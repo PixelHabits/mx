@@ -1,0 +1,6 @@
+pre-commit:
+  skip: [rebase]
+  jobs:
+    - run: bun x ultracite fix {staged_files}
+      glob: "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,jsonc}"
+      stage_fixed: true

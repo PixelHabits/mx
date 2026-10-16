@@ -1,0 +1,30 @@
+{
+	"name": "mx",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"bin": {
+		"mx": "dist/mx"
+	},
+	"scripts": {
+		"build": "bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --env=disable src/main.ts --outfile dist/mx",
+		"check": "ultracite check",
+		"fix": "ultracite fix",
+		"prepare": "lefthook install && effect-tsgo patch",
+		"test": "bun test --isolate tests --pass-with-no-tests",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@effect/platform-bun": "4.0.5",
+		"effect": "4.0.5"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.15",
+		"@effect/tsgo": "0.52.0",
+		"@types/bun": "^1.4.2",
+		"lefthook": "^2.1.17",
+		"typescript": "7.0.2",
+		"ultracite": "7.12.4"
+	},
+	"packageManager": "bun@1.4.3"
+}

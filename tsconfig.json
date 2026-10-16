@@ -1,0 +1,191 @@
+{
+	"$schema": "https://json.schemastore.org/tsconfig",
+	"compilerOptions": {
+		/** Environment & latest features */
+		"lib": ["ESNext"],
+		"module": "Preserve",
+		"moduleDetection": "force",
+		"target": "ESNext",
+		"types": ["bun"],
+
+		/** Bundler mode */
+		"allowImportingTsExtensions": true,
+		"isolatedModules": true,
+		"moduleResolution": "bundler",
+		"noEmit": true,
+		"resolveJsonModule": true,
+		"verbatimModuleSyntax": true,
+
+		/** Best practices */
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitOverride": true,
+		"noUncheckedIndexedAccess": true,
+		"skipLibCheck": true,
+		"strict": true,
+
+		/** Effect language service: correctness, antipattern, effect-native and style rules are errors that fail the typecheck, except the two tabled style rules; the maintainers rule is off. A use of an unstable or experimental Effect module fails unless allowedUnstableApis or allowedExperimentalApis lists it. */
+		"plugins": [
+			{
+				"name": "@effect/language-service",
+				/** Auto-imports and quick fixes use the effect barrel. */
+				"barrelImportPackages": ["effect"],
+				/** Keys derive from the package name, the path below src/ and the class name. */
+				"keyPatterns": [
+					{
+						"target": "service",
+						"pattern": "default",
+						"skipLeadingPath": ["src/"]
+					},
+					{
+						"target": "custom",
+						"pattern": "default",
+						"skipLeadingPath": ["src/"]
+					}
+				],
+				/** Unstable modules the code uses on purpose. An entry without # covers the module and every module below it; an entry with # covers one export. */
+				"allowedUnstableApis": [
+					// runMain for the mx process.
+					"@effect/platform-bun/BunRuntime",
+					// Bun file system, path, stdio, terminal and child processes for every command.
+					"@effect/platform-bun/BunServices",
+					// The mx command line.
+					"effect/cli"
+				],
+				"allowedExperimentalApis": [],
+				"diagnosticSeverity": {
+					/** correctness */
+					"anyUnknownInErrorContext": "error",
+					"classSelfMismatch": "error",
+					"duplicatePackage": "error",
+					"effectFnImplicitAny": "error",
+					"experimentalApiUsage": "error",
+					"floatingEffect": "error",
+					"floatingEffectInVitest": "error",
+					"missingEffectContext": "error",
+					"missingEffectError": "error",
+					"missingLayerContext": "error",
+					"missingReturnYieldStar": "error",
+					"missingStarInYieldEffectGen": "error",
+					"obsoleteMatchImport": "error",
+					"obsoleteSchemaImport": "error",
+					"outdatedApi": "error",
+					"overriddenSchemaConstructor": "error",
+					"promiseInEffectSuccess": "error",
+					"schemaClassMissingBrand": "error",
+					"schemaLiteralNonFinite": "error",
+					"schemaOpaqueInstanceMember": "error",
+					"unsafeEffectTypeAssertion": "error",
+					"unstableApiUsage": "error",
+					/** antipattern */
+					"catchUnfailableEffect": "error",
+					"effectFnIife": "error",
+					"effectGenUsesAdapter": "error",
+					"effectInFailure": "error",
+					"effectInVoidSuccess": "error",
+					"globalErrorInEffectCatch": "error",
+					"globalErrorInEffectFailure": "error",
+					"layerMergeAllWithDependencies": "error",
+					"lazyEffect": "error",
+					"lazyPromiseInEffectSync": "error",
+					"leakingRequirements": "error",
+					"multipleEffectProvide": "error",
+					"preferUnsafeConstructor": "error",
+					"returnEffectInGen": "error",
+					"runEffectInsideEffect": "error",
+					"schemaSyncInEffect": "error",
+					"strictEffectProvide": "error",
+					"tryCatchInEffectGen": "error",
+					"unknownInEffectCatch": "error",
+					/** effect-native */
+					"abortControllerInEffect": "error",
+					"asyncFunction": "error",
+					"cryptoRandomUUID": "error",
+					"cryptoRandomUUIDInEffect": "error",
+					"extendsNativeError": "error",
+					"globalConsole": "error",
+					"globalConsoleInEffect": "error",
+					"globalDate": "error",
+					"globalDateInEffect": "error",
+					"globalFetch": "error",
+					"globalFetchInEffect": "error",
+					"globalRandom": "error",
+					"globalRandomInEffect": "error",
+					"globalTimers": "error",
+					"globalTimersInEffect": "error",
+					"instanceOfSchema": "error",
+					"newPromise": "error",
+					"nodeBuiltinImport": "error",
+					"preferEffectArray": "error",
+					"preferEffectRecord": "error",
+					"preferSchemaOverJson": "error",
+					"processEnv": "error",
+					"processEnvInEffect": "error",
+					"schemaSync": "error",
+					/** style */
+					"acquireReleaseDisposable": "error",
+					"allOfMapToForEach": "error",
+					"catchAllTagDispatchToCatchTag": "error",
+					"catchAllToMapError": "error",
+					"catchChainToFirstSuccessOf": "error",
+					"catchConditionalRefailToCatchIf": "error",
+					"catchDieToOrDie": "error",
+					"catchIfTagToCatchTag": "error",
+					"catchRefailToTapError": "error",
+					"catchTagToCatchReason": "error",
+					"catchToIgnore": "error",
+					"catchToOrElseSucceed": "error",
+					"deterministicKeys": "error",
+					"effectDoNotation": "error",
+					"effectFnOpportunity": "error",
+					"effectMapFlatten": "error",
+					"effectMapVoid": "error",
+					"effectSleepZeroToYieldNow": "error",
+					"effectSucceedWithVoid": "error",
+					"flatMapConditionalToFilterOrFail": "error",
+					"flatMapIgnoredParamToAndThen": "error",
+					"flatMapToMap": "error",
+					"flatMapToTap": "error",
+					"mapSomeToAsSome": "error",
+					"matchEffectToMapBoth": "error",
+					"matchEffectToMatch": "error",
+					"missedPipeableOpportunity": "error",
+					"missingPipeableSignature": "off",
+					"multipleCatchTag": "error",
+					"nestedEffectGenYield": "error",
+					"newSchemaClass": "error",
+					"optionMatchToFromOption": "error",
+					"preferSchemaTaggedError": "error",
+					"preferSchemaTypeProperty": "error",
+					"preferSucceedSomeOrNone": "error",
+					"preferTypedSchemaDecoder": "error",
+					"provideLayerSucceedToProvideService": "error",
+					"raceFirstWithSleepToTimeout": "error",
+					"redundantMapError": "error",
+					"redundantOrDie": "error",
+					"redundantSchemaTagIdentifier": "error",
+					"runOfExitToRunExit": "error",
+					"schemaNumber": "error",
+					"schemaStructWithTag": "error",
+					"schemaUnionOfLiterals": "error",
+					"serviceNotAsClass": "error",
+					"strictBooleanExpressions": "off",
+					"syncToSucceed": "error",
+					"timeoutCatchTagToTimeoutOrElse": "error",
+					"unnecessaryArrowBlock": "error",
+					"unnecessaryEffectGen": "error",
+					"unnecessaryFailYieldableError": "error",
+					"unnecessaryPipe": "error",
+					"unnecessaryPipeChain": "error",
+					"unnecessaryTypeofType": "error",
+					/** maintainers */
+					// A library-maintainer rule that tsgo ships off; this repository publishes no packages.
+					"apiStabilityLeak": "off"
+				}
+			}
+		],
+
+		"incremental": true,
+		"tsBuildInfoFile": "${configDir}/.cache/tsbuildinfo.json"
+	},
+	"include": ["src/**/*.ts", "tests/**/*.ts"]
+}

@@ -1,0 +1,7 @@
+[install]
+# Only install package versions published at least 3 days ago
+minimumReleaseAge = 259200 # seconds
+
+# node_modules holds only the declared dependencies, instead of one hoisted
+# pile the code can reach into.
+linker = "isolated"

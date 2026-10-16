@@ -1,0 +1,32 @@
+{
+	"$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+	"extends": [
+		"ultracite/biome/core",
+		"ultracite/biome/vitest",
+		"ultracite/biome/type-aware"
+	],
+	"files": {
+		// Downgrade ultracite's "!!**/node_modules" force-ignore to a regular
+		// ignore (last match wins): the scanner must index node_modules or
+		// type-aware noUnresolvedImports flags every exports-map package.
+		"includes": ["!**/node_modules", "!dist"]
+	},
+	"formatter": {
+		"indentStyle": "tab"
+	},
+	"json": {
+		"formatter": {
+			"indentStyle": "tab"
+		}
+	},
+	"javascript": {
+		"globals": ["Bun"]
+	},
+	"linter": {
+		"rules": {
+			"nursery": {
+				"noFloatingPromises": "error"
+			}
+		}
+	}
+}
