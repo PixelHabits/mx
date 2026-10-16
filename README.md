@@ -4,44 +4,54 @@ mx keeps a local copy of a Microsoft 365 mailbox and lets an AI agent search, re
 
 ## Install
 
-1. Build the binary and put it on your path:
+`mx install` sets mx up for the signed-in user, without admin rights. It is safe to run again, for example after a new build.
 
-   ```sh
-   cd ~/Developer/mx
-   bun install
-   bun run build
-   install -Dm755 dist/mx ~/.local/bin/mx
-   ```
+1. It copies the binary it runs from to the install folder.
+2. It registers `mx sync` to start at sign-in.
+3. It registers `mx mcp` with each MCP client it finds: Claude Desktop on Windows, Claude Code when the `claude` CLI is on your `PATH`, and Codex. With the `codex` CLI it runs `codex mcp add`; without it, it appends a `[mcp_servers.mx]` section to `~/.codex/config.toml` when that file has none.
+4. It runs `mx login` when there is no saved sign-in. Like `mx login`, it asks for a client id and a tenant once, or takes `--client-id` and `--tenant`, and saves them.
+5. It starts `mx sync`.
 
-2. Sign in:
+### Linux
 
-   ```sh
-   mx login
-   ```
+```sh
+cd ~/Developer/mx
+bun install
+bun run build
+./dist/mx-linux-x64 install
+```
 
-   `mx login` asks for a client id and a tenant once, or takes `--client-id` and `--tenant`, and saves them. The tenant is `organizations`, which Enter keeps, a tenant id, or a domain such as `contoso.com`. Then it prints a URL and a code. Open the URL, enter the code and sign in with your work account. mx saves the refresh token in the system's secret store: Windows Credential Manager, the macOS Keychain, or the Secret Service on Linux. On a Linux machine without a Secret Service, it saves the token in a file only you can read.
+The binary goes to `~/.local/bin/mx`. The sync service is the systemd user unit `~/.config/systemd/user/mx-sync.service`. Follow its log with:
 
-3. Run the first sync by hand and check its summary:
+```sh
+journalctl --user -u mx-sync -f
+```
 
-   ```sh
-   mx sync --once
-   ```
+### Windows
 
-4. Start the sync service, which keeps the store current as the next section describes:
+Build on Linux with `bun run build`, copy `dist/mx-windows-x64.exe` to the Windows machine, and run it from a terminal:
 
-   ```sh
-   install -Dm644 systemd/mx-sync.service ~/.config/systemd/user/mx-sync.service
-   systemctl --user daemon-reload
-   systemctl --user enable --now mx-sync.service
-   journalctl --user -u mx-sync -f
-   ```
+```powershell
+.\mx-windows-x64.exe install
+```
 
-5. Register the MCP server with Claude Code and Codex:
+The binary goes to `%LOCALAPPDATA%\Programs\mx\mx.exe`. Next to it, `mxw.exe` is the same program marked as a Windows GUI program, so Windows starts it without a console window. The value `mx` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` starts `mxw.exe sync` at sign-in. Its log is `%LOCALAPPDATA%\mx\state\sync.log`.
 
-   ```sh
-   claude mcp add --scope user mx -- ~/.local/bin/mx mcp
-   codex mcp add mx -- ~/.local/bin/mx mcp
-   ```
+Claude Desktop reads `mcpServers.mx` in `%APPDATA%\Claude\claude_desktop_config.json`. Quit and reopen Claude Desktop after the install so it starts mx.
+
+### Uninstall
+
+```sh
+mx uninstall
+```
+
+It lists what it removes and asks first. `mx uninstall --yes` removes it all without asking; without a terminal, `--yes` is required. In this order, it:
+
+1. Stops `mx sync` and removes its registration. Sync deletes its Graph subscriptions as it stops, while its sign-in is still saved.
+2. Removes mx from Claude Desktop, Claude Code and Codex.
+3. Deletes the installed binary, `config.json` with the client id and the tenant, the mail store, the saved sign-in, the attachment cache and the state folder.
+
+Nothing of mx stays. To keep the sign-in, the mail and the settings, run `mx install` again instead.
 
 ## How the sync service follows the mailbox
 
@@ -58,19 +68,22 @@ mx runs the `cloudflared` that `MX_CLOUDFLARED` names, or else the one on your `
 
 ## When a command says "Run mx login."
 
-Microsoft refused the saved sign-in, or there is none. Run `mx login` again. The service retries every 5 minutes, so it picks up the new sign-in by itself.
+Microsoft refused the saved sign-in, or there is none. Run `mx login` again. On Linux the service retries every 5 minutes, so it picks up the new sign-in by itself. On Windows, run `mx install` again to start sync.
 
 ## Files
 
-| Path | Holds |
-| --- | --- |
-| `$XDG_CONFIG_HOME/mx/config.json` | The client id and the tenant `mx login` saved. |
-| `$XDG_DATA_HOME/mx/mx.sqlite` | The messages, the folders and their delta links, and the full-text index. |
-| `$XDG_DATA_HOME/mx/cloudflared/` | The cloudflared release mx downloaded, when neither `MX_CLOUDFLARED` nor `PATH` has one. |
-| `$XDG_STATE_HOME/mx/refresh-token` | The refresh token, only on a machine without a secret store. The file has mode 0600. |
-| `$XDG_CACHE_HOME/mx/` | Attachments the `attachment` tool downloaded, one folder per message. |
+| Linux | Windows | Holds |
+| --- | --- | --- |
+| `$XDG_CONFIG_HOME/mx/config.json` | `%LOCALAPPDATA%\mx\config.json` | The client id and the tenant `mx login` saved. |
+| `$XDG_DATA_HOME/mx/mx.sqlite` | `%LOCALAPPDATA%\mx\data\mx.sqlite` | The messages, the folders and their delta links, and the full-text index. |
+| `$XDG_DATA_HOME/mx/cloudflared/` | `%LOCALAPPDATA%\mx\data\cloudflared\` | The cloudflared release mx downloaded, when neither `MX_CLOUDFLARED` nor `PATH` has one. |
+| `$XDG_STATE_HOME/mx/refresh-token` | | The refresh token, only on a machine without a secret store. The file has mode 0600. |
+| | `%LOCALAPPDATA%\mx\state\sync.log` | The log of the background `mx sync`. |
+| `$XDG_CACHE_HOME/mx/` | `%LOCALAPPDATA%\mx\cache\` | Attachments the `attachment` tool downloaded, one folder per message. |
 
-Unset variables fall back to `~/.config`, `~/.local/share`, `~/.local/state` and `~/.cache`.
+On Linux, unset XDG variables fall back to `~/.config`, `~/.local/share`, `~/.local/state` and `~/.cache`.
+
+mx checks at start that Bun's SQLite has FTS5, the full-text search it needs, and stops with a message when it does not.
 
 ## Tools
 

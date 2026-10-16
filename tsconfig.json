@@ -60,6 +60,7 @@
 					"effect/http",
 					// The Graph mail endpoints as an HttpApi.
 					"effect/http-api",
+					"effect/Logger#toFile",
 					// XDG paths and file names.
 					"effect/Path",
 					// systemd-creds for the saved sign-in.

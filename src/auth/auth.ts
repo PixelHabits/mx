@@ -1,5 +1,6 @@
 import {
 	Clock,
+	Console,
 	Context,
 	Duration,
 	Effect,
@@ -368,3 +369,17 @@ export class Auth extends Context.Service<
 		Layer.provide(Credentials.layer)
 	);
 }
+
+/**
+ * The device-code sign-in at the terminal with `config`: prints the URL and the code, waits for the user, and saves the
+ * sign-in.
+ */
+export const signIn = Effect.fnUntraced(function* (
+	auth: Auth["Service"],
+	config: SignInConfig
+) {
+	const { complete, url, userCode } = yield* auth.startLogin(config);
+	yield* Console.log(`Open ${url} and enter the code ${userCode}.`);
+	yield* complete;
+	yield* Console.log("Signed in. The refresh token is saved.");
+});

@@ -6,6 +6,7 @@ import {
 	ConfigProvider,
 	Context,
 	Effect,
+	Exit,
 	Fiber,
 	FileSystem,
 	Layer,
@@ -17,10 +18,12 @@ import {
 	Terminal,
 } from "effect";
 import { Command } from "effect/cli";
+import type { ChildProcess } from "effect/process";
 import { TestClock, TestConsole } from "effect/testing";
 import { savedConfig } from "../src/auth/config.ts";
 import { mx } from "../src/cli.ts";
 import { Paths } from "../src/paths.ts";
+import { deleteAfterExit, stopSync } from "../src/windows.ts";
 import {
 	FakeMicrosoft,
 	inlineImage,
@@ -59,12 +62,16 @@ const tenant = "contoso.com";
 /** The cloudflared `MX_CLOUDFLARED` names; the fake processes run it as a quick tunnel. */
 const cloudflared = `${home}/bin/cloudflared`;
 
-/** The environment of an mx process: the XDG directories under the test home, cloudflared, a client id and a tenant. */
+/** The environment of an mx process: its folders under the test home, cloudflared, a client id and a tenant. */
 const environment = {
+	APPDATA: `${home}/AppData/Roaming`,
 	HOME: home,
+	LOCALAPPDATA: `${home}/AppData/Local`,
 	MX_CLIENT_ID: clientId,
 	MX_CLOUDFLARED: cloudflared,
 	MX_TENANT: tenant,
+	PATH: `${home}/path`,
+	USERPROFILE: home,
 	XDG_CACHE_HOME: `${home}/cache`,
 	XDG_CONFIG_HOME: `${home}/config`,
 	XDG_DATA_HOME: `${home}/data`,
@@ -206,6 +213,58 @@ const fakeTerminal = (system: typeof platform, keys: readonly string[]) => {
 	return { frames, system: Layer.merge(system, terminal) };
 };
 
+/** Runs `effect` as if on Windows; mx reads `process.platform` as it builds its layers. */
+const onWindows = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+	Effect.acquireUseRelease(
+		Effect.sync(() => {
+			const actual = process.platform;
+			Object.defineProperty(process, "platform", { value: "win32" });
+			return actual;
+		}),
+		() => effect,
+		(actual) =>
+			Effect.sync(() => {
+				Object.defineProperty(process, "platform", { value: actual });
+			})
+	);
+
+/** Runs `effect` as if mx ran from the binary `exe`; mx reads `process.execPath` as it builds its layers. */
+const runningAs =
+	(exe: string) =>
+	<A, E, R>(effect: Effect.Effect<A, E, R>) =>
+		Effect.acquireUseRelease(
+			Effect.sync(() => {
+				const actual = process.execPath;
+				Object.defineProperty(process, "execPath", { value: exe });
+				return actual;
+			}),
+			() => effect,
+			(actual) =>
+				Effect.sync(() => {
+					Object.defineProperty(process, "execPath", { value: actual });
+				})
+		);
+
+/** `platform` where the process dies 4 bytes into each write into `folder`, as when the machine stops mid-write. */
+const cutOffWrites = (folder: string) =>
+	Layer.merge(
+		platform,
+		Layer.effect(
+			FileSystem.FileSystem,
+			Effect.map(FileSystem.FileSystem, (fs) =>
+				FileSystem.FileSystem.of({
+					...fs,
+					writeFile: (file, data, options) =>
+						file.startsWith(folder)
+							? fs
+									.writeFile(file, data.subarray(0, 4), options)
+									.pipe(Effect.andThen(Effect.die("The machine stopped.")))
+							: fs.writeFile(file, data, options),
+				})
+			)
+		).pipe(Layer.provide(BunServices.layer))
+	);
+
 const call = (name: string, args: Record<string, unknown>) =>
 	McpClient.use((client) => client.call(name, args));
 
@@ -307,6 +366,18 @@ const allFolders = [
 	"folder-deleted",
 	"folder-archive",
 ];
+
+const installed = `${home}/.local/bin/mx`;
+const windowsFolder = `${home}/AppData/Local/Programs/mx`;
+const background = `${windowsFolder}/mxw.exe`;
+
+/** A command as `processes.commands` records it, joined by spaces. */
+const commandLine = (command: ChildProcess.StandardCommand) =>
+	Arr.join([command.command, ...command.args], " ");
+const unitFile = `${home}/config/systemd/user/mx-sync.service`;
+const claudeCli = `${home}/path/claude`;
+const codexConfig = `${home}/.codex/config.toml`;
+const codexSettings = 'model = "gpt-6.1-sol"\n';
 
 /** `mx sync` running as the service does, from the first push test to the last. */
 const services: Fiber.Fiber<unknown, unknown>[] = [];
@@ -578,6 +649,21 @@ describe("mx", () => {
 					(form) => form.get("client_id")
 				)
 			).toEqual([otherClientId]);
+		}));
+
+	test("mx login restarts mx sync where mx install registered it, so sync runs under the new sign-in", () =>
+		Effect.gen(function* () {
+			const before = processes.commands.length;
+			const { output } = yield* cliOn(unconfigured)("login");
+			expect(
+				Arr.map(processes.commands.slice(before), (command) =>
+					Arr.join(command, " ")
+				)
+			).toEqual([
+				"systemctl --user is-enabled --quiet mx-sync.service",
+				"systemctl --user restart --no-block mx-sync.service",
+			]);
+			expect(lines(output).at(-1)).toBe("Restarted mx sync.");
 		}));
 
 	test("mx sync --once stores every mail folder, child folders included, through Graph delta with text bodies and immutable ids", () =>
@@ -1063,15 +1149,22 @@ describe("mx", () => {
 			expect(microsoft.subscriptions.validated).toContain(url);
 			expect(microsoft.subscriptions.byId.has(stale)).toBe(false);
 			expect(microsoft.subscriptions.byId.has(foreign)).toBe(true);
-			expect(processes.commands[0]).toEqual([
-				cloudflared,
-				"tunnel",
-				"--no-autoupdate",
-				"--url",
-				expect.stringMatching(loopbackUrl),
-				"--metrics",
-				expect.stringMatching(loopbackAddress),
-			]);
+			expect(
+				Arr.findFirst(
+					processes.commands,
+					([command]) => command === cloudflared
+				)
+			).toEqual(
+				Option.some([
+					cloudflared,
+					"tunnel",
+					"--no-autoupdate",
+					"--url",
+					expect.stringMatching(loopbackUrl),
+					"--metrics",
+					expect.stringMatching(loopbackAddress),
+				])
+			);
 		}));
 
 	test("a change notification brings a new message into the store within seconds, and the webhook answers 202", () =>
@@ -1199,6 +1292,55 @@ describe("mx", () => {
 			Effect.provide(TestClock.layer())
 		));
 
+	test("mx install, run twice, installs the binary, enables the systemd unit, registers mx with Claude Code and Codex, and starts sync", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* fs.makeDirectory(`${home}/path`, { recursive: true });
+			yield* fs.writeFileString(claudeCli, "");
+			yield* fs.chmod(claudeCli, 0o755);
+			yield* fs.makeDirectory(`${home}/.codex`, { recursive: true });
+			yield* fs.writeFileString(codexConfig, codexSettings);
+			const before = processes.commands.length;
+			yield* cli("install");
+			yield* cli("install");
+			expect((yield* fs.stat(installed)).size).toBe(
+				(yield* fs.stat(process.execPath)).size
+			);
+			expect((yield* fs.stat(installed)).mode % 0o1000).toBe(0o755);
+			expect(yield* fs.readFileString(unitFile)).toContain(
+				`ExecStart="${installed}" sync`
+			);
+			const once = [
+				"systemctl --user daemon-reload",
+				"systemctl --user enable mx-sync.service",
+				`${claudeCli} mcp remove --scope user mx`,
+				`${claudeCli} mcp add --scope user mx -- ${installed} mcp`,
+				"systemctl --user restart --no-block mx-sync.service",
+			];
+			expect(
+				Arr.map(processes.commands.slice(before), (command) =>
+					Arr.join(command, " ")
+				)
+			).toEqual([...once, ...once]);
+			expect(yield* fs.readFileString(codexConfig)).toBe(
+				`${codexSettings}\n[mcp_servers.mx]\nargs = ["mcp"]\ncommand = "${installed}"\n`
+			);
+		}));
+
+	test("mx install on Windows that stops while it writes the new mx.exe leaves the installed one whole", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const exe = `${windowsFolder}/mx.exe`;
+			const before = new TextEncoder().encode("synthetic installed mx.exe");
+			yield* fs.makeDirectory(windowsFolder, { recursive: true });
+			yield* fs.writeFile(exe, before);
+			const exit = yield* Effect.exit(
+				onWindows(cliOn(cutOffWrites(windowsFolder))("install"))
+			);
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect([...(yield* fs.readFile(exe))]).toEqual([...before]);
+		}));
+
 	test("a refused refresh token fails loudly with run mx login, and no token is ever printed", () =>
 		Effect.gen(function* () {
 			microsoft.refuseRefresh = true;
@@ -1208,4 +1350,149 @@ describe("mx", () => {
 			expect(printed.length).toBeGreaterThan(0);
 			expect(Arr.join(printed, "\n")).not.toMatch(secrets_);
 		}));
+	test("mx uninstall without --yes and without a terminal refuses and removes nothing", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const before = processes.commands.length;
+			const failure = yield* Effect.flip(
+				withStdinTerminal(false)(cli("uninstall"))
+			);
+			expect(failure.message).toContain("mx uninstall --yes");
+			expect(processes.commands).toHaveLength(before);
+			expect(yield* fs.exists(installed)).toBe(true);
+			expect(yield* fs.exists(`${home}/data/mx/mx.sqlite`)).toBe(true);
+		}));
+
+	test("mx uninstall lists what it removes and asks first, and removes nothing when the answer is no", () =>
+		Effect.gen(function* () {
+			secrets.machine = "store";
+			const fs = yield* FileSystem.FileSystem;
+			const before = processes.commands.length;
+			const { frames, system } = fakeTerminal(platform, ["n"]);
+			const { output } = yield* withStdinTerminal(true)(
+				cliOn(system)("uninstall")
+			);
+			const prompt = Arr.join(frames, "");
+			for (const path of [
+				installed,
+				unitFile,
+				configFile,
+				`${home}/data/mx`,
+				`${home}/cache/mx`,
+				`${home}/state/mx`,
+			]) {
+				expect(prompt).toContain(path);
+			}
+			expect(prompt).toContain("the saved sign-in");
+			expect(output).toBe("mx uninstall removed nothing.");
+			expect(processes.commands).toHaveLength(before);
+			expect(yield* fs.exists(installed)).toBe(true);
+		}));
+
+	test("mx uninstall --yes stops sync first, then removes the unit, the client registrations, the binary, the client id, the mail store, the sign-in, the cache and the state folder", () =>
+		Effect.gen(function* () {
+			secrets.machine = "store";
+			const fs = yield* FileSystem.FileSystem;
+			const before = processes.commands.length;
+			let signedInWhenSyncStopped = false;
+			processes.onSpawn = () => {
+				signedInWhenSyncStopped ||= secrets.entries.has("mx/refresh-token");
+			};
+			yield* cli("uninstall", "--yes");
+			processes.onSpawn = undefined;
+			expect(
+				Arr.map(processes.commands.slice(before), (command) =>
+					Arr.join(command, " ")
+				)
+			).toEqual([
+				"systemctl --user disable --now mx-sync.service",
+				"systemctl --user daemon-reload",
+				`${claudeCli} mcp remove --scope user mx`,
+			]);
+			expect(signedInWhenSyncStopped).toBe(true);
+			expect(yield* fs.readFileString(codexConfig)).toBe(codexSettings);
+			for (const path of [
+				installed,
+				unitFile,
+				configFile,
+				`${home}/data/mx`,
+				`${home}/cache/mx`,
+				`${home}/state/mx`,
+			]) {
+				expect(yield* fs.exists(path)).toBe(false);
+			}
+			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
+		}));
+
+	test("mx install on Windows adds the program folder to the user PATH once and keeps every other entry, and mx uninstall takes out only that folder", () =>
+		onWindows(
+			Effect.gen(function* () {
+				const others =
+					"%USERPROFILE%\\AppData\\Local\\Microsoft\\WindowsApps;C:\\Users\\Zoë\\bin;;C:\\Tools\\";
+				processes.userPath = others;
+				const { output } = yield* cli("install");
+				expect(output).toContain(
+					`Added ${windowsFolder} to your PATH. Open a new terminal to run mx.`
+				);
+				yield* cli("install");
+				expect(processes.userPath).toBe(`${others};${windowsFolder}`);
+				yield* cli("uninstall", "--yes");
+				expect(processes.userPath).toBe(others);
+			})
+		));
+
+	test("on Windows, mx uninstall stops mx sync with the processes it started before it deletes anything", () =>
+		onWindows(
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				yield* cli("install");
+				const before = processes.commands.length;
+				let installedWhenSyncStopped = false;
+				processes.onSpawn = () => {
+					installedWhenSyncStopped ||= Bun.file(background).size > 0;
+				};
+				yield* cli("uninstall", "--yes");
+				processes.onSpawn = undefined;
+				expect(Arr.join(processes.commands[before] ?? [], " ")).toBe(
+					commandLine(stopSync(process.pid))
+				);
+				expect(installedWhenSyncStopped).toBe(true);
+				expect(yield* fs.exists(background)).toBe(false);
+			})
+		));
+
+	test("mx uninstall run from the installed mx.exe deletes mxw.exe and the copies an update moved aside at once, and the program folder once it exits", () =>
+		onWindows(
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const exe = `${windowsFolder}/mx.exe`;
+				const movedAside = [
+					`${windowsFolder}/mx.old.exe`,
+					`${windowsFolder}/mxw.old.exe`,
+				];
+				yield* cli("install");
+				yield* Effect.forEach(movedAside, (file) =>
+					fs.writeFileString(file, "an exe an update moved aside")
+				);
+				const before = processes.commands.length;
+				const { output } = yield* runningAs(exe)(cli("uninstall", "--yes"));
+				for (const file of [background, ...movedAside]) {
+					expect(yield* fs.exists(file)).toBe(false);
+				}
+				expect(yield* fs.exists(exe)).toBe(true);
+				expect(
+					Arr.map(processes.commands.slice(before), (command) =>
+						Arr.join(command, " ")
+					)
+				).toContain(
+					commandLine(
+						deleteAfterExit({ folder: windowsFolder, pid: process.pid })
+					)
+				);
+				expect(output).toContain(
+					`mx uninstall deletes ${windowsFolder} once it exits.`
+				);
+				expect(output).not.toContain("Could not delete");
+			})
+		));
 });

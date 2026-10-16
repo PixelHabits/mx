@@ -8,6 +8,7 @@ import { mx } from "./cli.ts";
 import {
 	CredentialFailed,
 	GraphRefused,
+	InstallFailed,
 	LoginRequired,
 	MicrosoftUnavailable,
 	SignInFailed,
@@ -26,6 +27,7 @@ const isExplained = Schema.is(
 	Schema.Union([
 		CredentialFailed,
 		GraphRefused,
+		InstallFailed,
 		LoginRequired,
 		MicrosoftUnavailable,
 		SignInFailed,

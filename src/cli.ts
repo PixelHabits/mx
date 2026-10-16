@@ -1,8 +1,17 @@
-import { Console, Effect, Layer } from "effect";
-import { Command, Flag } from "effect/cli";
+import {
+	Array as Arr,
+	Console,
+	Effect,
+	FileSystem,
+	Layer,
+	Logger,
+	Path,
+} from "effect";
+import { CliError, Command, Flag, Prompt } from "effect/cli";
 import packageJson from "../package.json" with { type: "json" };
-import { Auth } from "./auth/auth.ts";
+import { Auth, signIn } from "./auth/auth.ts";
 import { clientIdFlag, tenantFlag } from "./auth/config.ts";
+import { Installer, type Removal } from "./install.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
 import { Store } from "./store.ts";
@@ -14,18 +23,35 @@ const login = Command.make(
 	{ clientId: clientIdFlag, tenant: tenantFlag },
 	(config) =>
 		Effect.gen(function* () {
-			const auth = yield* Auth;
-			const { complete, url, userCode } = yield* auth.startLogin(config);
-			yield* Console.log(`Open ${url} and enter the code ${userCode}.`);
-			yield* complete;
-			yield* Console.log("Signed in. The refresh token is saved.");
+			yield* signIn(yield* Auth, config);
+			yield* (yield* Installer).resumeSync;
 		})
 ).pipe(
-	Command.provide(Auth.layer.pipe(Layer.provide(Paths.layer))),
+	Command.provide(
+		Layer.mergeAll(Auth.layer, Installer.layer).pipe(Layer.provide(Paths.layer))
+	),
 	Command.withDescription(
-		"Sign in to Microsoft with a device code and save the refresh token in the system's secret store. mx login asks for a client id and a tenant once, or takes --client-id and --tenant, and saves them."
+		"Sign in to Microsoft with a device code, save the refresh token in the system's secret store, and restart mx sync with the new sign-in. mx login asks for a client id and a tenant once, or takes --client-id and --tenant, and saves them."
 	)
 );
+
+/** The background mx sync on Windows has no console, so its log also goes to a file in the state folder. */
+const syncLog =
+	process.platform === "win32"
+		? Layer.unwrap(
+				Effect.gen(function* () {
+					const { state } = yield* Paths;
+					const path = yield* Path.Path;
+					yield* (yield* FileSystem.FileSystem).makeDirectory(state, {
+						recursive: true,
+					});
+					return Logger.layer(
+						[Logger.toFile(Logger.formatSimple, path.join(state, "sync.log"))],
+						{ mergeWithExisting: true }
+					);
+				})
+			)
+		: Layer.empty;
 
 const sync = Command.make(
 	"sync",
@@ -41,14 +67,75 @@ const sync = Command.make(
 				yield* Console.log(summary(yield* (yield* Sync).pass));
 				return;
 			}
+			yield* (yield* Installer).removeOldBinaries;
 			return yield* (yield* Watch).run;
 		})
 ).pipe(
 	Command.provide(
-		Layer.mergeAll(Sync.layer, Watch.layer).pipe(Layer.provide(Paths.layer))
+		Layer.mergeAll(Sync.layer, Watch.layer, Installer.layer, syncLog).pipe(
+			Layer.provide(Paths.layer)
+		)
 	),
 	Command.withDescription(
 		"Keep the local store in step with the mailbox: Graph push notifications through a cloudflared quick tunnel, and a delta pass of every folder every 5 minutes, or every 60 seconds while push is down."
+	)
+);
+
+const install = Command.make(
+	"install",
+	{ clientId: clientIdFlag, tenant: tenantFlag },
+	(config) =>
+		Effect.flatMap(Installer, (installer) => installer.install(config))
+).pipe(
+	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
+	Command.withDescription(
+		"Install this binary for the signed-in user, start mx sync at sign-in, register mx mcp with Claude Desktop, Claude Code and Codex where they are installed, and sign in when there is no saved sign-in. Safe to run again."
+	)
+);
+
+/** Asks on the terminal whether to remove everything in `removals`; without a terminal it fails and names `--yes`. */
+const confirmed = (removals: readonly Removal[]) =>
+	process.stdin.isTTY === true
+		? Prompt.run(
+				Prompt.Confirm({
+					message: `mx uninstall removes:\n${Arr.join(
+						Arr.map(removals, ({ what }) => `  - ${what}`),
+						"\n"
+					)}\nRemove all of this?`,
+				})
+			).pipe(Effect.catchTag("QuitError", () => Effect.succeed(false)))
+		: Effect.fail(
+				CliError.UserError.make({
+					cause: undefined,
+					userMessage:
+						"There is no terminal to confirm the uninstall. Run mx uninstall --yes to remove everything mx uninstall lists.",
+				})
+			);
+
+const uninstall = Command.make(
+	"uninstall",
+	{
+		yes: Flag.Boolean("yes").pipe(
+			Flag.withDefault(false),
+			Flag.withDescription("Remove everything without asking.")
+		),
+	},
+	({ yes }) =>
+		Effect.gen(function* () {
+			const removals = yield* (yield* Installer).removals;
+			if (!(yes || (yield* confirmed(removals)))) {
+				yield* Console.log("mx uninstall removed nothing.");
+				return;
+			}
+			yield* Effect.forEach(removals, ({ remove }) => remove, {
+				discard: true,
+			});
+			yield* Console.log("Uninstalled mx.");
+		})
+).pipe(
+	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
+	Command.withDescription(
+		"Stop mx sync, and remove its registration, mx from each MCP client, the installed binary, the client id and the tenant, the mail store, the saved sign-in, the attachment cache and the state folder. It lists them and asks first; --yes removes them without asking."
 	)
 );
 
@@ -76,5 +163,5 @@ export const mx = Command.make("mx").pipe(
 	Command.withDescription(
 		"Read and manage a Microsoft 365 mailbox through Microsoft Graph."
 	),
-	Command.withSubcommands([login, sync, mcp, reindex])
+	Command.withSubcommands([login, sync, mcp, reindex, install, uninstall])
 );

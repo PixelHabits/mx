@@ -3,9 +3,6 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"bin": {
-		"mx": "dist/mx"
-	},
 	"scripts": {
 		"build": "bun scripts/build.ts",
 		"check": "ultracite check",

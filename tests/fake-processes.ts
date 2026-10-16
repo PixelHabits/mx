@@ -1,15 +1,17 @@
-import { Deferred, Effect, Layer, Sink, Stream } from "effect";
+import { Array as Arr, Deferred, Effect, Layer, Sink, Stream } from "effect";
 import { type ChildProcess, ChildProcessSpawner } from "effect/process";
+import { readUserPath, writeUserPath } from "../src/windows.ts";
 import type { FakeTunnels } from "./fake-push.ts";
 
 const { ExitCode, makeHandle, ProcessId } = ChildProcessSpawner;
 
 const handle = (
 	pid: number,
-	exit: Deferred.Deferred<ChildProcessSpawner.ExitCode>
+	exit: Deferred.Deferred<ChildProcessSpawner.ExitCode>,
+	stdout: Stream.Stream<Uint8Array> = Stream.empty
 ) =>
 	makeHandle({
-		all: Stream.empty,
+		all: stdout,
 		exitCode: Deferred.await(exit),
 		getInputFd: () => Sink.drain,
 		getOutputFd: () => Stream.empty,
@@ -18,20 +20,32 @@ const handle = (
 		pid: ProcessId(pid),
 		stderr: Stream.empty,
 		stdin: Sink.drain,
-		stdout: Stream.empty,
+		stdout,
 		unref: Effect.succeed(Effect.void),
 	});
 
 const flagValue = (args: readonly string[], flag: string) =>
 	args[args.indexOf(flag) + 1] ?? "";
 
+const commandLine = (command: ChildProcess.StandardCommand) =>
+	Arr.join([command.command, ...command.args], " ");
+
+/** The PowerShell that prints the user PATH, and the one that sets it from its environment. */
+const pathRead = commandLine(readUserPath);
+const pathWrite = commandLine(writeUserPath(""));
+
 /**
  * Every program mx starts, recorded and faked. `cloudflared tunnel` opens a quick tunnel on the fake internet, named
- * `tunnel-<n>.trycloudflare.com`, that runs until the scope that started it closes or `exit` ends it. Any other program
- * exits 0 at once.
+ * `tunnel-<n>.trycloudflare.com`, that runs until the scope that started it closes or `exit` ends it. The PowerShell
+ * that reads the user PATH on Windows prints `userPath` as it does, and the one that writes it sets `userPath`. Any
+ * other program exits 0 at once.
  */
 export class FakeProcesses {
 	readonly commands: (readonly string[])[] = [];
+	/** The `Path` value under `HKCU\Environment`. */
+	userPath = "";
+	/** Runs as each program starts, for a test that checks what holds at that moment. */
+	onSpawn: (() => void) | undefined;
 	private opened = 0;
 	private readonly running = new Map<
 		string,
@@ -45,7 +59,9 @@ export class FakeProcesses {
 
 	readonly layer = Layer.succeed(
 		ChildProcessSpawner.ChildProcessSpawner,
-		ChildProcessSpawner.make((command) => this.spawn(command))
+		ChildProcessSpawner.make((command) =>
+			Effect.suspend(() => this.spawn(command))
+		)
 	);
 
 	/** Ends the quick tunnel at `host` as if cloudflared exited with code 1. */
@@ -61,13 +77,27 @@ export class FakeProcesses {
 			return Effect.die("mx pipes no commands.");
 		}
 		this.commands.push([command.command, ...command.args]);
+		this.onSpawn?.();
+		if (commandLine(command) === pathWrite) {
+			this.userPath = command.options.env?.MX_PATH ?? "";
+		}
+		const stdout =
+			commandLine(command) === pathRead
+				? Stream.succeed(
+						new Uint8Array(
+							Buffer.from(
+								Buffer.from(this.userPath, "utf16le").toString("base64")
+							)
+						)
+					)
+				: Stream.empty;
 		return Effect.flatMap(
 			Deferred.make<ChildProcessSpawner.ExitCode>(),
 			(exit) => {
 				if (command.args[0] !== "tunnel") {
 					return Effect.as(
 						Deferred.succeed(exit, ExitCode(0)),
-						handle(this.commands.length, exit)
+						handle(this.commands.length, exit, stdout)
 					);
 				}
 				this.opened += 1;

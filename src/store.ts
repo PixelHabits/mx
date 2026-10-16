@@ -262,14 +262,32 @@ export class Store extends Context.Service<
 				recursive: true,
 			});
 			const db = yield* Effect.acquireRelease(
-				Effect.sync(() => {
-					const opened = new Database(database, { create: true, strict: true });
-					opened.run(`PRAGMA busy_timeout = ${busyTimeoutMillis}`);
-					opened.run(schema);
-					return opened;
-				}),
+				Effect.sync(
+					() => new Database(database, { create: true, strict: true })
+				),
 				(opened) => Effect.sync(() => opened.close())
 			);
+			const [{ fts5 }] = yield* Effect.sync(() =>
+				db
+					.query("SELECT sqlite_compileoption_used('ENABLE_FTS5') AS fts5")
+					.all()
+			).pipe(
+				Effect.flatMap(
+					Schema.decodeUnknownEffect(
+						Schema.Tuple([Schema.Struct({ fts5: Flag })])
+					)
+				),
+				Effect.orDie
+			);
+			if (fts5 === 0) {
+				return yield* Effect.die(
+					"This Bun's SQLite has no FTS5, which mx needs for search."
+				);
+			}
+			yield* Effect.sync(() => {
+				db.run(`PRAGMA busy_timeout = ${busyTimeoutMillis}`);
+				db.run(schema);
+			});
 
 			type Params = Record<string, string | number | null>;
 			/** Runs a statement and decodes its rows; a row the schema refuses is a defect in mx's own database. */

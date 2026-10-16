@@ -86,3 +86,11 @@ export class PushUnavailable extends Schema.TaggedError<
 >("mx/errors/PushUnavailable")("PushUnavailable", {
 	message: Schema.String,
 }) {}
+
+/** `mx install`, `mx uninstall` or `mx update` could not finish a step; `message` says which and why. */
+export class InstallFailed extends Schema.TaggedError<
+	InstallFailed,
+	{ readonly brand: unique symbol }
+>("mx/errors/InstallFailed")("InstallFailed", {
+	message: Schema.String,
+}) {}
