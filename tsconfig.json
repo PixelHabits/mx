@@ -198,7 +198,20 @@
 					/** maintainers */
 					// A library-maintainer rule that tsgo ships off; this repository publishes no packages.
 					"apiStabilityLeak": "off"
-				}
+				},
+				"overrides": [
+					{
+						// The fakes stand in for Microsoft's and Cloudflare's servers: web-platform handlers that answer with promises and reach the local webhook with fetch, not Effect programs.
+						"include": ["tests/fake-*.ts"],
+						"options": {
+							"diagnosticSeverity": {
+								"asyncFunction": "off",
+								"cryptoRandomUUID": "off",
+								"globalFetch": "off"
+							}
+						}
+					}
+				]
 			}
 		],
 

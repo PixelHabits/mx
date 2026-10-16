@@ -34,6 +34,8 @@ import {
 	messageSelect,
 	type Reaction,
 	type Recipient,
+	type Subscription,
+	SubscriptionPage,
 } from "./api.ts";
 
 export type GraphError =
@@ -219,6 +221,23 @@ export class Graph extends Context.Service<
 			readonly id: string;
 			readonly name: string;
 		}) => Effect.Effect<Message, GraphError>;
+		/** This app's subscriptions for the signed-in user. */
+		readonly subscriptions: Effect.Effect<readonly Subscription[], GraphError>;
+		readonly subscribe: (input: {
+			readonly changeType: string;
+			readonly clientState: string;
+			readonly expiration: Temporal.Instant;
+			readonly lifecycleNotificationUrl: string;
+			readonly notificationUrl: string;
+			readonly resource: string;
+		}) => Effect.Effect<Subscription, GraphError>;
+		/** Renews a subscription until `expiration`. */
+		readonly renew: (
+			id: string,
+			expiration: Temporal.Instant
+		) => Effect.Effect<Subscription, GraphError>;
+		readonly unsubscribe: (id: string) => Effect.Effect<void, GraphError>;
+		readonly reauthorize: (id: string) => Effect.Effect<void, GraphError>;
 	}
 >()("mx/graph/graph") {
 	static readonly layerNoDeps = Layer.effect(
@@ -237,10 +256,11 @@ export class Graph extends Context.Service<
 			const uploads = transport.pipe(
 				HttpClient.transformResponse(Effect.flatMap(checked))
 			);
-			const { mail } = yield* HttpApiClient.makeWith(GraphApi, {
-				baseUrl: graphBase,
-				httpClient: client,
-			});
+			const { mail, subscriptions: subscriptionApi } =
+				yield* HttpApiClient.makeWith(GraphApi, {
+					baseUrl: graphBase,
+					httpClient: client,
+				});
 
 			const getJson = <S extends Schema.Top>(url: string, schema: S) =>
 				client
@@ -460,6 +480,46 @@ export class Graph extends Context.Service<
 				}
 			);
 
+			const subscriptions = Effect.gen(function* () {
+				let page = yield* settle(subscriptionApi.list());
+				const found: Subscription[] = [...page.value];
+				while (page["@odata.nextLink"] !== undefined) {
+					page = yield* settle(
+						getJson(page["@odata.nextLink"], SubscriptionPage)
+					);
+					found.push(...page.value);
+				}
+				return found;
+			}).pipe(Effect.withSpan("Graph.subscriptions"));
+
+			const subscribe: Graph["Service"]["subscribe"] = Effect.fn(
+				"Graph.subscribe"
+			)(({ expiration, ...input }) =>
+				settle(
+					subscriptionApi.create({
+						payload: { ...input, expirationDateTime: expiration.toString() },
+					})
+				)
+			);
+
+			const renew = Effect.fn("Graph.renew")(
+				(id: string, expiration: Temporal.Instant) =>
+					settle(
+						subscriptionApi.update({
+							params: { id },
+							payload: { expirationDateTime: expiration.toString() },
+						})
+					)
+			);
+
+			const unsubscribe = Effect.fn("Graph.unsubscribe")((id: string) =>
+				settle(subscriptionApi.delete({ params: { id } }))
+			);
+
+			const reauthorize = Effect.fn("Graph.reauthorize")((id: string) =>
+				settle(subscriptionApi.reauthorize({ params: { id } }))
+			);
+
 			return Graph.of({
 				attach,
 				attachmentContent,
@@ -471,8 +531,13 @@ export class Graph extends Context.Service<
 				folders,
 				message: Effect.fn("Graph.message")(message),
 				move,
+				reauthorize,
+				renew,
 				send,
 				sendDraft,
+				subscribe,
+				subscriptions,
+				unsubscribe,
 				update,
 			});
 		})

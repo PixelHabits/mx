@@ -299,4 +299,57 @@ export const mail = HttpApiGroup.make("mail")
 		)
 	);
 
-export const GraphApi = HttpApi.make("Graph").add(mail);
+export const Subscription = Schema.Struct({
+	expirationDateTime: Schema.String,
+	id: Schema.String,
+	notificationUrl: Schema.String,
+	resource: Schema.String,
+});
+export type Subscription = typeof Subscription.Type;
+
+export const SubscriptionPage = Schema.Struct({
+	"@odata.nextLink": Schema.optionalKey(Schema.String),
+	value: Schema.Array(Subscription),
+});
+
+/** Graph change notifications: a subscription per folder that posts to a public URL. */
+export const subscriptions = HttpApiGroup.make("subscriptions")
+	.add(
+		HttpApiEndpoint.get("list", "/subscriptions", {
+			success: SubscriptionPage,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("create", "/subscriptions", {
+			payload: Schema.Struct({
+				changeType: Schema.String,
+				clientState: Schema.String,
+				expirationDateTime: Schema.String,
+				lifecycleNotificationUrl: Schema.String,
+				notificationUrl: Schema.String,
+				resource: Schema.String,
+			}),
+			success: Subscription.pipe(HttpApiSchema.status(201)),
+		})
+	)
+	.add(
+		HttpApiEndpoint.patch("update", "/subscriptions/:id", {
+			params,
+			payload: Schema.Struct({ expirationDateTime: Schema.String }),
+			success: Subscription,
+		})
+	)
+	.add(
+		HttpApiEndpoint.delete("delete", "/subscriptions/:id", {
+			params,
+			success: HttpApiSchema.NoContent,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("reauthorize", "/subscriptions/:id/reauthorize", {
+			params,
+			success: HttpApiSchema.NoContent,
+		})
+	);
+
+export const GraphApi = HttpApi.make("Graph").add(mail).add(subscriptions);

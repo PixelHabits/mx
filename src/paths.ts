@@ -19,6 +19,8 @@ export class Paths extends Context.Service<
 		readonly cache: string;
 		/** `$XDG_CONFIG_HOME/mx/config.json`, with the client id `mx login` saved. */
 		readonly configFile: string;
+		/** `$XDG_DATA_HOME/mx`, for the database and the cloudflared mx downloads. */
+		readonly data: string;
 		/** `$XDG_DATA_HOME/mx/mx.sqlite`. */
 		readonly database: string;
 		/** `$XDG_STATE_HOME/mx`, for the sign-in file on a machine without a secret store. */
@@ -38,6 +40,7 @@ export class Paths extends Context.Service<
 			return Paths.of({
 				cache: path.join(cache, "mx"),
 				configFile: path.join(config, "mx", "config.json"),
+				data: path.join(data, "mx"),
 				database: path.join(data, "mx", "mx.sqlite"),
 				state: path.join(state, "mx"),
 			});

@@ -6,7 +6,7 @@ import {
 	HttpClientResponse,
 } from "effect/http";
 
-/** The deadline for one attempt, body included. An attachment download is the longest request mx makes. */
+/** The deadline for one attempt, body included, unless the caller names a longer one for a download. */
 const requestDeadline = Duration.seconds(60);
 
 /** How many times a request repeats after its first attempt. */
@@ -59,15 +59,17 @@ const isRead = (request: HttpClientRequest.HttpClientRequest) =>
 export const policy = (
 	http: HttpClient.HttpClient,
 	options: {
+		readonly deadline?: Duration.Duration;
 		readonly retryable?: (
 			request: HttpClientRequest.HttpClientRequest
 		) => boolean;
 	} = {}
 ) => {
+	const deadline = options.deadline ?? requestDeadline;
 	const bounded = HttpClient.transform(http, (effect, request) =>
 		effect.pipe(
 			Effect.flatMap(buffered),
-			withDeadline(requestDeadline, request),
+			withDeadline(deadline, request),
 			Effect.provideService(HttpClient.TracerPropagationEnabled, false)
 		)
 	);
@@ -84,7 +86,7 @@ export const policy = (
 		times: retries,
 	});
 	const overall = Duration.sum(
-		Duration.times(requestDeadline, retries + 1),
+		Duration.times(deadline, retries + 1),
 		retryWaits
 	);
 	const retryable = options.retryable ?? isRead;

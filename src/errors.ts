@@ -78,3 +78,11 @@ export class Refused extends Schema.TaggedError<
 >("mx/errors/Refused")("Refused", {
 	message: Schema.String,
 }) {}
+
+/** Push notifications cannot run now: cloudflared is missing or failed, the tunnel is unreachable, or a subscription failed. */
+export class PushUnavailable extends Schema.TaggedError<
+	PushUnavailable,
+	{ readonly brand: unique symbol }
+>("mx/errors/PushUnavailable")("PushUnavailable", {
+	message: Schema.String,
+}) {}

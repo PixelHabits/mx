@@ -1,4 +1,12 @@
-import { Array as Arr, Context, Effect, Layer, Option, Result } from "effect";
+import {
+	Array as Arr,
+	Context,
+	Effect,
+	Layer,
+	Option,
+	Result,
+	Semaphore,
+} from "effect";
 import type { DeltaPage, Message } from "./graph/api.ts";
 import { Graph, type GraphError } from "./graph/graph.ts";
 import { Store } from "./store.ts";
@@ -10,6 +18,9 @@ export interface Pass {
 	readonly saved: number;
 }
 
+export const summary = ({ folders, removed, saved }: Pass) =>
+	`Synced ${folders} folders: ${saved} messages saved, ${removed} removed.`;
+
 type Entry = DeltaPage["value"][number];
 
 const isRemoved = (entry: Entry): entry is Exclude<Entry, Message> =>
@@ -18,17 +29,22 @@ const isRemoved = (entry: Entry): entry is Exclude<Entry, Message> =>
 /**
  * Brings the store up to date with the mailbox: lists every mail folder, then runs each folder's Graph delta from the
  * link the last pass saved. A folder without a link, or whose link Graph no longer knows (410), starts over, and the
- * messages that round does not return leave the store.
+ * messages that round does not return leave the store. Passes run one at a time, so two never read the same delta link.
  */
 export class Sync extends Context.Service<
 	Sync,
-	{ readonly pass: Effect.Effect<Pass, GraphError> }
+	{
+		readonly pass: Effect.Effect<Pass, GraphError>;
+		/** One folder's delta round, for a change notification about it. */
+		readonly folderPass: (folderId: string) => Effect.Effect<Pass, GraphError>;
+	}
 >()("mx/sync") {
 	static readonly layerNoDeps = Layer.effect(
 		Sync,
 		Effect.gen(function* () {
 			const graph = yield* Graph;
 			const store = yield* Store;
+			const oneAtATime = yield* Semaphore.make(1);
 
 			/** One delta round for the folder, every page, from its saved link or from the start. */
 			const round = (
@@ -92,9 +108,25 @@ export class Sync extends Context.Service<
 					removed += changed.removed;
 				}
 				return { folders: folders.length, removed, saved };
-			}).pipe(Effect.withSpan("Sync.pass"));
+			}).pipe(oneAtATime.withPermits(1), Effect.withSpan("Sync.pass"));
 
-			return Sync.of({ pass });
+			const folderPass = Effect.fn("Sync.folderPass")(function* (
+				folderId: string
+			) {
+				const folder = Arr.findFirst(
+					yield* store.folders,
+					(stored) => stored.id === folderId
+				);
+				if (Option.isNone(folder)) {
+					return yield* pass;
+				}
+				const changed = yield* round(folderId, folder.value.deltaLink).pipe(
+					oneAtATime.withPermits(1)
+				);
+				return { folders: 1, ...changed };
+			});
+
+			return Sync.of({ folderPass, pass });
 		})
 	);
 

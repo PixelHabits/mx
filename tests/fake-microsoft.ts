@@ -1,6 +1,7 @@
 import { Array as Arr, Effect, Layer, Option } from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
+import { FakeSubscriptions, FakeTunnels } from "./fake-push.ts";
 
 /** Microsoft's sign-in host; its paths start with the tenant, as `/<tenant>/oauth2/v2.0/token`. */
 export const loginHost = "login.microsoftonline.com";
@@ -16,7 +17,10 @@ const carol = { address: "carol@example.test", name: "Carol Example" };
 
 /** The folder ids Graph answers for the well-known names mx sends. */
 const wellKnown: Record<string, string> = {
+	archive: "folder-archive",
 	deleteditems: "folder-deleted",
+	drafts: "folder-drafts",
+	inbox: "folder-inbox",
 	sentitems: "folder-sent",
 };
 
@@ -96,6 +100,8 @@ const content = (value: unknown) => (value as { content: string }).content;
  */
 export class FakeMicrosoft {
 	readonly received: Received[] = [];
+	readonly tunnels = new FakeTunnels();
+	readonly subscriptions = new FakeSubscriptions(this.tunnels);
 	/** Device-code polls still to answer `authorization_pending`. */
 	pendingPolls = 1;
 	/** When set, every refresh answers `invalid_grant`. */
@@ -225,8 +231,9 @@ export class FakeMicrosoft {
 		HttpClient.make((request) =>
 			HttpClientRequest.toWeb(request).pipe(
 				Effect.flatMap((web) =>
-					Effect.promise(() => web.arrayBuffer()).pipe(
-						Effect.map((body) => this.answer(web, new Uint8Array(body)))
+					Effect.promise(
+						async (): Promise<Response> =>
+							await this.answer(web, new Uint8Array(await web.arrayBuffer()))
 					)
 				),
 				Effect.orDie,
@@ -252,6 +259,21 @@ export class FakeMicrosoft {
 			message.parentFolderId = folderId;
 			this.changes.push({ folderId, id });
 		}
+	}
+
+	/** A message from Bob arrives in Inbox, and Graph notifies Inbox's subscriptions. */
+	receive(subject: string) {
+		const added = this.add({
+			body: `${subject}, in the body.`,
+			conversationId: this.newId("conversation"),
+			from: bob,
+			id: this.newId("message"),
+			parentFolderId: "folder-inbox",
+			received: "2026-10-06T08:00:00Z",
+			subject,
+			to: [devin],
+		});
+		return this.subscriptions.notify("inbox", added.id);
 	}
 
 	/** The messages in a folder as Graph holds them now. */
@@ -320,8 +342,14 @@ export class FakeMicrosoft {
 		});
 	}
 
-	private answer(request: Request, bytes: Uint8Array): Response {
+	private answer(
+		request: Request,
+		bytes: Uint8Array
+	): Response | Promise<Response> {
 		const url = new URL(request.url);
+		if (this.tunnels.answers(url)) {
+			return this.tunnels.forward(request, url, bytes);
+		}
 		const body = new TextDecoder().decode(bytes);
 		this.received.push({
 			authorization: request.headers.get("authorization"),
@@ -590,9 +618,12 @@ export class FakeMicrosoft {
 		url: URL,
 		body: Json,
 		asText: boolean
-	): Response {
-		const [, , , collection, id, action, attachmentId, value] =
-			decodeURIComponent(url.pathname).split("/");
+	): Response | Promise<Response> {
+		const parts = decodeURIComponent(url.pathname).split("/");
+		if (parts[2] === "subscriptions") {
+			return this.subscriptions.answer(method, parts[3], parts[4], body);
+		}
+		const [, , , collection, id, action, attachmentId, value] = parts;
 		if (collection === "mailFolders") {
 			return this.folderRequest(url, asText, id, action, attachmentId);
 		}

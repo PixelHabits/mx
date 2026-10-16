@@ -1,4 +1,4 @@
-import { Console, Effect, Layer, Schedule } from "effect";
+import { Console, Effect, Layer } from "effect";
 import { Command, Flag } from "effect/cli";
 import packageJson from "../package.json" with { type: "json" };
 import { Auth } from "./auth/auth.ts";
@@ -6,13 +6,8 @@ import { clientIdFlag, tenantFlag } from "./auth/config.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
 import { Store } from "./store.ts";
-import { type Pass, Sync } from "./sync.ts";
-
-/** How long `mx sync` waits between passes. */
-const syncInterval = "60 seconds";
-
-const summary = ({ folders, removed, saved }: Pass) =>
-	`Synced ${folders} folders: ${saved} messages saved, ${removed} removed.`;
+import { Sync, summary } from "./sync.ts";
+import { Watch } from "./watch.ts";
 
 const login = Command.make(
 	"login",
@@ -42,28 +37,18 @@ const sync = Command.make(
 	},
 	({ once }) =>
 		Effect.gen(function* () {
-			const { pass } = yield* Sync;
 			if (once) {
-				yield* Console.log(summary(yield* pass));
+				yield* Console.log(summary(yield* (yield* Sync).pass));
 				return;
 			}
-			/** An outage waits for the next pass; a refused sign-in or anything else stops the service loudly. */
-			yield* pass.pipe(
-				Effect.tap((done) =>
-					done.saved + done.removed > 0
-						? Effect.logInfo(summary(done))
-						: Effect.void
-				),
-				Effect.catchTag("MicrosoftUnavailable", (error) =>
-					Effect.logWarning(error.message)
-				),
-				Effect.repeat(Schedule.spaced(syncInterval))
-			);
+			return yield* (yield* Watch).run;
 		})
 ).pipe(
-	Command.provide(Sync.layer.pipe(Layer.provide(Paths.layer))),
+	Command.provide(
+		Layer.mergeAll(Sync.layer, Watch.layer).pipe(Layer.provide(Paths.layer))
+	),
 	Command.withDescription(
-		"Keep the local store in step with the mailbox through Graph delta, every 60 seconds."
+		"Keep the local store in step with the mailbox: Graph push notifications through a cloudflared quick tunnel, and a delta pass of every folder every 5 minutes, or every 60 seconds while push is down."
 	)
 );
 

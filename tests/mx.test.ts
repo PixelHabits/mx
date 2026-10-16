@@ -17,7 +17,7 @@ import {
 	Terminal,
 } from "effect";
 import { Command } from "effect/cli";
-import { TestConsole } from "effect/testing";
+import { TestClock, TestConsole } from "effect/testing";
 import { savedConfig } from "../src/auth/config.ts";
 import { mx } from "../src/cli.ts";
 import { Paths } from "../src/paths.ts";
@@ -29,6 +29,7 @@ import {
 	userCode,
 	verificationUri,
 } from "./fake-microsoft.ts";
+import { FakeProcesses } from "./fake-processes.ts";
 import { FakeSecrets } from "./fake-secrets.ts";
 import { connect, McpClient } from "./mcp-client.ts";
 
@@ -36,6 +37,7 @@ import { connect, McpClient } from "./mcp-client.ts";
 class Home extends Context.Service<Home, string>()("mx/tests/mx.test/Home") {}
 
 const microsoft = new FakeMicrosoft();
+const processes = new FakeProcesses(microsoft.tunnels);
 const secrets = new FakeSecrets();
 secrets.install();
 
@@ -54,10 +56,14 @@ const clientId = "11111111-2222-4333-8444-555555555555";
 const otherClientId = "66666666-7777-4888-9999-000000000000";
 const tenant = "contoso.com";
 
-/** The environment of an mx process: the XDG directories under the test home, a client id and a tenant. */
+/** The cloudflared `MX_CLOUDFLARED` names; the fake processes run it as a quick tunnel. */
+const cloudflared = `${home}/bin/cloudflared`;
+
+/** The environment of an mx process: the XDG directories under the test home, cloudflared, a client id and a tenant. */
 const environment = {
 	HOME: home,
 	MX_CLIENT_ID: clientId,
+	MX_CLOUDFLARED: cloudflared,
 	MX_TENANT: tenant,
 	XDG_CACHE_HOME: `${home}/cache`,
 	XDG_CONFIG_HOME: `${home}/config`,
@@ -66,13 +72,14 @@ const environment = {
 };
 
 /**
- * What every mx process runs on: Microsoft, Bun, a console that keeps its lines, and Config over `env` and the saved
- * config.json, as `src/main.ts` sets it up.
+ * What every mx process runs on: Microsoft and the internet, Bun with faked child processes, a console that keeps its
+ * lines, and Config over `env` and the saved config.json, as `src/main.ts` sets it up.
  */
 const platformWith = (env: Record<string, string>) =>
 	Layer.mergeAll(
 		microsoft.layer,
 		BunServices.layer,
+		processes.layer,
 		TestConsole.layer,
 		savedConfig.pipe(
 			Layer.provide(Paths.layer),
@@ -269,16 +276,40 @@ const devicecodeRequests = () =>
 	).length;
 
 /** Runs `check` on the real clock until it answers true, for up to 10 seconds. */
-const eventually = (what: string, check: () => boolean) =>
+const eventually = <E = never, R = never>(
+	what: string,
+	check: Effect.Effect<boolean, E, R> | (() => boolean)
+) =>
 	Effect.gen(function* () {
+		const holds = typeof check === "function" ? Effect.sync(check) : check;
 		for (let attempt = 0; attempt < 200; attempt += 1) {
-			if (check()) {
+			if (yield* holds) {
 				return;
 			}
 			yield* Effect.promise(() => Bun.sleep(50));
 		}
 		return yield* Effect.die(`Timed out waiting for ${what}.`);
 	});
+
+/** Lets work that the test does not wait on run for a while on the real clock. */
+const settle = Effect.promise(() => Bun.sleep(1500));
+
+const deltaRequests = (folderId: string) =>
+	Arr.filter(graphRequests("/messages/delta"), (request) =>
+		request.url.pathname.includes(`/${folderId}/`)
+	).length;
+
+const allFolders = [
+	"folder-inbox",
+	"folder-projects",
+	"folder-sent",
+	"folder-drafts",
+	"folder-deleted",
+	"folder-archive",
+];
+
+/** `mx sync` running as the service does, from the first push test to the last. */
+const services: Fiber.Fiber<unknown, unknown>[] = [];
 
 /** The refresh token Microsoft issued `back` tokens ago, 1 for the newest. */
 const issued = (back: number) => microsoft.refreshTokens.at(-back) ?? "none";
@@ -300,6 +331,8 @@ const earlyDraftLine =
 	/^#\d+ .* Drafts \| to bob@example\.test \| Before sync \| draft$/u;
 const replyDraftLine = /^#\d+ .* Drafts \| to Carol Example/u;
 const permanent = /permanentDelete/u;
+const loopbackUrl = /^http:\/\/127\.0\.0\.1:\d+$/u;
+const loopbackAddress = /^127\.0\.0\.1:\d+$/u;
 const lineIn = (id: number, folder: string) =>
 	new RegExp(`^#${id} .* ${folder} \\|`, "u");
 
@@ -981,6 +1014,190 @@ describe("mx", () => {
 			);
 			expect(next).not.toBe(sent);
 		}));
+
+	test("mx sync deletes stale subscriptions and subscribes Inbox and Sent Items for created, updated and deleted mail through a validated quick tunnel", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* fs.makeDirectory(`${home}/bin`, { recursive: true });
+			yield* fs.writeFileString(cloudflared, "");
+			const stale = microsoft.subscriptions.seed({
+				changeType: "created,updated,deleted",
+				clientState: "an earlier run",
+				expirationDateTime: "2026-10-07T00:00:00Z",
+				lifecycleNotificationUrl: "https://old-tunnel.trycloudflare.com/graph",
+				notificationUrl: "https://old-tunnel.trycloudflare.com/graph",
+				resource: "me/mailFolders('inbox')/messages",
+			});
+			const foreign = microsoft.subscriptions.seed({
+				changeType: "created",
+				clientState: "another tool",
+				expirationDateTime: "2026-10-07T00:00:00Z",
+				lifecycleNotificationUrl: "https://hooks.example.test/mail",
+				notificationUrl: "https://hooks.example.test/mail",
+				resource: "me/mailFolders('inbox')/messages",
+			});
+			services.push(yield* Effect.forkDetach(cli("sync")));
+			const url = "https://tunnel-1.trycloudflare.com/graph";
+			yield* eventually("both subscriptions", () =>
+				Arr.every(["inbox", "sentitems"], (folder) =>
+					Arr.some(
+						microsoft.subscriptions.on(folder),
+						(subscription) => subscription.notificationUrl === url
+					)
+				)
+			);
+			const ours = Arr.filter(
+				[...microsoft.subscriptions.byId.values()],
+				(subscription) => subscription.notificationUrl === url
+			);
+			expect(
+				Arr.map(ours, (subscription) => subscription.resource).sort()
+			).toEqual([
+				"me/mailFolders('inbox')/messages",
+				"me/mailFolders('sentitems')/messages",
+			]);
+			for (const subscription of ours) {
+				expect(subscription.changeType).toBe("created,updated,deleted");
+				expect(subscription.lifecycleNotificationUrl).toBe(url);
+			}
+			expect(microsoft.subscriptions.validated).toContain(url);
+			expect(microsoft.subscriptions.byId.has(stale)).toBe(false);
+			expect(microsoft.subscriptions.byId.has(foreign)).toBe(true);
+			expect(processes.commands[0]).toEqual([
+				cloudflared,
+				"tunnel",
+				"--no-autoupdate",
+				"--url",
+				expect.stringMatching(loopbackUrl),
+				"--metrics",
+				expect.stringMatching(loopbackAddress),
+			]);
+		}));
+
+	test("a change notification brings a new message into the store within seconds, and the webhook answers 202", () =>
+		Effect.gen(function* () {
+			yield* Effect.promise(() => microsoft.receive("Push arrives"));
+			expect(microsoft.subscriptions.delivered.at(-1)?.status).toBe(202);
+			yield* eventually(
+				"the pushed message in the store",
+				Effect.map(call("search", { query: "push arrives" }), ({ text }) =>
+					text.includes("Inbox | Bob Example <bob@example.test> | Push arrives")
+				)
+			);
+		}));
+
+	test("a notification without this run's clientState runs no pass", () =>
+		Effect.gen(function* () {
+			yield* settle;
+			const before = deltaRequests("folder-inbox");
+			yield* Effect.promise(() =>
+				microsoft.subscriptions.notify(
+					"inbox",
+					"message-forged",
+					"not the secret"
+				)
+			);
+			yield* settle;
+			expect(deltaRequests("folder-inbox")).toBe(before);
+		}));
+
+	test("reauthorizationRequired reauthorizes the subscription, and missed runs a delta pass of its folder", () =>
+		Effect.gen(function* () {
+			yield* Effect.promise(() =>
+				microsoft.subscriptions.lifecycle("inbox", "reauthorizationRequired")
+			);
+			const inbox = Arr.findFirst(
+				microsoft.subscriptions.on("inbox"),
+				(subscription) =>
+					subscription.notificationUrl.endsWith(".trycloudflare.com/graph")
+			).pipe(
+				Option.map((subscription) => subscription.id),
+				Option.getOrElse(() => "none")
+			);
+			yield* eventually("a reauthorize call", () =>
+				microsoft.subscriptions.reauthorized.includes(inbox)
+			);
+			const before = deltaRequests("folder-sent");
+			yield* Effect.promise(() =>
+				microsoft.subscriptions.lifecycle("sentitems", "missed")
+			);
+			yield* eventually(
+				"a delta pass of Sent Items",
+				() => deltaRequests("folder-sent") > before
+			);
+		}));
+
+	test("when cloudflared exits, a new tunnel starts, change and lifecycle notifications both reach it, and every folder gets a delta pass", () =>
+		Effect.gen(function* () {
+			const before = Arr.map(allFolders, deltaRequests);
+			yield* processes.exit("tunnel-1.trycloudflare.com");
+			const url = "https://tunnel-2.trycloudflare.com/graph";
+			const onTunnels = (folder: string) =>
+				Arr.filter(microsoft.subscriptions.on(folder), (subscription) =>
+					subscription.notificationUrl.endsWith(".trycloudflare.com/graph")
+				);
+			yield* eventually("the subscriptions on the new host", () =>
+				Arr.every(["inbox", "sentitems"], (folder) => {
+					const [only, ...others] = onTunnels(folder);
+					return (
+						others.length === 0 &&
+						only?.notificationUrl === url &&
+						only.lifecycleNotificationUrl === url
+					);
+				})
+			);
+			const inbox = Arr.map(onTunnels("inbox"), ({ id }) => id);
+			yield* Effect.promise(() =>
+				microsoft.subscriptions.lifecycle("inbox", "reauthorizationRequired")
+			);
+			yield* eventually("a reauthorize call through the new tunnel", () =>
+				Arr.every(inbox, (id) =>
+					microsoft.subscriptions.reauthorized.includes(id)
+				)
+			);
+			yield* eventually("a delta pass of every folder", () =>
+				Arr.every(
+					allFolders,
+					(folder, index) => deltaRequests(folder) > (before[index] ?? 0)
+				)
+			);
+		}));
+
+	test("stopping mx sync deletes this run's subscriptions and leaves other tools' alone", () =>
+		Effect.gen(function* () {
+			yield* Effect.forEach(services, Fiber.interrupt);
+			expect(
+				Arr.map(
+					[...microsoft.subscriptions.byId.values()],
+					(subscription) => subscription.notificationUrl
+				)
+			).toEqual(["https://hooks.example.test/mail"]);
+		}));
+
+	test("without cloudflared, mx sync polls every folder every 60 seconds", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* fs.remove(cloudflared);
+			const before = deltaRequests("folder-archive");
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"the first pass",
+				() => deltaRequests("folder-archive") > before
+			);
+			const first = deltaRequests("folder-archive");
+			yield* TestClock.adjust("59 seconds");
+			yield* settle;
+			expect(deltaRequests("folder-archive")).toBe(first);
+			yield* TestClock.adjust("1 second");
+			yield* eventually(
+				"the second pass",
+				() => deltaRequests("folder-archive") > first
+			);
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test and its mx sync run on.
+			Effect.provide(TestClock.layer())
+		));
 
 	test("a refused refresh token fails loudly with run mx login, and no token is ever printed", () =>
 		Effect.gen(function* () {

@@ -27,7 +27,7 @@ mx keeps a local copy of a Microsoft 365 mailbox and lets an AI agent search, re
    mx sync --once
    ```
 
-4. Start the sync service, which runs a pass every 60 seconds:
+4. Start the sync service, which keeps the store current as the next section describes:
 
    ```sh
    install -Dm644 systemd/mx-sync.service ~/.config/systemd/user/mx-sync.service
@@ -43,6 +43,19 @@ mx keeps a local copy of a Microsoft 365 mailbox and lets an AI agent search, re
    codex mcp add mx -- ~/.local/bin/mx mcp
    ```
 
+## How the sync service follows the mailbox
+
+`mx sync` learns about new mail from Graph push notifications, and polls as the fallback.
+
+1. It starts a local webhook on `127.0.0.1` and a Cloudflare quick tunnel to it with `cloudflared`. A new quick tunnel takes about 30 seconds to answer from the internet.
+2. It subscribes to changes in Inbox and Sent Items. Graph posts a notification within seconds of a change, and mx runs a delta pass of that folder.
+3. It renews the subscriptions every day, and checks the tunnel every 5 minutes. When cloudflared exits or the tunnel stops answering, mx starts a new tunnel, deletes the old subscriptions and subscribes again through it, since Graph cannot move a subscription's lifecycle notifications to a new address.
+4. While push works, mx also polls every folder every 5 minutes. When push is down, for example because cloudflared cannot be found or downloaded, mx polls every 60 seconds and tries push again every 10 minutes.
+
+The log says in one line each time push comes up or goes down. On start, mx deletes the subscriptions an earlier run left behind. On a clean stop, it deletes its own.
+
+mx runs the `cloudflared` that `MX_CLOUDFLARED` names, or else the one on your `PATH`. Without either, it downloads cloudflared 2026.10.1 from Cloudflare's GitHub releases into its data folder and checks the file's sha256 first.
+
 ## When a command says "Run mx login."
 
 Microsoft refused the saved sign-in, or there is none. Run `mx login` again. The service retries every 5 minutes, so it picks up the new sign-in by itself.
@@ -53,6 +66,7 @@ Microsoft refused the saved sign-in, or there is none. Run `mx login` again. The
 | --- | --- |
 | `$XDG_CONFIG_HOME/mx/config.json` | The client id and the tenant `mx login` saved. |
 | `$XDG_DATA_HOME/mx/mx.sqlite` | The messages, the folders and their delta links, and the full-text index. |
+| `$XDG_DATA_HOME/mx/cloudflared/` | The cloudflared release mx downloaded, when neither `MX_CLOUDFLARED` nor `PATH` has one. |
 | `$XDG_STATE_HOME/mx/refresh-token` | The refresh token, only on a machine without a secret store. The file has mode 0600. |
 | `$XDG_CACHE_HOME/mx/` | Attachments the `attachment` tool downloaded, one folder per message. |
 
@@ -100,7 +114,7 @@ bun run check
 bun run test
 ```
 
-The tests run every command against an in-memory Microsoft in `tests/fake-microsoft.ts`, and talk to `mx mcp` over its stdio as a client does. `tests/fake-secrets.ts` stands in for `Bun.secrets`, so no test touches the system's secret store.
+The tests run every command against an in-memory Microsoft in `tests/fake-microsoft.ts`, and talk to `mx mcp` over its stdio as a client does. `tests/fake-secrets.ts` stands in for `Bun.secrets`, so no test touches the system's secret store. `tests/fake-processes.ts` stands in for every program mx starts: its cloudflared opens quick tunnels on the fake internet in `tests/fake-push.ts`, where Graph validates the webhook and posts notifications to it.
 
 To try the server by hand, pipe MCP 2026-07-28 requests into it. Each request carries its protocol version in `_meta`, and there is no handshake:
 
