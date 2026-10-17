@@ -28,45 +28,45 @@ export class Paths extends Context.Service<
 		readonly home: string;
 	}
 >()("mx/paths") {
-	static readonly layer = Layer.effect(
-		Paths,
-		Effect.gen(function* () {
-			const path = yield* Path.Path;
-			if (process.platform === "win32") {
-				const { appData, home, localAppData } = yield* Config.all({
-					appData: Config.NonEmptyString("APPDATA"),
-					home: Config.NonEmptyString("USERPROFILE"),
-					localAppData: Config.NonEmptyString("LOCALAPPDATA"),
-				});
-				const root = path.join(localAppData, "mx");
-				return Paths.of({
-					bin: path.join(localAppData, "Programs", "mx", "mx.exe"),
-					cache: path.join(root, "cache"),
-					config: appData,
-					configFile: path.join(root, "config.json"),
-					data: path.join(root, "data"),
-					database: path.join(root, "data", "mx.sqlite"),
-					home,
-					state: path.join(root, "state"),
-				});
-			}
-			const home = yield* Config.NonEmptyString("HOME");
-			const { cache, config, data, state } = yield* Config.all({
-				cache: xdg("XDG_CACHE_HOME", home, ".cache"),
-				config: xdg("XDG_CONFIG_HOME", home, ".config"),
-				data: xdg("XDG_DATA_HOME", home, ".local/share"),
-				state: xdg("XDG_STATE_HOME", home, ".local/state"),
+	/** The paths for this machine, read from its environment; for code that runs before any layer, as a command-line prompt. */
+	static readonly make = Effect.gen(function* () {
+		const path = yield* Path.Path;
+		if (process.platform === "win32") {
+			const { appData, home, localAppData } = yield* Config.all({
+				appData: Config.NonEmptyString("APPDATA"),
+				home: Config.NonEmptyString("USERPROFILE"),
+				localAppData: Config.NonEmptyString("LOCALAPPDATA"),
 			});
+			const root = path.join(localAppData, "mx");
 			return Paths.of({
-				bin: path.join(home, ".local", "bin", "mx"),
-				cache: path.join(cache, "mx"),
-				config,
-				configFile: path.join(config, "mx", "config.json"),
-				data: path.join(data, "mx"),
-				database: path.join(data, "mx", "mx.sqlite"),
+				bin: path.join(localAppData, "Programs", "mx", "mx.exe"),
+				cache: path.join(root, "cache"),
+				config: appData,
+				configFile: path.join(root, "config.json"),
+				data: path.join(root, "data"),
+				database: path.join(root, "data", "mx.sqlite"),
 				home,
-				state: path.join(state, "mx"),
+				state: path.join(root, "state"),
 			});
-		})
-	);
+		}
+		const home = yield* Config.NonEmptyString("HOME");
+		const { cache, config, data, state } = yield* Config.all({
+			cache: xdg("XDG_CACHE_HOME", home, ".cache"),
+			config: xdg("XDG_CONFIG_HOME", home, ".config"),
+			data: xdg("XDG_DATA_HOME", home, ".local/share"),
+			state: xdg("XDG_STATE_HOME", home, ".local/state"),
+		});
+		return Paths.of({
+			bin: path.join(home, ".local", "bin", "mx"),
+			cache: path.join(cache, "mx"),
+			config,
+			configFile: path.join(config, "mx", "config.json"),
+			data: path.join(data, "mx"),
+			database: path.join(data, "mx", "mx.sqlite"),
+			home,
+			state: path.join(state, "mx"),
+		});
+	});
+
+	static readonly layer = Layer.effect(Paths, Paths.make);
 }

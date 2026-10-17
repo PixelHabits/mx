@@ -272,6 +272,29 @@ const deleteMessages = Tool.make("delete", {
 	.annotate(Tool.Destructive, true)
 	.annotate(Tool.OpenWorld, false);
 
+/** Whether an agent runs a tool without asking or asks every time. */
+export type Approval = "allow" | "ask";
+
+/**
+ * The approval mx recommends for each tool, in the order mx lists them: only `send` and `delete` ask every time. The
+ * hints do not decide it: `update_draft`, `delete_draft` and `update` are destructive and still run without asking.
+ */
+export const recommendedApprovals: readonly {
+	readonly approval: Approval;
+	readonly tool: string;
+}[] = [
+	{ approval: "allow", tool: search.name },
+	{ approval: "allow", tool: thread.name },
+	{ approval: "allow", tool: message.name },
+	{ approval: "allow", tool: attachment.name },
+	{ approval: "allow", tool: draft.name },
+	{ approval: "allow", tool: updateDraft.name },
+	{ approval: "allow", tool: deleteDraft.name },
+	{ approval: "ask", tool: send.name },
+	{ approval: "allow", tool: update.name },
+	{ approval: "ask", tool: deleteMessages.name },
+];
+
 const textResult = (text: string, isError: boolean) =>
 	McpSchema.CallToolResult.make({
 		content: [{ text, type: "text" }],

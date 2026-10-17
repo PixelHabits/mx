@@ -4,13 +4,23 @@ mx keeps a local copy of a Microsoft 365 mailbox and lets an AI agent search, re
 
 ## Install
 
-`mx install` sets mx up for the signed-in user, without admin rights. It is safe to run again, for example after a new build.
+`mx install` sets mx up for the signed-in user, without admin rights. Run it again to reinstall, for example after a new build.
 
-1. It copies the binary it runs from to the install folder.
-2. It registers `mx sync` to start at sign-in.
-3. It registers `mx mcp` with each MCP client it finds: Claude Desktop on Windows, Claude Code when the `claude` CLI is on your `PATH`, and Codex. With the `codex` CLI it runs `codex mcp add`; without it, it appends a `[mcp_servers.mx]` section to `~/.codex/config.toml` when that file has none.
-4. It runs `mx login` when there is no saved sign-in. Like `mx login`, it asks for a client id and a tenant once, or takes `--client-id` and `--tenant`, and saves them.
-5. It starts `mx sync`.
+1. It asks which agents to set up, as a list where the agents whose config file exists start selected. Name them with `--agent` instead, once for each, as in `mx install --agent claude-code --agent codex`. Without a terminal, `--agent` is required.
+2. It checks that each chosen agent's config file exists. When one is missing, it stops before it changes anything and says how to make the agent write it: open Claude Code or Codex once, or in Claude Desktop open Settings › Developer › Edit Config. Then run `mx install` again.
+3. It copies the binary it runs from to the install folder.
+4. It registers `mx sync` to start at sign-in.
+5. It sets the `mx` entry in each chosen agent's config file to the installed binary with the argument `mcp`, and keeps everything else in the file.
+6. It sets the [recommended approvals](#recommended-approvals) for each of mx's tools that has no approval yet, in Claude Code and Codex.
+7. It runs `mx login` when there is no saved sign-in. Like `mx login`, it asks for a client id and a tenant once, or takes `--client-id` and `--tenant`, and saves them.
+8. It starts `mx sync`.
+9. It tells you to quit and reopen each agent it set up. An agent that stays open can save its old settings over the file and drop the `mx` entry.
+
+| Agent | `--agent` | Config file | Entry |
+| --- | --- | --- | --- |
+| Claude Desktop, on Windows and macOS | `claude-desktop` | `%APPDATA%\Claude\claude_desktop_config.json` on Windows, `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS | `mcpServers.mx` |
+| Claude Code | `claude-code` | `~/.claude.json`, and `~/.claude/settings.json` for approvals; both in `$CLAUDE_CONFIG_DIR` when it is set | `mcpServers.mx`, the user scope, and `mcp__mx__<tool>` rules in `permissions` |
+| Codex | `codex` | `$CODEX_HOME/config.toml`, by default `~/.codex/config.toml` | `[mcp_servers.mx]`, and `approval_mode` in `[mcp_servers.mx.tools.<tool>]` |
 
 ### Linux
 
@@ -40,8 +50,6 @@ The exe is not code-signed, so SmartScreen warns before it runs. Choose More inf
 
 The binary goes to `%LOCALAPPDATA%\Programs\mx\mx.exe`. Next to it, `mxw.exe` is the same program marked as a Windows GUI program, so Windows starts it without a console window. The value `mx` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` starts `mxw.exe sync` at sign-in. Its log is `%LOCALAPPDATA%\mx\state\sync.log`.
 
-Claude Desktop reads `mcpServers.mx` in `%APPDATA%\Claude\claude_desktop_config.json`. Quit and reopen Claude Desktop after the install so it starts mx.
-
 ### Uninstall
 
 ```sh
@@ -51,7 +59,7 @@ mx uninstall
 It lists what it removes and asks first. `mx uninstall --yes` removes it all without asking; without a terminal, `--yes` is required. In this order, it:
 
 1. Stops `mx sync` and removes its registration. Sync deletes its Graph subscriptions as it stops, while its sign-in is still saved.
-2. Removes mx from Claude Desktop, Claude Code and Codex.
+2. Removes mx from every agent config file that has it: the `mx` entry in `mcpServers`, Codex's `[mcp_servers.mx]` with its tool tables, and every rule in the `allow`, `ask` and `deny` lists of Claude Code's user settings that names mx, as `mcp__mx`, `mcp__mx__<tool>` or a glob such as `mcp__mx__*`. A list it empties goes too. Project and local settings files stay as they are.
 3. Deletes the installed binary, `config.json` with the client id and the tenant, the mail store, the saved sign-in, the attachment cache and the state folder.
 
 Nothing of mx stays. To keep the sign-in, the mail and the settings, run `mx install` again instead.
@@ -123,10 +131,31 @@ Read tools answer from the local store. `message` with `full=true` and `attachme
 
 ### Recommended approvals
 
-The tools carry MCP hints: `readOnlyHint` on `search`, `thread`, `message` and `attachment`, and `destructiveHint` on every write but `draft`, since `update_draft` replaces a body, `update` moves mail, `delete_draft` and `delete` move it to Deleted Items, and `send` sends it. Set the client's permissions to:
+The tools carry MCP hints: `readOnlyHint` on `search`, `thread`, `message` and `attachment`, and `destructiveHint` on every write but `draft`, since `update_draft` replaces a body, `update` moves mail, `delete_draft` and `delete` move it to Deleted Items, and `send` sends it. The hints do not set the approvals. mx recommends:
 
 - Allow `search`, `thread`, `message`, `attachment`, `draft`, `update_draft`, `delete_draft` and `update` without asking.
 - Always ask for `send` and `delete`.
+
+`mx install` sets these for each tool that has no approval yet, and keeps every approval you set:
+
+| Agent | Allow without asking | Always ask | A tool has an approval when |
+| --- | --- | --- | --- |
+| Claude Code | `mcp__mx__<tool>` in `permissions.allow` of `~/.claude/settings.json` | `mcp__mx__<tool>` in `permissions.ask` | A rule in `allow`, `ask` or `deny` covers it: `mcp__mx__<tool>`, `mcp__mx`, or a glob such as `mcp__mx__*` |
+| Codex | `approval_mode = "approve"` in `[mcp_servers.mx.tools.<tool>]` | `approval_mode = "prompt"` | The tool's table sets `approval_mode`, or `[mcp_servers.mx]` sets `default_tools_approval_mode` |
+
+Claude Code checks `deny`, then `ask`, then `allow`, and the first rule that matches decides. Claude Desktop keeps tool approvals outside its config file, so mx sets none there.
+
+With `approval_policy = "never"`, Codex approves a `prompt` tool without asking when its sandbox is off, external, or allows writes to the whole disk, as `sandbox_mode = "danger-full-access"` does. There, "always ask" is not guaranteed. Codex 0.163.0 decides this in `mcp_permission_prompt_is_auto_approved`, in `codex-rs/codex-mcp/src/mcp/mod.rs`.
+
+### Changing approvals
+
+The recommended approvals are defaults. Change them in each agent's own settings, and a reinstall keeps them.
+
+Warning: allowing `send` without asking lets an agent send email as you without review, including when an incoming email tells it to.
+
+- **Claude Code:** run `/permissions`, or edit `~/.claude/settings.json` and move `mcp__mx__send` or `mcp__mx__delete` from `permissions.ask` to `permissions.allow`. An `ask` rule from any settings file outranks an `allow` rule, so the rule must leave `ask`. The prompt's "Yes, and don't ask again" option saves an `allow` rule to `.claude/settings.local.json` in the repository, which does not outrank the `ask` rule in `~/.claude/settings.json`.
+- **Codex:** in `config.toml`, set `approval_mode = "approve"` in `[mcp_servers.mx.tools.send]` or `[mcp_servers.mx.tools.delete]`. Codex then runs the tool without asking under any `approval_policy`.
+- **Claude Desktop:** choose to allow the tool always when its approval prompt asks.
 
 ## Rebuild the search index
 

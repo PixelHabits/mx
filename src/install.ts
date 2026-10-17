@@ -1,6 +1,5 @@
 import {
 	Array as Arr,
-	Config,
 	Console,
 	Context,
 	Effect,
@@ -8,10 +7,10 @@ import {
 	Layer,
 	Option,
 	Path,
-	Schema,
 	Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { type Agent, type AgentId, agents, type ConfigFile } from "./agents.ts";
 import { Auth, signIn } from "./auth/auth.ts";
 import type { SignInConfig } from "./auth/config.ts";
 import { Credentials } from "./auth/credentials.ts";
@@ -79,15 +78,8 @@ const oldName = (exe: string) => exe.replace(exeSuffix, ".old.exe");
 
 const trailingBackslashes = /\\+$/u;
 
-const McpConfig = Schema.Record(Schema.String, Schema.Unknown);
-const decodeJsonObject = Schema.decodeEffect(Schema.fromJsonString(McpConfig));
-const encodeJson = Schema.encodeEffect(
-	Schema.fromJsonString(McpConfig, { space: 2 })
-);
-
-const CodexConfig = Schema.Struct({
-	mcp_servers: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
-});
+/** Names agents as a sentence does: `Claude Code and Codex`. */
+const listed = new Intl.ListFormat("en", { type: "conjunction" });
 
 /** One thing `mx uninstall` removes: `what` names it as the prompt lists it, and `remove` removes it and says so. */
 export interface Removal {
@@ -96,20 +88,21 @@ export interface Removal {
 }
 
 /**
- * Installs mx for the signed-in user: the binary, the background `mx sync`, and the MCP server in every client it
- * finds. Each step writes the state it wants, so running it again changes nothing that is already right.
+ * Installs mx for the signed-in user: the binary, the background `mx sync`, and `mx mcp` in the config of each agent
+ * chosen. Each step writes the state it wants, so running it again reinstalls without duplicating anything.
  */
 export class Installer extends Context.Service<
 	Installer,
 	{
-		/** Signs in with `login` when there is no sign-in saved for it. */
-		readonly install: (
-			login: SignInConfig
-		) => Effect.Effect<
+		/** Sets up `agents`, and signs in with `login` when there is no sign-in saved for it. */
+		readonly install: (options: {
+			readonly agents: readonly AgentId[];
+			readonly login: SignInConfig;
+		}) => Effect.Effect<
 			void,
 			InstallFailed | SignInFailed | MicrosoftUnavailable
 		>;
-		/** What `mx uninstall` removes on this machine, in the order it removes them; none when mx left nothing here. */
+		/** What `mx uninstall` removes on this machine, in the order it removes them. */
 		readonly removals: Effect.Effect<readonly Removal[], InstallFailed>;
 		/** Puts `bytes` in place as the installed binary, also while it runs. */
 		readonly replaceBinary: (
@@ -137,22 +130,12 @@ export class Installer extends Context.Service<
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 			const credentials = yield* Credentials;
 			const auth = yield* Auth;
-			const { bin, cache, config, configFile, data, home, state } =
-				yield* Paths;
-			const { codexHome, searchPath } = yield* Config.all({
-				codexHome: Config.option(Config.NonEmptyString("CODEX_HOME")),
-				searchPath: Config.String("PATH").pipe(Config.withDefault("")),
-			});
+			const { bin, cache, config, configFile, data, state } = yield* Paths;
+			const offered = yield* agents;
 			const windows = process.platform === "win32";
 			const folder = path.dirname(bin);
 			const background = path.join(folder, backgroundName);
 			const unitFile = path.join(config, "systemd", "user", unitName);
-			const claudeDesktop = path.join(config, "Claude");
-			const codexConfig = path.join(
-				Option.getOrElse(codexHome, () => path.join(home, ".codex")),
-				"config.toml"
-			);
-			const codexSection = `\n${Bun.TOML.stringify({ mcp_servers: { mx: { args: ["mcp"], command: bin } } })}`;
 			const failed = (step: string) => (error: { readonly message: string }) =>
 				InstallFailed.make({ message: `${step}: ${error.message}` });
 
@@ -216,9 +199,6 @@ export class Installer extends Context.Service<
 				Effect.scoped(
 					Effect.flatMap(spawner.spawn(command), (started) => started.unref)
 				).pipe(Effect.asVoid, Effect.mapError(failed(what)));
-
-			const which = (name: string) =>
-				Option.fromNullishOr(Bun.which(name, { PATH: searchPath }));
 
 			/**
 			 * Writes the whole binary next to `target` and renames it into place, so `target` never holds part of one. Windows
@@ -380,116 +360,81 @@ export class Installer extends Context.Service<
 				);
 			});
 
-			/** Claude Desktop keeps its MCP servers in `mcpServers` of `claude_desktop_config.json`; other keys stay. */
-			const editClaudeDesktop = (
-				edit: (servers: Record<string, unknown>) => Record<string, unknown>
-			) =>
-				Effect.gen(function* () {
-					const file = path.join(claudeDesktop, "claude_desktop_config.json");
-					const current = (yield* fs.exists(file))
-						? yield* decodeJsonObject(yield* fs.readFileString(file))
-						: {};
-					const servers = yield* Schema.decodeUnknownEffect(McpConfig)(
-						current.mcpServers ?? {}
-					);
-					yield* fs.writeFileString(
-						file,
-						yield* encodeJson({ ...current, mcpServers: edit(servers) })
-					);
-				}).pipe(
-					Effect.mapError(
-						failed(
-							"Could not update Claude Desktop's claude_desktop_config.json"
-						)
-					)
+			/**
+			 * Writes `text` over the config file by renaming a whole file onto it, so the agent never reads half of one. A
+			 * config that is a symlink, as into a dotfiles repository, stays one, and the file keeps its mode. A config that
+			 * does not exist yet is created.
+			 */
+			const writeConfig = Effect.fnUntraced(function* (
+				file: string,
+				text: string
+			) {
+				const exists = yield* fs.exists(file);
+				const target = exists ? yield* fs.realPath(file) : file;
+				yield* fs.makeDirectory(path.dirname(target), { recursive: true });
+				const staged = yield* fs.makeTempFileScoped({
+					directory: path.dirname(target),
+				});
+				yield* fs.writeFileString(staged, text);
+				if (exists) {
+					yield* fs.chmod(staged, (yield* fs.stat(target)).mode % 0o1000);
+				}
+				yield* fs.rename(staged, target);
+			}, Effect.scoped);
+
+			/** The text mx edits: the file's, or the one mx starts from when there is none; none when the agent must write it. */
+			const current = (file: ConfigFile) =>
+				fs.exists(file.path).pipe(
+					Effect.flatMap((exists) =>
+						exists
+							? Effect.asSome(fs.readFileString(file.path))
+							: Effect.succeed(file.initial)
+					),
+					Effect.mapError(failed(`Could not read ${file.path}`))
 				);
 
-			const codexHasMx = Effect.gen(function* () {
-				const text = yield* fs.readFileString(codexConfig);
-				const parsed = yield* Effect.try({
-					catch: (error) =>
-						InstallFailed.make({
-							message: `${codexConfig} is not valid TOML: ${String(error)}`,
-						}),
-					try: (): unknown => Bun.TOML.parse(text),
-				});
-				const { mcp_servers } = yield* Schema.decodeUnknownEffect(CodexConfig)(
-					parsed
-				).pipe(Effect.mapError(failed(`Could not read ${codexConfig}`)));
-				return { has: mcp_servers?.mx !== undefined, text };
-			});
+			/** The file's text with mx set up; fails when the agent has not written the file yet. */
+			const setUp = (agent: Agent, file: ConfigFile) =>
+				Effect.flatMap(
+					current(file),
+					Option.match({
+						onNone: () =>
+							InstallFailed.make({
+								message: `${file.path} does not exist. ${agent.createConfig}`,
+							}),
+						onSome: file.setUp,
+					})
+				);
 
-			const registerClients = Effect.gen(function* () {
-				if (windows && (yield* fs.exists(claudeDesktop))) {
-					yield* editClaudeDesktop((servers) => ({
-						...servers,
-						mx: { args: ["mcp"], command: bin },
-					}));
-					yield* Console.log("Registered mx with Claude Desktop.");
-				}
-				const claude = which("claude");
-				if (Option.isSome(claude)) {
-					yield* run(claude.value, ["mcp", "remove", "--scope", "user", "mx"], {
-						allowFailure: true,
-					});
-					yield* run(claude.value, [
-						"mcp",
-						"add",
-						"--scope",
-						"user",
-						"mx",
-						"--",
-						bin,
-						"mcp",
-					]);
-					yield* Console.log("Registered mx with Claude Code.");
-				}
-				const codex = which("codex");
-				if (Option.isSome(codex)) {
-					yield* run(codex.value, ["mcp", "add", "mx", "--", bin, "mcp"]);
-					yield* Console.log("Registered mx with Codex.");
-				} else if (yield* fs.exists(codexConfig)) {
-					const { has, text } = yield* codexHasMx;
-					if (!has) {
-						yield* fs.writeFileString(codexConfig, `${text}${codexSection}`);
-					}
-					yield* Console.log(`Registered mx with Codex in ${codexConfig}.`);
-				}
-			}).pipe(
-				Effect.catchTag("PlatformError", (error) =>
-					Effect.fail(failed("Could not register mx with an MCP client")(error))
-				)
-			);
+			const takeOut = (file: ConfigFile) =>
+				Effect.flatMap(
+					current(file),
+					Option.match({
+						onNone: () => Effect.succeedNone,
+						onSome: file.takeOut,
+					})
+				);
 
-			const unregisterClients = Effect.gen(function* () {
-				if (windows && (yield* fs.exists(claudeDesktop))) {
-					yield* editClaudeDesktop(({ mx: _, ...others }) => others);
-				}
-				const claude = which("claude");
-				if (Option.isSome(claude)) {
-					yield* run(claude.value, ["mcp", "remove", "--scope", "user", "mx"], {
-						allowFailure: true,
-					});
-				}
-				const codex = which("codex");
-				if (Option.isSome(codex)) {
-					yield* run(codex.value, ["mcp", "remove", "mx"], {
-						allowFailure: true,
-					});
-				} else if (yield* fs.exists(codexConfig)) {
-					const text = yield* fs.readFileString(codexConfig);
-					yield* fs.writeFileString(
-						codexConfig,
-						text.replace(codexSection, "")
-					);
-				}
-			}).pipe(
-				Effect.catchTag("PlatformError", (error) =>
-					Effect.fail(
-						failed("Could not unregister mx from an MCP client")(error)
-					)
-				)
-			);
+			/**
+			 * Runs `edit`, which reads the file, and writes its answer right away, so what another program saved to the file
+			 * earlier stays. Prints `done` when it wrote.
+			 */
+			const change = (
+				file: ConfigFile,
+				edit: Effect.Effect<Option.Option<string>, InstallFailed>,
+				done: string
+			) =>
+				Effect.flatMap(
+					edit,
+					Option.match({
+						onNone: () => Effect.void,
+						onSome: (text) =>
+							writeConfig(file.path, text).pipe(
+								Effect.mapError(failed(`Could not write ${file.path}`)),
+								Effect.andThen(Console.log(done))
+							),
+					})
+				);
 
 			/** Whether a sign-in is saved. */
 			const signedIn = credentials.read.pipe(
@@ -498,7 +443,31 @@ export class Installer extends Context.Service<
 			);
 
 			const install = Effect.fn("Installer.install")(
-				function* (login: SignInConfig) {
+				function* ({
+					agents: chosen,
+					login,
+				}: {
+					readonly agents: readonly AgentId[];
+					readonly login: SignInConfig;
+				}) {
+					// Every config is read and edited before anything changes, so a missing or unreadable one changes nothing.
+					const set = yield* Effect.forEach(Arr.dedupe(chosen), (id) =>
+						Effect.gen(function* () {
+							const agent = Arr.findFirst(offered, (each) => each.id === id);
+							if (Option.isNone(agent)) {
+								return yield* InstallFailed.make({
+									message:
+										"mx sets up Claude Desktop on Windows and macOS only.",
+								});
+							}
+							yield* Effect.forEach(
+								agent.value.files,
+								(file) => setUp(agent.value, file),
+								{ discard: true }
+							);
+							return agent.value;
+						})
+					);
 					if (path.resolve(process.execPath) !== path.resolve(bin)) {
 						const bytes = yield* fs
 							.readFile(process.execPath)
@@ -513,13 +482,25 @@ export class Installer extends Context.Service<
 					}
 					yield* registerSync;
 					yield* Console.log("Registered mx sync to start at sign-in.");
-					yield* registerClients;
+					// Each config is read again as it is written, so what an agent saved to it in the meantime stays.
+					for (const agent of set) {
+						for (const file of agent.files) {
+							yield* change(
+								file,
+								setUp(agent, file),
+								`Registered mx with ${agent.app} in ${file.path}.`
+							);
+						}
+					}
 					yield* credentials.use(login);
 					if (!(yield* signedIn)) {
 						yield* signIn(auth, login);
 					}
 					yield* restartSync;
 					yield* Console.log("Started mx sync.");
+					yield* Console.log(
+						`Quit and reopen ${listed.format(Arr.map(set, ({ app }) => app))} now. An agent left open can write its old settings back and drop mx.`
+					);
 				},
 				Effect.catchTag("CredentialFailed", (error) =>
 					Effect.fail(failed("Could not read the saved sign-in")(error))
@@ -691,19 +672,28 @@ export class Installer extends Context.Service<
 							},
 						]
 					: [];
+				const agentRemovals = Arr.getSomes(
+					yield* Effect.forEach(
+						Arr.flatMap(offered, (agent) => agent.files),
+						(file) =>
+							Effect.map(
+								takeOut(file),
+								Option.map(
+									(): Removal => ({
+										remove: change(
+											file,
+											takeOut(file),
+											`Removed ${file.holds} from ${file.path}.`
+										),
+										what: `${file.holds} in ${file.path}`,
+									})
+								)
+							)
+					)
+				);
 				return Arr.flatten([
 					registration,
-					[
-						{
-							remove: Effect.andThen(
-								unregisterClients,
-								Console.log(
-									"Removed mx from Claude Desktop, Claude Code and Codex."
-								)
-							),
-							what: "the mx entry in Claude Desktop, Claude Code and Codex",
-						},
-					],
+					agentRemovals,
 					yield* programRemovals,
 					yield* removeFile("the client id and the tenant", configFile),
 					yield* removeStore,

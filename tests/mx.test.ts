@@ -114,8 +114,9 @@ const platformWith = (env: Record<string, string>) =>
 const platform = platformWith(environment);
 
 /** `platform` without `MX_CLIENT_ID` and `MX_TENANT`, where only config.json can name a client id and a tenant. */
-const { MX_CLIENT_ID: _, MX_TENANT: __, ...withoutSignIn } = environment;
-const unconfigured = platformWith(withoutSignIn);
+const unconfigured = platformWith(
+	Rec.remove(Rec.remove(environment, "MX_CLIENT_ID"), "MX_TENANT")
+);
 
 /** `mx mcp` as Claude Code starts it, one process for every test, with a client on its stdio. */
 const server = ManagedRuntime.make(
@@ -145,25 +146,40 @@ const test = <E>(
 /** Everything any mx process printed, to check that no token ever shows. */
 const printed: string[] = [];
 
-/** Runs `mx <args>` as a process of its own on `system` and answers what it printed to stdout. */
-const cliOn =
+/** Runs `mx <args>` as a process of its own on `system`: how it exited, and what it printed to stdout and stderr. */
+const runOn =
 	(system: typeof platform) =>
 	(...args: string[]) =>
-		Command.runWith(mx, { version: "0.0.0-test" })(args).pipe(
-			Effect.andThen(
-				Effect.all({
-					errors: TestConsole.errorLines,
-					output: TestConsole.logLines,
-				})
+		Effect.exit(Command.runWith(mx, { version: "0.0.0-test" })(args)).pipe(
+			Effect.flatMap((exit) =>
+				Effect.map(
+					Effect.all({
+						errors: TestConsole.errorLines,
+						output: TestConsole.logLines,
+					}),
+					({ errors, output }) => {
+						printed.push(...Arr.map([...errors, ...output], String));
+						return {
+							errors: Arr.join(Arr.map(errors, String), "\n"),
+							exit,
+							output: Arr.join(Arr.map(output, String), "\n"),
+						};
+					}
+				)
 			),
-			Effect.map(({ errors, output }) => {
-				printed.push(...Arr.map([...errors, ...output], String));
-				return { output: Arr.join(Arr.map(output, String), "\n") };
-			}),
 			// @effect-diagnostics-next-line strictEffectProvide:off - each call is the entry point of one mx process.
 			Effect.provide(system, { local: true })
 		);
 
+/** Runs `mx <args>` and answers what it printed to stdout; when mx fails, this fails with mx's error. */
+const cliOn =
+	(system: typeof platform) =>
+	(...args: string[]) =>
+		Effect.flatMap(runOn(system)(...args), ({ exit, output }) =>
+			Effect.as(exit, { output })
+		);
+
+const run = runOn(platform);
 const cli = cliOn(platform);
 
 /** Runs `effect` with stdin a terminal or not; mx asks for what a command needs only on a terminal. */
@@ -271,6 +287,28 @@ const cutOffWrites = (folder: string) =>
 							? fs
 									.writeFile(file, data.subarray(0, 4), options)
 									.pipe(Effect.andThen(Effect.die("The machine stopped.")))
+							: fs.writeFile(file, data, options),
+				})
+			)
+		).pipe(Layer.provide(BunServices.layer))
+	);
+
+/** `platform` where an agent saves its config, as `save` does, while mx install writes the binary. */
+const savedWhileInstalling = (
+	save: (
+		fs: FileSystem.FileSystem
+	) => ReturnType<FileSystem.FileSystem["writeFile"]>
+) =>
+	Layer.merge(
+		platform,
+		Layer.effect(
+			FileSystem.FileSystem,
+			Effect.map(FileSystem.FileSystem, (fs) =>
+				FileSystem.FileSystem.of({
+					...fs,
+					writeFile: (file, data, options) =>
+						file.startsWith(`${home}/.local/bin/`)
+							? Effect.andThen(save(fs), fs.writeFile(file, data, options))
 							: fs.writeFile(file, data, options),
 				})
 			)
@@ -398,9 +436,93 @@ const downloads = (version: string) =>
 		request.url.pathname.startsWith(`${releasesPath}download/v${version}/`)
 	).length;
 const unitFile = `${home}/config/systemd/user/mx-sync.service`;
-const claudeCli = `${home}/path/claude`;
+const mxEntry = { args: ["mcp"], command: installed };
+
+const claudeCodeConfig = `${home}/.claude.json`;
+const claudeCodeSettings = {
+	mcpServers: {
+		mx: { args: ["mcp"], command: "/old/mx", env: { MX_DEBUG: "1" } },
+		other: { args: [], command: "other" },
+	},
+	numStartups: 3,
+	projects: { [home]: { allowedTools: [] } },
+};
+
+const desktopConfig = `${home}/AppData/Roaming/Claude/claude_desktop_config.json`;
+
 const codexConfig = `${home}/.codex/config.toml`;
-const codexSettings = 'model = "gpt-6.1-sol"\n';
+const codexSettings = `# Codex settings for the test machine.
+model = "gpt-6.1-sol"
+
+[mcp_servers.mx]
+command = "/old/mx"
+args = ["mcp"]
+
+[mcp_servers.mx.env]
+MX_DEBUG = "1"
+
+# A server mx leaves alone.
+[mcp_servers.other]
+command = "other"
+`;
+/** `[mcp_servers.mx.tools.<tool>]` tables, each with its approval mode. */
+const codexApprovals = (approvals: readonly (readonly [string, string])[]) =>
+	Arr.join(
+		Arr.map(
+			approvals,
+			([name, mode]) =>
+				`[mcp_servers.mx.tools.${name}]\napproval_mode = "${mode}"\n\n`
+		),
+		""
+	);
+/** The recommended approvals: every tool runs without asking, except send and delete, which always ask. */
+const recommended = [
+	["search", "approve"],
+	["thread", "approve"],
+	["message", "approve"],
+	["attachment", "approve"],
+	["draft", "approve"],
+	["update_draft", "approve"],
+	["delete_draft", "approve"],
+	["send", "prompt"],
+	["update", "approve"],
+	["delete", "prompt"],
+] as const;
+const codexWithMx = `# Codex settings for the test machine.
+model = "gpt-6.1-sol"
+
+[mcp_servers.mx]
+command = "${installed}"
+args = ["mcp"]
+
+[mcp_servers.mx.env]
+MX_DEBUG = "1"
+
+${codexApprovals(recommended)}# A server mx leaves alone.
+[mcp_servers.other]
+command = "other"
+`;
+/** `codexSettings` where the user already lets Codex run `send` without asking. */
+const codexSendApproved = codexSettings.replace(
+	"# A server mx leaves alone.",
+	`${codexApprovals([["send", "approve"]])}# A server mx leaves alone.`
+);
+
+/** Claude Code's user settings, linked into a dotfiles folder, where the user denies mx's `delete`. */
+const claudeCodeSettingsFile = `${home}/.claude/settings.json`;
+const dotfile = `${home}/dotfiles/claude/settings.json`;
+const userSettings = {
+	model: "opus",
+	permissions: { allow: ["Bash(ls *)"], deny: ["mcp__mx__delete"] },
+};
+
+const codexWithoutMx = `# Codex settings for the test machine.
+model = "gpt-6.1-sol"
+
+# A server mx leaves alone.
+[mcp_servers.other]
+command = "other"
+`;
 
 /** `mx sync` running as the service does, from the first push test to the last. */
 const services: Fiber.Fiber<unknown, unknown>[] = [];
@@ -416,6 +538,10 @@ const readJson = (file: string) =>
 	Effect.flatMap(
 		Effect.flatMap(FileSystem.FileSystem, (fs) => fs.readFileString(file)),
 		parseJson
+	);
+const writeJson = (file: string, value: unknown) =>
+	Effect.flatMap(FileSystem.FileSystem, (fs) =>
+		fs.writeFileString(file, JSON.stringify(value, null, 2))
 	);
 const secrets_ = /synthetic-(access|refresh)-token|synthetic-device-code/u;
 const ownSentLine = /^#\d+ .* Sent Items \(me\)$/mu;
@@ -1315,17 +1441,120 @@ describe("mx", () => {
 			Effect.provide(TestClock.layer())
 		));
 
-	test("mx install, run twice, installs the binary, enables the systemd unit, registers mx with Claude Code and Codex, and starts sync", () =>
+	test("mx install without --agent and without a terminal fails, names the agents it can set up, and changes nothing", () =>
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
-			yield* fs.makeDirectory(`${home}/path`, { recursive: true });
-			yield* fs.writeFileString(claudeCli, "");
-			yield* fs.chmod(claudeCli, 0o755);
+			const before = processes.commands.length;
+			const { errors, exit } = yield* withStdinTerminal(false)(run("install"));
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(errors).toContain("--agent");
+			expect(errors).toContain("claude-code, codex");
+			expect(errors).not.toContain("claude-desktop");
+			expect(processes.commands).toHaveLength(before);
+			expect(yield* fs.exists(installed)).toBe(false);
+		}));
+
+	test("mx install fails before it changes anything when a chosen agent's config file is missing, and names that file", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* writeJson(claudeCodeConfig, claudeCodeSettings);
+			const settings = yield* fs.readFileString(claudeCodeConfig);
+			const before = processes.commands.length;
+			const failure = yield* Effect.flip(
+				cli("install", "--agent", "claude-code", "--agent", "codex")
+			);
+			expect(failure.message).toBe(
+				`${codexConfig} does not exist. Open Codex once, then run mx install again.`
+			);
+			expect(yield* fs.readFileString(claudeCodeConfig)).toBe(settings);
+			expect(processes.commands).toHaveLength(before);
+			expect(yield* fs.exists(installed)).toBe(false);
+		}));
+
+	test("mx install without --agent asks which agents to set up, and the ones whose config file exists start selected", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const { frames, system } = fakeTerminal(platform, ["return"]);
+			const { exit } = yield* withStdinTerminal(true)(runOn(system)("install"));
+			expect(Exit.isSuccess(exit)).toBe(true);
+			const drawn = Arr.join(frames, "");
+			expect(drawn).toContain("Claude Code");
+			expect(drawn).toContain("Codex");
+			expect(drawn).not.toContain("Claude Desktop");
+			expect(yield* readJson(claudeCodeConfig)).toEqual({
+				...claudeCodeSettings,
+				mcpServers: {
+					...claudeCodeSettings.mcpServers,
+					mx: { ...claudeCodeSettings.mcpServers.mx, ...mxEntry },
+				},
+			});
+			expect(yield* fs.exists(codexConfig)).toBe(false);
+		}));
+
+	test("mx install refuses a config.toml it cannot change without touching other settings, and writes nothing", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const dotted =
+				'model = "gpt-6.1-sol"\n\n[mcp_servers]\nmx.command = "/old/mx"\n';
 			yield* fs.makeDirectory(`${home}/.codex`, { recursive: true });
+			yield* fs.writeFileString(codexConfig, dotted);
+			const before = processes.commands.length;
+			const failure = yield* Effect.flip(cli("install", "--agent", "codex"));
+			expect(failure.message).toContain(codexConfig);
+			expect(yield* fs.readFileString(codexConfig)).toBe(dotted);
+			expect(processes.commands).toHaveLength(before);
+		}));
+
+	test("mx install keeps what an agent saved to its config while mx install ran, and says to restart each agent it set up", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* writeJson(claudeCodeConfig, claudeCodeSettings);
+			yield* fs.writeFileString(codexConfig, codexSettings);
+			const saved = {
+				...claudeCodeSettings,
+				mcpServers: {
+					...claudeCodeSettings.mcpServers,
+					notes: { args: [], command: "notes" },
+				},
+				numStartups: 4,
+			};
+			const { output } = yield* cliOn(
+				savedWhileInstalling((files) =>
+					Effect.andThen(
+						files.writeFileString(
+							claudeCodeConfig,
+							JSON.stringify(saved, null, 2)
+						),
+						files.writeFileString(
+							codexConfig,
+							`${codexSettings}\n[mcp_servers.notes]\ncommand = "notes"\n`
+						)
+					)
+				)
+			)("install", "--agent", "claude-code", "--agent", "codex");
+			expect(yield* readJson(claudeCodeConfig)).toEqual({
+				...saved,
+				mcpServers: {
+					...saved.mcpServers,
+					mx: { ...saved.mcpServers.mx, ...mxEntry },
+				},
+			});
+			const codex = yield* fs.readFileString(codexConfig);
+			expect(codex).toContain('[mcp_servers.notes]\ncommand = "notes"');
+			expect(codex).toContain(`command = "${installed}"`);
+			expect(lines(output).at(-1)).toBe(
+				"Quit and reopen Claude Code and Codex now. An agent left open can write its old settings back and drop mx."
+			);
+		}));
+
+	test("mx install, run twice, installs the binary, enables the systemd unit, sets the command and args of one mx entry in each agent's config and keeps everything else, the entry's other keys too, and starts sync", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* writeJson(claudeCodeConfig, claudeCodeSettings);
 			yield* fs.writeFileString(codexConfig, codexSettings);
 			const before = processes.commands.length;
-			yield* cli("install");
-			yield* cli("install");
+			yield* cli("install", "--agent", "claude-code", "--agent", "codex");
+			yield* cli("install", "--agent", "codex", "--agent", "claude-code");
 			expect((yield* fs.stat(installed)).size).toBe(
 				(yield* fs.stat(process.execPath)).size
 			);
@@ -1336,8 +1565,6 @@ describe("mx", () => {
 			const once = [
 				"systemctl --user daemon-reload",
 				"systemctl --user enable mx-sync.service",
-				`${claudeCli} mcp remove --scope user mx`,
-				`${claudeCli} mcp add --scope user mx -- ${installed} mcp`,
 				"systemctl --user restart --no-block mx-sync.service",
 			];
 			expect(
@@ -1345,9 +1572,103 @@ describe("mx", () => {
 					Arr.join(command, " ")
 				)
 			).toEqual([...once, ...once]);
-			expect(yield* fs.readFileString(codexConfig)).toBe(
-				`${codexSettings}\n[mcp_servers.mx]\nargs = ["mcp"]\ncommand = "${installed}"\n`
+			expect(yield* readJson(claudeCodeConfig)).toEqual({
+				...claudeCodeSettings,
+				mcpServers: {
+					...claudeCodeSettings.mcpServers,
+					mx: { ...claudeCodeSettings.mcpServers.mx, ...mxEntry },
+				},
+			});
+			expect(yield* fs.readFileString(codexConfig)).toBe(codexWithMx);
+		}));
+
+	test("with CLAUDE_CONFIG_DIR set, mx install writes Claude Code's .claude.json and settings.json in that folder and leaves ~/.claude.json alone", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const folder = `${home}/claude-work`;
+			yield* fs.makeDirectory(folder, { recursive: true });
+			yield* writeJson(`${folder}/.claude.json`, { numStartups: 1 });
+			const before = yield* fs.readFileString(claudeCodeConfig);
+			yield* cliOn(platformWith({ ...environment, CLAUDE_CONFIG_DIR: folder }))(
+				"install",
+				"--agent",
+				"claude-code"
 			);
+			expect(yield* readJson(`${folder}/.claude.json`)).toEqual({
+				mcpServers: { mx: mxEntry },
+				numStartups: 1,
+			});
+			expect(yield* readJson(`${folder}/settings.json`)).toMatchObject({
+				permissions: { ask: ["mcp__mx__send", "mcp__mx__delete"] },
+			});
+			expect(yield* fs.readFileString(claudeCodeConfig)).toBe(before);
+		}));
+
+	test("mx install keeps the tool approvals each agent has, presets the recommended ones only where none is set, and writes Claude Code's through a symlink", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* fs.writeFileString(codexConfig, codexSendApproved);
+			yield* fs.makeDirectory(`${home}/dotfiles/claude`, { recursive: true });
+			yield* writeJson(dotfile, userSettings);
+			yield* fs.makeDirectory(`${home}/.claude`, { recursive: true });
+			yield* fs.remove(claudeCodeSettingsFile, { force: true });
+			yield* fs.symlink(dotfile, claudeCodeSettingsFile);
+			yield* cli("install", "--agent", "codex", "--agent", "claude-code");
+			yield* cli("install", "--agent", "claude-code", "--agent", "codex");
+			expect(yield* fs.readFileString(codexConfig)).toBe(
+				codexWithMx.replace(
+					codexApprovals(recommended),
+					codexApprovals([
+						["send", "approve"],
+						...Arr.filter(recommended, ([name]) => name !== "send"),
+					])
+				)
+			);
+			expect(yield* fs.readLink(claudeCodeSettingsFile)).toBe(dotfile);
+			expect(yield* readJson(dotfile)).toEqual({
+				model: "opus",
+				permissions: {
+					allow: [
+						"Bash(ls *)",
+						...Arr.map(
+							Arr.filter(recommended, ([, mode]) => mode === "approve"),
+							([name]) => `mcp__mx__${name}`
+						),
+					],
+					ask: ["mcp__mx__send"],
+					deny: ["mcp__mx__delete"],
+				},
+			});
+		}));
+
+	test("mx install on Windows tells how to make Claude Desktop write its config when it has none", () =>
+		Effect.gen(function* () {
+			const failure = yield* Effect.flip(
+				onWindows(cli("install", "--agent", "claude-desktop"))
+			);
+			expect(failure.message).toBe(
+				`${desktopConfig} does not exist. In Claude Desktop, open Settings › Developer › Edit Config, then run mx install again.`
+			);
+		}));
+
+	test("mx install on Windows writes mx.exe into mcpServers.mx of Claude Desktop's config and keeps its other settings", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const settings = {
+				globalShortcut: "Ctrl+Space",
+				isUsingBuiltInNodeForMcp: true,
+			};
+			yield* fs.makeDirectory(`${home}/AppData/Roaming/Claude`, {
+				recursive: true,
+			});
+			yield* writeJson(desktopConfig, settings);
+			yield* onWindows(cli("install", "--agent", "claude-desktop"));
+			expect(yield* readJson(desktopConfig)).toEqual({
+				...settings,
+				mcpServers: {
+					mx: { args: ["mcp"], command: `${windowsFolder}/mx.exe` },
+				},
+			});
 		}));
 
 	test("mx install on Windows that stops while it writes the new mx.exe leaves the installed one whole", () =>
@@ -1358,7 +1679,9 @@ describe("mx", () => {
 			yield* fs.makeDirectory(windowsFolder, { recursive: true });
 			yield* fs.writeFile(exe, before);
 			const exit = yield* Effect.exit(
-				onWindows(cliOn(cutOffWrites(windowsFolder))("install"))
+				onWindows(
+					cliOn(cutOffWrites(windowsFolder))("install", "--agent", "codex")
+				)
 			);
 			expect(Exit.isFailure(exit)).toBe(true);
 			expect([...(yield* fs.readFile(exe))]).toEqual([...before]);
@@ -1472,16 +1795,31 @@ describe("mx", () => {
 				expect(prompt).toContain(path);
 			}
 			expect(prompt).toContain("the saved sign-in");
+			for (const entry of [
+				`mcpServers.mx in ${claudeCodeConfig}`,
+				`the permission rules that name mx in ${claudeCodeSettingsFile}`,
+				`[mcp_servers.mx] with its tool tables in ${codexConfig}`,
+			]) {
+				expect(prompt).toContain(entry);
+			}
 			expect(output).toBe("mx uninstall removed nothing.");
 			expect(processes.commands).toHaveLength(before);
 			expect(yield* fs.exists(installed)).toBe(true);
 		}));
 
-	test("mx uninstall --yes stops sync first, then removes the unit, the client registrations, the binary, the client id, the mail store, the sign-in, the cache and the state folder", () =>
+	test("mx uninstall --yes stops sync first, then removes the unit, mx from each agent with every Claude Code rule that names mx, the binary, the client id, the mail store, the sign-in, the cache and the state folder", () =>
 		Effect.gen(function* () {
 			secrets.machine = "store";
 			const fs = yield* FileSystem.FileSystem;
 			const before = processes.commands.length;
+			yield* writeJson(dotfile, {
+				model: "opus",
+				permissions: {
+					allow: ["Bash(ls *)", "mcp__mx__search", "mcp__mx__*"],
+					ask: ["mcp__mx__send", "mcp__mx"],
+					deny: ["mcp__mx__delete", "mcp__other__send"],
+				},
+			});
 			let signedInWhenSyncStopped = false;
 			processes.onSpawn = () => {
 				signedInWhenSyncStopped ||= secrets.entries.has("mx/refresh-token");
@@ -1495,10 +1833,18 @@ describe("mx", () => {
 			).toEqual([
 				"systemctl --user disable --now mx-sync.service",
 				"systemctl --user daemon-reload",
-				`${claudeCli} mcp remove --scope user mx`,
 			]);
 			expect(signedInWhenSyncStopped).toBe(true);
-			expect(yield* fs.readFileString(codexConfig)).toBe(codexSettings);
+			const { mx: _, ...others } = claudeCodeSettings.mcpServers;
+			expect(yield* readJson(claudeCodeConfig)).toEqual({
+				...claudeCodeSettings,
+				mcpServers: others,
+			});
+			expect(yield* fs.readFileString(codexConfig)).toBe(codexWithoutMx);
+			expect(yield* readJson(dotfile)).toEqual({
+				model: "opus",
+				permissions: { allow: ["Bash(ls *)"], deny: ["mcp__other__send"] },
+			});
 			for (const path of [
 				installed,
 				unitFile,
@@ -1518,11 +1864,11 @@ describe("mx", () => {
 				const others =
 					"%USERPROFILE%\\AppData\\Local\\Microsoft\\WindowsApps;C:\\Users\\Zoë\\bin;;C:\\Tools\\";
 				processes.userPath = others;
-				const { output } = yield* cli("install");
+				const { output } = yield* cli("install", "--agent", "codex");
 				expect(output).toContain(
 					`Added ${windowsFolder} to your PATH. Open a new terminal to run mx.`
 				);
-				yield* cli("install");
+				yield* cli("install", "--agent", "codex");
 				expect(processes.userPath).toBe(`${others};${windowsFolder}`);
 				yield* cli("uninstall", "--yes");
 				expect(processes.userPath).toBe(others);
@@ -1533,7 +1879,7 @@ describe("mx", () => {
 		onWindows(
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
-				yield* cli("install");
+				yield* cli("install", "--agent", "codex");
 				const before = processes.commands.length;
 				let installedWhenSyncStopped = false;
 				processes.onSpawn = () => {
@@ -1558,7 +1904,7 @@ describe("mx", () => {
 					`${windowsFolder}/mx.old.exe`,
 					`${windowsFolder}/mxw.old.exe`,
 				];
-				yield* cli("install");
+				yield* cli("install", "--agent", "codex");
 				yield* Effect.forEach(movedAside, (file) =>
 					fs.writeFileString(file, "an exe an update moved aside")
 				);

@@ -11,6 +11,7 @@ import {
 } from "effect";
 import { CliError, Command, Flag, Prompt } from "effect/cli";
 import packageJson from "../package.json" with { type: "json" };
+import { agentFlag } from "./agents.ts";
 import { Auth, signIn } from "./auth/auth.ts";
 import { clientIdFlag, tenantFlag } from "./auth/config.ts";
 import type { InstallFailed } from "./errors.ts";
@@ -137,13 +138,15 @@ const update = Command.make("update", {}, () =>
 
 const install = Command.make(
 	"install",
-	{ clientId: clientIdFlag, tenant: tenantFlag },
-	(config) =>
-		Effect.flatMap(Installer, (installer) => installer.install(config))
+	{ agent: agentFlag, clientId: clientIdFlag, tenant: tenantFlag },
+	({ agent, clientId, tenant }) =>
+		Effect.flatMap(Installer, (installer) =>
+			installer.install({ agents: agent, login: { clientId, tenant } })
+		)
 ).pipe(
 	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
 	Command.withDescription(
-		"Install this binary for the signed-in user, start mx sync at sign-in, register mx mcp with Claude Desktop, Claude Code and Codex where they are installed, and sign in when there is no saved sign-in. Safe to run again."
+		"Install this binary for the signed-in user, start mx sync at sign-in, add mx mcp to the MCP config of each agent chosen, and sign in when there is no saved sign-in. Run it again to reinstall."
 	)
 );
 
@@ -189,7 +192,7 @@ const uninstall = Command.make(
 ).pipe(
 	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
 	Command.withDescription(
-		"Stop mx sync, and remove its registration, mx from each MCP client, the installed binary, the client id and the tenant, the mail store, the saved sign-in, the attachment cache and the state folder. It lists them and asks first; --yes removes them without asking."
+		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, the installed binary, the client id and the tenant, the mail store, the saved sign-in, the attachment cache and the state folder. It lists them and asks first; --yes removes them without asking."
 	)
 );
 
