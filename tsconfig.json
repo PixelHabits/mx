@@ -65,6 +65,9 @@
 					"effect/Path",
 					// systemd-creds for the saved sign-in.
 					"effect/process",
+					// The mail store in SQLite, and its transactions.
+					"effect/sql",
+					"@effect/sql-sqlite-bun",
 					"effect/Stdio",
 					"effect/Terminal",
 					// Console capture in the tests.

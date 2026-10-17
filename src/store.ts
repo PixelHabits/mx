@@ -1,20 +1,21 @@
-import { Database } from "bun:sqlite";
+import { SqliteClient } from "@effect/sql-sqlite-bun";
 import {
 	Array as Arr,
 	Context,
+	Duration,
 	Effect,
 	FileSystem,
 	Layer,
 	Option,
 	Path,
 	Schema,
-	Semaphore,
 } from "effect";
+import { SqlClient, type SqlError, type Statement } from "effect/sql";
 import type { Folder, Message, Recipient } from "./graph/api.ts";
 import { Paths } from "./paths.ts";
 
 /** Waits this long for a write lock that the other mx process holds. */
-const busyTimeoutMillis = 5000;
+const busyTimeout = Duration.seconds(5);
 
 /**
  * The full-text index over subject, sender and new text. The porter stemmer indexes each word by its stem, so approve,
@@ -29,31 +30,31 @@ const columnWeights = { body: 1, sender: 2, subject: 10 };
 /** FTS5's bm25 relevance of a row, lower for a better match; it takes the weights in column order. */
 const relevance = `bm25(search, ${columnWeights.subject}, ${columnWeights.sender}, ${columnWeights.body})`;
 
-const schema = `
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS folders (
+/** Creates each table, index and trigger of the store that it lacks. */
+const createSchema = Effect.gen(function* () {
+	const sql = yield* SqlClient.SqlClient;
+	yield* sql`CREATE TABLE IF NOT EXISTS folders (
 	id TEXT PRIMARY KEY,
 	parent_id TEXT NOT NULL,
 	name TEXT NOT NULL,
 	path TEXT NOT NULL,
 	sent INTEGER NOT NULL,
 	delta_link TEXT
-);
--- The local id each Graph id got. A row stays after its message leaves, so a message that comes back, as after a move
--- whose source folder synced first, gets its id again, and AUTOINCREMENT never gives an id to a second message.
-CREATE TABLE IF NOT EXISTS local_ids (
+)`;
+	// The local id each Graph id got. A row stays after its message leaves, so a message that comes back, as after a move
+	// whose source folder synced first, gets its id again, and AUTOINCREMENT never gives an id to a second message.
+	yield* sql`CREATE TABLE IF NOT EXISTS local_ids (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	graph_id TEXT NOT NULL UNIQUE
-);
--- Each lookup of a message by its Graph id, in either mx process, takes the next number in asked as it begins; filed is
--- the number of the lookup whose answer the store holds. An answer to an earlier lookup than that changes nothing.
-CREATE TABLE IF NOT EXISTS lookups (
+)`;
+	// Each lookup of a message by its Graph id, in either mx process, takes the next number in asked as it begins; filed
+	// is the number of the lookup whose answer the store holds. An answer to an earlier lookup than that changes nothing.
+	yield* sql`CREATE TABLE IF NOT EXISTS lookups (
 	graph_id TEXT PRIMARY KEY,
 	asked INTEGER NOT NULL,
 	filed INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS messages (
+)`;
+	yield* sql`CREATE TABLE IF NOT EXISTS messages (
 	id INTEGER PRIMARY KEY REFERENCES local_ids (id),
 	graph_id TEXT NOT NULL UNIQUE,
 	folder_id TEXT NOT NULL REFERENCES folders (id) ON DELETE CASCADE,
@@ -74,30 +75,32 @@ CREATE TABLE IF NOT EXISTS messages (
 	importance TEXT NOT NULL,
 	has_attachments INTEGER NOT NULL,
 	body TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS messages_conversation ON messages (conversation_id);
-CREATE INDEX IF NOT EXISTS messages_folder ON messages (folder_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS search USING ${searchTable};
-CREATE TRIGGER IF NOT EXISTS messages_inserted AFTER INSERT ON messages BEGIN
+)`;
+	yield* sql`CREATE INDEX IF NOT EXISTS messages_conversation ON messages (conversation_id)`;
+	yield* sql`CREATE INDEX IF NOT EXISTS messages_folder ON messages (folder_id)`;
+	yield* sql.unsafe(
+		`CREATE VIRTUAL TABLE IF NOT EXISTS search USING ${searchTable}`
+	);
+	yield* sql`CREATE TRIGGER IF NOT EXISTS messages_inserted AFTER INSERT ON messages BEGIN
 	INSERT INTO search (rowid, subject, sender, body) VALUES (new.id, new.subject, new.from_name || ' ' || new.from_address, new.body);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_deleted AFTER DELETE ON messages BEGIN
+END`;
+	yield* sql`CREATE TRIGGER IF NOT EXISTS messages_deleted AFTER DELETE ON messages BEGIN
 	DELETE FROM search WHERE rowid = old.id;
-END;
-CREATE TRIGGER IF NOT EXISTS messages_updated AFTER UPDATE ON messages BEGIN
+END`;
+	yield* sql`CREATE TRIGGER IF NOT EXISTS messages_updated AFTER UPDATE ON messages BEGIN
 	DELETE FROM search WHERE rowid = old.id;
 	INSERT INTO search (rowid, subject, sender, body) VALUES (new.id, new.subject, new.from_name || ' ' || new.from_address, new.body);
-END;
--- What the running mx sync last wrote about itself, in one row that mx status and the read tools read.
-CREATE TABLE IF NOT EXISTS heartbeat (
+END`;
+	// What the running mx sync last wrote about itself, in one row that mx status and the read tools read.
+	yield* sql`CREATE TABLE IF NOT EXISTS heartbeat (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
 	written_at INTEGER NOT NULL,
 	last_success_at INTEGER,
 	mode TEXT NOT NULL,
 	version TEXT NOT NULL,
 	last_error TEXT
-);
-`;
+)`;
+});
 
 const Address = Schema.Struct({ address: Schema.String, name: Schema.String });
 export type Address = typeof Address.Type;
@@ -254,12 +257,6 @@ const address = ({ emailAddress }: Recipient): Address => ({
 	name: emailAddress.name ?? emailAddress.address ?? "",
 });
 
-const select =
-	"SELECT m.*, f.path AS folder_path, f.sent AS folder_sent FROM messages m JOIN folders f ON f.id = m.folder_id";
-
-/** When the message arrived; a draft has no received time until Graph saves it, so its sent or saved time stands in. */
-const arrived = "COALESCE(m.received_at, m.sent_at)";
-
 const whitespace = /\s+/u;
 
 /** `LIKE` wildcards, and `!`, the escape character mx gives them. */
@@ -274,6 +271,34 @@ const ftsQuery = (text: string) =>
 		),
 		" "
 	);
+
+/** Runs a statement and decodes its rows; a failed statement or a row the schema refuses is a defect in mx's own database. */
+const all = <S extends Schema.Top & { readonly DecodingServices: never }>(
+	rowSchema: S,
+	statement: Effect.Effect<readonly unknown[], SqlError.SqlError>
+) =>
+	statement.pipe(
+		Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(rowSchema))),
+		Effect.orDie
+	);
+
+/** Runs a statement for what it changes; a failed statement is a defect in mx's own database. */
+const run = (statement: Effect.Effect<unknown, SqlError.SqlError>) =>
+	Effect.orDie(Effect.asVoid(statement));
+
+/** The connection to the store, in the data folder, which it creates. */
+const connection = Layer.unwrap(
+	Effect.gen(function* () {
+		const { database } = yield* Paths;
+		const fs = yield* FileSystem.FileSystem;
+		const path = yield* Path.Path;
+		yield* fs.makeDirectory(path.dirname(database), {
+			mode: 0o700,
+			recursive: true,
+		});
+		return Layer.orDie(SqliteClient.layer({ busyTimeout, filename: database }));
+	})
+);
 
 /**
  * The local copy of the mailbox in SQLite: folders with their delta links, one row per message with a short integer id
@@ -327,6 +352,10 @@ export class Store extends Context.Service<
 			folderId: string,
 			kept: readonly string[]
 		) => Effect.Effect<void>;
+		/**
+		 * Runs `run` in one SQLite transaction. Fibers share one connection, and the transaction holds it until it ends, so
+		 * another fiber's statements wait instead of joining it.
+		 */
 		readonly transaction: <A>(run: Effect.Effect<A>) => Effect.Effect<A>;
 		readonly byId: (id: number) => Effect.Effect<Option.Option<Stored>>;
 		readonly byGraphId: (
@@ -360,83 +389,40 @@ export class Store extends Context.Service<
 	static readonly layer = Layer.effect(
 		Store,
 		Effect.gen(function* () {
-			const { database } = yield* Paths;
-			const fs = yield* FileSystem.FileSystem;
-			const path = yield* Path.Path;
-			yield* fs.makeDirectory(path.dirname(database), {
-				mode: 0o700,
-				recursive: true,
-			});
-			const db = yield* Effect.acquireRelease(
-				Effect.sync(
-					() => new Database(database, { create: true, strict: true })
-				),
-				(opened) => Effect.sync(() => opened.close())
-			);
-			const [{ fts5 }] = yield* Effect.sync(() =>
-				db
-					.query("SELECT sqlite_compileoption_used('ENABLE_FTS5') AS fts5")
-					.all()
-			).pipe(
-				Effect.flatMap(
-					Schema.decodeUnknownEffect(
-						Schema.Tuple([Schema.Struct({ fts5: Flag })])
-					)
-				),
-				Effect.orDie
-			);
+			const sql = yield* SqlClient.SqlClient;
+			const [{ fts5 }] =
+				yield* sql`SELECT sqlite_compileoption_used('ENABLE_FTS5') AS fts5`.pipe(
+					Effect.flatMap(
+						Schema.decodeUnknownEffect(
+							Schema.Tuple([Schema.Struct({ fts5: Flag })])
+						)
+					),
+					Effect.orDie
+				);
 			if (fts5 === 0) {
 				return yield* Effect.die(
 					"This Bun's SQLite has no FTS5, which mx needs for search."
 				);
 			}
-			yield* Effect.sync(() => {
-				db.run(`PRAGMA busy_timeout = ${busyTimeoutMillis}`);
-				db.run(schema);
-			});
+			yield* run(sql`PRAGMA foreign_keys = ON`);
+			yield* Effect.orDie(createSchema);
 
-			type Params = Record<string, string | number | null>;
-			/** Runs a statement and decodes its rows; a row the schema refuses is a defect in mx's own database. */
-			const all = <S extends Schema.Top & { readonly DecodingServices: never }>(
-				rowSchema: S,
-				sql: string,
-				params: Params = {}
-			) =>
-				Effect.sync(() => db.query(sql).all(params)).pipe(
-					Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(rowSchema))),
-					Effect.orDie
-				);
-			const run = (sql: string, params: Params) =>
-				Effect.sync(() => {
-					db.query(sql).run(params);
-				});
+			const select = sql`SELECT m.*, f.path AS folder_path, f.sent AS folder_sent FROM messages m JOIN folders f ON f.id = m.folder_id`;
+			/** When the message arrived; a draft has no received time until Graph saves it, so its sent or saved time stands in. */
+			const arrived = sql`COALESCE(m.received_at, m.sent_at)`;
+
 			/** Graph ids as the JSON text `json_each` reads. */
 			const jsonIds = (ids: readonly string[]) =>
 				encodeStrings(ids).pipe(Effect.orDie);
-			const messages = (where: string, params: Params) =>
-				all(Row, `${select} ${where}`, params).pipe(
-					Effect.map(Arr.map(stored))
-				);
+			const messages = (where: Statement.Fragment) =>
+				all(Row, sql`${select} ${where}`).pipe(Effect.map(Arr.map(stored)));
 
-			const transactions = yield* Semaphore.make(1);
-
-			/**
-			 * Runs `effect` in one SQLite transaction. Fibers share the one connection, and a statement another fiber ran
-			 * between BEGIN and COMMIT would join this transaction, so transactions take turns.
-			 */
 			const transaction = <A>(effect: Effect.Effect<A>) =>
-				Effect.acquireUseRelease(
-					Effect.sync(() => db.run("BEGIN IMMEDIATE")),
-					() => effect,
-					(_, exit) =>
-						Effect.sync(() =>
-							db.run(exit._tag === "Success" ? "COMMIT" : "ROLLBACK")
-						)
-				).pipe(transactions.withPermits(1));
+				Effect.orDie(sql.withTransaction(effect));
 
 			const folders = all(
 				FolderRow,
-				"SELECT id, name, path, sent, delta_link FROM folders"
+				sql`SELECT id, name, path, sent, delta_link FROM folders`
 			).pipe(
 				Effect.map(
 					Arr.map(
@@ -457,24 +443,14 @@ export class Store extends Context.Service<
 				sent: boolean
 			) =>
 				run(
-					`INSERT INTO folders (id, parent_id, name, path, sent) VALUES ($id, $parent, $name, $path, $sent)
-					ON CONFLICT (id) DO UPDATE SET parent_id = excluded.parent_id, name = excluded.name, path = excluded.path, sent = excluded.sent`,
-					{
-						id: folder.id,
-						name: folder.displayName,
-						parent: folder.parentFolderId,
-						path: folderPath,
-						sent: sent ? 1 : 0,
-					}
+					sql`INSERT INTO folders (id, parent_id, name, path, sent) VALUES (${folder.id}, ${folder.parentFolderId}, ${folder.displayName}, ${folderPath}, ${sent ? 1 : 0})
+					ON CONFLICT (id) DO UPDATE SET parent_id = excluded.parent_id, name = excluded.name, path = excluded.path, sent = excluded.sent`
 				);
 
 			const hasFolder = (id: string) =>
 				all(
 					Schema.Struct({ id: Schema.String }),
-					"SELECT id FROM folders WHERE id = $id",
-					{
-						id,
-					}
+					sql`SELECT id FROM folders WHERE id = ${id}`
 				).pipe(Effect.map(Arr.isReadonlyArrayNonEmpty));
 
 			const saveFolder = Effect.fnUntraced(function* (
@@ -483,8 +459,7 @@ export class Store extends Context.Service<
 			) {
 				const parent = yield* all(
 					Schema.Struct({ path: Schema.String }),
-					"SELECT path FROM folders WHERE id = $id",
-					{ id: folder.parentFolderId }
+					sql`SELECT path FROM folders WHERE id = ${folder.parentFolderId}`
 				);
 				yield* upsertFolder(
 					folder,
@@ -517,18 +492,16 @@ export class Store extends Context.Service<
 							{ discard: true }
 						),
 						run(
-							"DELETE FROM folders WHERE id NOT IN (SELECT value FROM json_each($ids))",
-							{ ids }
+							sql`DELETE FROM folders WHERE id NOT IN (SELECT value FROM json_each(${ids}))`
 						)
 					)
 				);
 			});
 
 			const setDeltaLink = (folderId: string, link: string) =>
-				run("UPDATE folders SET delta_link = $link WHERE id = $id", {
-					id: folderId,
-					link,
-				});
+				run(
+					sql`UPDATE folders SET delta_link = ${link} WHERE id = ${folderId}`
+				);
 
 			/** Inserts or updates the message; an update with `inPlace` happens only while the row is filed where `message` says. */
 			const upsert = Effect.fnUntraced(function* (
@@ -546,37 +519,15 @@ export class Store extends Context.Service<
 					encodeStrings(message.categories),
 				]).pipe(Effect.orDie);
 				yield* run(
-					"INSERT INTO local_ids (graph_id) VALUES ($graphId) ON CONFLICT (graph_id) DO NOTHING",
-					{ graphId: message.id }
+					sql`INSERT INTO local_ids (graph_id) VALUES (${message.id}) ON CONFLICT (graph_id) DO NOTHING`
 				);
 				const saved = yield* all(
 					Schema.Struct({ id: Schema.Int }),
-					`INSERT INTO messages (id, graph_id, folder_id, conversation_id, internet_message_id, from_name, from_address, to_list, cc_list, bcc_list, subject, received_at, sent_at, is_read, is_draft, flag, categories, importance, has_attachments, body)
-					VALUES ((SELECT id FROM local_ids WHERE graph_id = $graphId), $graphId, $folderId, $conversationId, $internetMessageId, $fromName, $fromAddress, $to, $cc, $bcc, $subject, $receivedAt, $sentAt, $isRead, $isDraft, $flag, $categories, $importance, $hasAttachments, $body)
+					sql`INSERT INTO messages (id, graph_id, folder_id, conversation_id, internet_message_id, from_name, from_address, to_list, cc_list, bcc_list, subject, received_at, sent_at, is_read, is_draft, flag, categories, importance, has_attachments, body)
+					VALUES ((SELECT id FROM local_ids WHERE graph_id = ${message.id}), ${message.id}, ${message.parentFolderId}, ${message.conversationId}, ${message.internetMessageId ?? null}, ${from.name}, ${from.address}, ${to}, ${cc}, ${bcc}, ${message.subject ?? ""}, ${message.receivedDateTime?.epochMilliseconds ?? null}, ${message.sentDateTime?.epochMilliseconds ?? null}, ${message.isRead ? 1 : 0}, ${message.isDraft ? 1 : 0}, ${message.flag.flagStatus}, ${categories}, ${message.importance}, ${message.hasAttachments ? 1 : 0}, ${message.uniqueBody.content})
 					ON CONFLICT (graph_id) DO UPDATE SET folder_id = excluded.folder_id, conversation_id = excluded.conversation_id, internet_message_id = excluded.internet_message_id, from_name = excluded.from_name, from_address = excluded.from_address, to_list = excluded.to_list, cc_list = excluded.cc_list, bcc_list = excluded.bcc_list, subject = excluded.subject, received_at = excluded.received_at, sent_at = excluded.sent_at, is_read = excluded.is_read, is_draft = excluded.is_draft, flag = excluded.flag, categories = excluded.categories, importance = excluded.importance, has_attachments = excluded.has_attachments, body = excluded.body
-					${inPlace ? "WHERE messages.folder_id = excluded.folder_id" : ""}
-					RETURNING id`,
-					{
-						bcc,
-						body: message.uniqueBody.content,
-						categories,
-						cc,
-						conversationId: message.conversationId,
-						flag: message.flag.flagStatus,
-						folderId: message.parentFolderId,
-						fromAddress: from.address,
-						fromName: from.name,
-						graphId: message.id,
-						hasAttachments: message.hasAttachments ? 1 : 0,
-						importance: message.importance,
-						internetMessageId: message.internetMessageId ?? null,
-						isDraft: message.isDraft ? 1 : 0,
-						isRead: message.isRead ? 1 : 0,
-						receivedAt: message.receivedDateTime?.epochMilliseconds ?? null,
-						sentAt: message.sentDateTime?.epochMilliseconds ?? null,
-						subject: message.subject ?? "",
-						to,
-					}
+					${inPlace ? sql`WHERE messages.folder_id = excluded.folder_id` : sql``}
+					RETURNING id`
 				);
 				return Option.map(Arr.head(saved), (row) => row.id);
 			});
@@ -585,16 +536,14 @@ export class Store extends Context.Service<
 
 			const remove = (graphId: string, folderId: string) =>
 				run(
-					"DELETE FROM messages WHERE graph_id = $graphId AND folder_id = $folderId",
-					{ folderId, graphId }
+					sql`DELETE FROM messages WHERE graph_id = ${graphId} AND folder_id = ${folderId}`
 				);
 
 			const lookup = (graphId: string) =>
 				all(
 					Schema.Struct({ asked: Schema.Int }),
-					`INSERT INTO lookups (graph_id, asked, filed) VALUES ($graphId, 1, 0)
-					ON CONFLICT (graph_id) DO UPDATE SET asked = asked + 1 RETURNING asked`,
-					{ graphId }
+					sql`INSERT INTO lookups (graph_id, asked, filed) VALUES (${graphId}, 1, 0)
+					ON CONFLICT (graph_id) DO UPDATE SET asked = asked + 1 RETURNING asked`
 				).pipe(
 					Effect.flatMap(
 						Arr.match({
@@ -614,17 +563,14 @@ export class Store extends Context.Service<
 					Effect.gen(function* () {
 						const newest = yield* all(
 							Schema.Struct({ filed: Schema.Int }),
-							"UPDATE lookups SET filed = $number WHERE graph_id = $graphId AND filed < $number RETURNING filed",
-							{ graphId, number }
+							sql`UPDATE lookups SET filed = ${number} WHERE graph_id = ${graphId} AND filed < ${number} RETURNING filed`
 						);
 						if (Arr.isReadonlyArrayEmpty(newest)) {
 							return;
 						}
 						yield* Option.match(answer, {
 							onNone: () =>
-								run("DELETE FROM messages WHERE graph_id = $graphId", {
-									graphId,
-								}),
+								run(sql`DELETE FROM messages WHERE graph_id = ${graphId}`),
 							onSome: (message) => upsert(message, false),
 						});
 					})
@@ -632,7 +578,7 @@ export class Store extends Context.Service<
 
 			const placements = all(
 				Schema.Struct({ folder_id: Schema.String, graph_id: Schema.String }),
-				"SELECT graph_id, folder_id FROM messages"
+				sql`SELECT graph_id, folder_id FROM messages`
 			).pipe(
 				Effect.map(
 					(rows): ReadonlyMap<string, string> =>
@@ -643,33 +589,39 @@ export class Store extends Context.Service<
 			const keepOnly = (folderId: string, kept: readonly string[]) =>
 				Effect.flatMap(jsonIds(kept), (ids) =>
 					run(
-						"DELETE FROM messages WHERE folder_id = $folderId AND graph_id NOT IN (SELECT value FROM json_each($ids))",
-						{ folderId, ids }
+						sql`DELETE FROM messages WHERE folder_id = ${folderId} AND graph_id NOT IN (SELECT value FROM json_each(${ids}))`
 					)
 				);
 
 			const byId = (id: number) =>
-				Effect.map(messages("WHERE m.id = $id", { id }), Arr.head);
+				Effect.map(messages(sql`WHERE m.id = ${id}`), Arr.head);
 
 			const byGraphId = (graphId: string) =>
-				Effect.map(
-					messages("WHERE m.graph_id = $graphId", { graphId }),
-					Arr.head
-				);
+				Effect.map(messages(sql`WHERE m.graph_id = ${graphId}`), Arr.head);
 
-			const search: Store["Service"]["search"] = (filter) =>
-				all(
+			const search: Store["Service"]["search"] = (filter) => {
+				const folderId = Option.getOrNull(filter.folderId);
+				const from = Option.getOrNull(
+					Option.map(
+						filter.from,
+						(text) => `%${text.replaceAll(likeWildcards, (c) => `!${c}`)}%`
+					)
+				);
+				const since = Option.getOrNull(
+					Option.map(filter.since, (at) => at.epochMilliseconds)
+				);
+				return all(
 					FoundRow,
-					`WITH candidates AS (${Option.match(filter.text, {
-						onNone: () => "SELECT id, 0 AS rank FROM messages",
-						onSome: () =>
-							`SELECT rowid AS id, ${relevance} AS rank FROM search WHERE search MATCH $text`,
+					sql`WITH candidates AS (${Option.match(filter.text, {
+						onNone: () => sql`SELECT id, 0 AS rank FROM messages`,
+						onSome: (text) =>
+							sql`SELECT rowid AS id, ${sql.literal(relevance)} AS rank FROM search WHERE search MATCH ${ftsQuery(text)}`,
 					})}),
 					matched AS (
 						SELECT m.id, m.conversation_id, c.rank, ${arrived} AS at FROM candidates c JOIN messages m ON m.id = c.id
-						WHERE ($folderId IS NULL OR m.folder_id = $folderId)
-						AND ($from IS NULL OR m.from_address LIKE $from ESCAPE '!' OR m.from_name LIKE $from ESCAPE '!')
-						AND ($since IS NULL OR ${arrived} >= $since)
+						WHERE (${folderId} IS NULL OR m.folder_id = ${folderId})
+						AND (${from} IS NULL OR m.from_address LIKE ${from} ESCAPE '!' OR m.from_name LIKE ${from} ESCAPE '!')
+						AND (${since} IS NULL OR ${arrived} >= ${since})
 					),
 					best AS (
 						SELECT id, rank, at, row_number() OVER (PARTITION BY conversation_id ORDER BY rank, at DESC, id DESC) AS place
@@ -679,21 +631,7 @@ export class Store extends Context.Service<
 						(SELECT count(*) FROM messages t WHERE t.conversation_id = m.conversation_id) - 1 AS others
 					FROM best b JOIN messages m ON m.id = b.id JOIN folders f ON f.id = m.folder_id
 					WHERE b.place = 1
-					ORDER BY b.rank, b.at DESC, b.id DESC LIMIT $limit`,
-					{
-						folderId: Option.getOrNull(filter.folderId),
-						from: Option.getOrNull(
-							Option.map(
-								filter.from,
-								(text) => `%${text.replaceAll(likeWildcards, (c) => `!${c}`)}%`
-							)
-						),
-						limit: filter.limit,
-						since: Option.getOrNull(
-							Option.map(filter.since, (since) => since.epochMilliseconds)
-						),
-						text: Option.getOrNull(Option.map(filter.text, ftsQuery)),
-					}
+					ORDER BY b.rank, b.at DESC, b.id DESC LIMIT ${filter.limit}`
 				).pipe(
 					Effect.map(
 						Arr.map(
@@ -701,16 +639,16 @@ export class Store extends Context.Service<
 						)
 					)
 				);
+			};
 
 			const conversation = (conversationId: string) =>
 				messages(
-					"WHERE m.conversation_id = $conversationId ORDER BY COALESCE(m.sent_at, m.received_at), m.id",
-					{ conversationId }
+					sql`WHERE m.conversation_id = ${conversationId} ORDER BY COALESCE(m.sent_at, m.received_at), m.id`
 				);
 
 			const ownAddresses = all(
 				Schema.Struct({ address: Schema.String }),
-				"SELECT DISTINCT lower(m.from_address) AS address FROM messages m JOIN folders f ON f.id = m.folder_id WHERE f.sent = 1 AND m.from_address != ''"
+				sql`SELECT DISTINCT lower(m.from_address) AS address FROM messages m JOIN folders f ON f.id = m.folder_id WHERE f.sent = 1 AND m.from_address != ''`
 			).pipe(
 				Effect.map(
 					(rows): ReadonlySet<string> =>
@@ -719,18 +657,21 @@ export class Store extends Context.Service<
 			);
 
 			const reindex = transaction(
-				Effect.sync(() => {
-					db.run("DROP TABLE search");
-					db.run(`CREATE VIRTUAL TABLE search USING ${searchTable}`);
-					db.run(
-						"INSERT INTO search (rowid, subject, sender, body) SELECT id, subject, from_name || ' ' || from_address, body FROM messages"
-					);
-				})
+				Effect.all(
+					[
+						run(sql`DROP TABLE search`),
+						run(sql.unsafe(`CREATE VIRTUAL TABLE search USING ${searchTable}`)),
+						run(
+							sql`INSERT INTO search (rowid, subject, sender, body) SELECT id, subject, from_name || ' ' || from_address, body FROM messages`
+						),
+					],
+					{ discard: true }
+				)
 			).pipe(
 				Effect.andThen(
 					all(
 						Schema.Struct({ count: Schema.Int }),
-						"SELECT count(*) AS count FROM search"
+						sql`SELECT count(*) AS count FROM search`
 					)
 				),
 				Effect.map(Arr.reduce(0, (total, row) => total + row.count))
@@ -738,7 +679,7 @@ export class Store extends Context.Service<
 
 			const heartbeat = all(
 				HeartbeatRow,
-				"SELECT written_at, last_success_at, mode, version, last_error FROM heartbeat"
+				sql`SELECT written_at, last_success_at, mode, version, last_error FROM heartbeat`
 			).pipe(
 				Effect.map((rows) =>
 					Option.map(
@@ -756,17 +697,8 @@ export class Store extends Context.Service<
 
 			const beat = (written: Heartbeat) =>
 				run(
-					`INSERT INTO heartbeat (id, written_at, last_success_at, mode, version, last_error) VALUES (1, $at, $lastSuccess, $mode, $version, $error)
-					ON CONFLICT (id) DO UPDATE SET written_at = excluded.written_at, last_success_at = excluded.last_success_at, mode = excluded.mode, version = excluded.version, last_error = excluded.last_error`,
-					{
-						at: written.at.epochMilliseconds,
-						error: Option.getOrNull(written.error),
-						lastSuccess: Option.getOrNull(
-							Option.map(written.lastSuccess, (at) => at.epochMilliseconds)
-						),
-						mode: written.mode,
-						version: written.version,
-					}
+					sql`INSERT INTO heartbeat (id, written_at, last_success_at, mode, version, last_error) VALUES (1, ${written.at.epochMilliseconds}, ${Option.getOrNull(Option.map(written.lastSuccess, (at) => at.epochMilliseconds))}, ${written.mode}, ${written.version}, ${Option.getOrNull(written.error)})
+					ON CONFLICT (id) DO UPDATE SET written_at = excluded.written_at, last_success_at = excluded.last_success_at, mode = excluded.mode, version = excluded.version, last_error = excluded.last_error`
 				);
 
 			return Store.of({
@@ -792,5 +724,5 @@ export class Store extends Context.Service<
 				transaction,
 			});
 		})
-	);
+	).pipe(Layer.provide(connection));
 }
