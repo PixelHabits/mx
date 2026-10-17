@@ -1,6 +1,8 @@
+import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, it, mock } from "bun:test";
 import { userInfo } from "node:os";
 import { BunServices } from "@effect/platform-bun";
+import { SqliteClient } from "@effect/sql-sqlite-bun";
 import {
 	Array as Arr,
 	type Cause,
@@ -23,11 +25,13 @@ import {
 } from "effect";
 import { Command } from "effect/cli";
 import type { ChildProcess } from "effect/process";
+import { SqlClient } from "effect/sql";
 import { TestClock, TestConsole } from "effect/testing";
 import packageJson from "../package.json" with { type: "json" };
 import { savedConfig } from "../src/auth/config.ts";
 import { mx } from "../src/cli.ts";
 import { Paths } from "../src/paths.ts";
+import { migrate, migrations } from "../src/store/migrations.ts";
 import {
 	deleteAfterExit,
 	readUserPath,
@@ -790,6 +794,132 @@ const neverSynced = (name: string) =>
 		});
 	});
 
+/** `platform` on a machine of its own below `name`, and where mx keeps the mail store there. */
+const ownStore = (name: string) => {
+	const root = join(home, name);
+	return {
+		database: onThisSystem({
+			darwin: join(
+				root,
+				"Library",
+				"Application Support",
+				"mx",
+				"data",
+				"mx.sqlite"
+			),
+			linux: join(root, "data", "mx", "mx.sqlite"),
+			win32: join(root, "Local", "mx", "data", "mx.sqlite"),
+		}),
+		system: platformWith({
+			...environment,
+			HOME: root,
+			LOCALAPPDATA: join(root, "Local"),
+			XDG_DATA_HOME: join(root, "data"),
+		}),
+	};
+};
+
+/** The schema that mx 0.1.0 created at every start, before the store recorded its migrations. */
+const schemaBeforeMigrations = `
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS folders (
+	id TEXT PRIMARY KEY,
+	parent_id TEXT NOT NULL,
+	name TEXT NOT NULL,
+	path TEXT NOT NULL,
+	sent INTEGER NOT NULL,
+	delta_link TEXT
+);
+CREATE TABLE IF NOT EXISTS local_ids (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	graph_id TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS lookups (
+	graph_id TEXT PRIMARY KEY,
+	asked INTEGER NOT NULL,
+	filed INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+	id INTEGER PRIMARY KEY REFERENCES local_ids (id),
+	graph_id TEXT NOT NULL UNIQUE,
+	folder_id TEXT NOT NULL REFERENCES folders (id) ON DELETE CASCADE,
+	conversation_id TEXT NOT NULL,
+	internet_message_id TEXT,
+	from_name TEXT NOT NULL,
+	from_address TEXT NOT NULL,
+	to_list TEXT NOT NULL,
+	cc_list TEXT NOT NULL,
+	bcc_list TEXT NOT NULL,
+	subject TEXT NOT NULL,
+	received_at INTEGER,
+	sent_at INTEGER,
+	is_read INTEGER NOT NULL,
+	is_draft INTEGER NOT NULL,
+	flag TEXT NOT NULL,
+	categories TEXT NOT NULL,
+	importance TEXT NOT NULL,
+	has_attachments INTEGER NOT NULL,
+	body TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_conversation ON messages (conversation_id);
+CREATE INDEX IF NOT EXISTS messages_folder ON messages (folder_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5 (subject, sender, body, tokenize = 'porter unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS messages_inserted AFTER INSERT ON messages BEGIN
+	INSERT INTO search (rowid, subject, sender, body) VALUES (new.id, new.subject, new.from_name || ' ' || new.from_address, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_deleted AFTER DELETE ON messages BEGIN
+	DELETE FROM search WHERE rowid = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS messages_updated AFTER UPDATE ON messages BEGIN
+	DELETE FROM search WHERE rowid = old.id;
+	INSERT INTO search (rowid, subject, sender, body) VALUES (new.id, new.subject, new.from_name || ' ' || new.from_address, new.body);
+END;
+CREATE TABLE IF NOT EXISTS heartbeat (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	written_at INTEGER NOT NULL,
+	last_success_at INTEGER,
+	mode TEXT NOT NULL,
+	version TEXT NOT NULL,
+	last_error TEXT
+);
+`;
+
+/** Runs `use` on the SQLite database `file`, as another program that opens mx's store would. */
+const withDatabase = <A>(file: string, use: (db: Database) => A) =>
+	Effect.acquireUseRelease(
+		Effect.sync(() => new Database(file, { strict: true })),
+		(db) => Effect.sync(() => use(db)),
+		(db) => Effect.sync(() => db.close())
+	);
+
+/** The migrations the store at `file` records, oldest first. */
+const recordedMigrations = (file: string) =>
+	withDatabase(file, (db) =>
+		db
+			.query(
+				"SELECT migration_id AS id, name FROM effect_sql_migrations ORDER BY migration_id"
+			)
+			.all()
+	);
+
+/** Runs `effect` on the SQLite database `file` through Effect's SqlClient, as the store does. */
+const onStore =
+	(file: string) =>
+	<A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
+		// @effect-diagnostics-next-line strictEffectProvide:off - one connection to the store, as one mx process opens it.
+		Effect.provide(effect, SqliteClient.layer({ filename: file }));
+
+/**
+ * A migration after the ones this mx knows, as a newer mx brings: it clears every folder's delta link, as a migration
+ * may, so the next pass reads each folder from the start.
+ */
+const laterMigration = {
+	"0002_resync_every_folder": Effect.flatMap(SqlClient.SqlClient, (sql) =>
+		Effect.asVoid(sql`UPDATE folders SET delta_link = NULL`)
+	),
+};
+
 /** The messages Graph holds in every folder now. */
 const mailboxSize = () =>
 	Arr.reduce(
@@ -840,6 +970,7 @@ const bookClubReplyLine =
 	/ \| Jonas Example <jonas@example\.com> \| RE: Book club: the next novel \| unread \(\+1 in thread\)$/u;
 const recipeSwapLine = /Recipe swap \| unread \(\+3 in thread\)$/u;
 const idListingPath = /^\/v1\.0\/me\/mailFolders\/[^/]+\/messages$/u;
+const seedOrderLine = /^#2 .* \| Garden supplies order \| unread$/mu;
 const rotaInArchiveLine =
 	/ Archive \| Rosa Example <rosa@example\.com> \| Garden plot rota /u;
 const timeLeft = /, (about \d+ min|less than a minute) left/u;
@@ -2491,6 +2622,103 @@ describe("mx", () => {
 			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test, its mx sync and mx status run on.
 			Effect.provide(TestClock.layer())
 		));
+
+	test("a store that mx 0.1.0 wrote opens: mx records its schema as the first migration and keeps every folder, message, local id and search", () =>
+		Effect.gen(function* () {
+			const { database, system } = ownStore("store-0.1.0");
+			yield* (yield* FileSystem.FileSystem).makeDirectory(dirname(database), {
+				recursive: true,
+			});
+			const received = Temporal.Instant.from(
+				"2026-10-03T09:30:00Z"
+			).epochMilliseconds;
+			yield* withDatabase(database, (db) => {
+				db.run(schemaBeforeMigrations);
+				db.run(
+					"INSERT INTO folders (id, parent_id, name, path, sent, delta_link) VALUES ('folder-inbox', 'root', 'Inbox', 'Inbox', 0, 'delta-link-inbox')"
+				);
+				// Local id 1 named a message that has since left the store; the seed order keeps its id 2.
+				db.run(
+					"INSERT INTO local_ids (id, graph_id) VALUES (1, 'message-gone'), (2, 'message-seeds')"
+				);
+				db.run(
+					`INSERT INTO messages (id, graph_id, folder_id, conversation_id, internet_message_id, from_name, from_address, to_list, cc_list, bcc_list, subject, received_at, sent_at, is_read, is_draft, flag, categories, importance, has_attachments, body)
+					VALUES (2, 'message-seeds', 'folder-inbox', 'conversation-garden', NULL, 'Marta Example', 'marta@example.com', '[]', '[]', '[]', 'Garden supplies order', ${received}, ${received}, 0, 0, 'notFlagged', '[]', 'normal', 0, 'The seed order was approved this morning.')`
+				);
+			});
+			const contents = withDatabase(database, (db) => ({
+				folders: db.query("SELECT * FROM folders").all(),
+				localIds: db.query("SELECT * FROM local_ids").all(),
+				messages: db.query("SELECT * FROM messages").all(),
+			}));
+			const before = yield* contents;
+			const found = yield* Effect.gen(function* () {
+				const { client, stdio } = yield* connect;
+				yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+					Effect.provide(stdio),
+					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+					Effect.provide(system, { local: true }),
+					Effect.forkScoped
+				);
+				return yield* client.call("search", { query: "approve" });
+			}).pipe(Effect.scoped);
+			expect(found.isError).toBe(false);
+			expect(found.text).toMatch(seedOrderLine);
+			expect(yield* recordedMigrations(database)).toEqual([
+				{ id: 1, name: "initial" },
+			]);
+			expect(yield* contents).toEqual(before);
+		}));
+
+	test("a later migration runs once: the store records it, and the next start runs nothing", () =>
+		Effect.gen(function* () {
+			const { database } = ownStore("store-later");
+			yield* (yield* FileSystem.FileSystem).makeDirectory(dirname(database), {
+				recursive: true,
+			});
+			yield* onStore(database)(migrate(migrations));
+			const links = withDatabase(database, (db) =>
+				db.query("SELECT delta_link AS link FROM folders").all()
+			);
+			yield* withDatabase(database, (db) =>
+				db.run(
+					"INSERT INTO folders (id, parent_id, name, path, sent, delta_link) VALUES ('folder-inbox', 'root', 'Inbox', 'Inbox', 0, 'delta-link-1')"
+				)
+			);
+			const withLater = { ...migrations, ...laterMigration };
+			yield* onStore(database)(migrate(withLater));
+			expect(yield* links).toEqual([{ link: null }]);
+			const recorded = [
+				{ id: 1, name: "initial" },
+				{ id: 2, name: "resync_every_folder" },
+			];
+			expect(yield* recordedMigrations(database)).toEqual(recorded);
+			yield* withDatabase(database, (db) =>
+				db.run("UPDATE folders SET delta_link = 'delta-link-2'")
+			);
+			yield* onStore(database)(migrate(withLater));
+			expect(yield* links).toEqual([{ link: "delta-link-2" }]);
+			expect(yield* recordedMigrations(database)).toEqual(recorded);
+		}));
+
+	test("mx refuses a store that a newer mx migrated, says to run mx update, and changes nothing", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const { database, system } = ownStore("store-newer");
+			yield* fs.makeDirectory(dirname(database), { recursive: true });
+			yield* onStore(database)(migrate({ ...migrations, ...laterMigration }));
+			const before = Bun.hash(yield* fs.readFile(database));
+			const failure = yield* Effect.flip(cliOn(system)("reindex"));
+			expect(failure.message).toBe(
+				"This mail store was written by a newer mx. Run mx update."
+			);
+			expect(Bun.hash(yield* fs.readFile(database))).toBe(before);
+			expect(yield* recordedMigrations(database)).toEqual([
+				{ id: 1, name: "initial" },
+				{ id: 2, name: "resync_every_folder" },
+			]);
+		}));
 
 	test("mx install without --agent and without a terminal fails, names the agents it can set up, and changes nothing", () =>
 		Effect.gen(function* () {

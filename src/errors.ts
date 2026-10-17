@@ -103,6 +103,16 @@ export class UpdateFailed extends Schema.TaggedError<
 	message: Schema.String,
 }) {}
 
+/** The mail store records a migration this mx does not know: a newer mx wrote it, and only a newer mx can open it. */
+export class NewerStore extends Schema.TaggedError<
+	NewerStore,
+	{ readonly brand: unique symbol }
+>("mx/errors/NewerStore")("NewerStore", {}) {
+	override get message() {
+		return "This mail store was written by a newer mx. Run mx update.";
+	}
+}
+
 /** `mx status` found mx sync stopped or reporting an error; `message` says which. */
 export class SyncUnhealthy extends Schema.TaggedError<
 	SyncUnhealthy,

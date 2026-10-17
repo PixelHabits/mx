@@ -13,94 +13,16 @@ import {
 import { SqlClient, type SqlError, type Statement } from "effect/sql";
 import type { Folder, Message, Recipient } from "./graph/api.ts";
 import { Paths } from "./paths.ts";
+import { migrate, migrations } from "./store/migrations.ts";
 
 /** Waits this long for a write lock that the other mx process holds. */
 const busyTimeout = Duration.seconds(5);
-
-/**
- * The full-text index over subject, sender and new text. The porter stemmer indexes each word by its stem, so approve,
- * approved and approval match one another.
- */
-const searchTable =
-	"fts5 (subject, sender, body, tokenize = 'porter unicode61 remove_diacritics 2')";
 
 /** How much a match in each column of the index counts toward relevance. */
 const columnWeights = { body: 1, sender: 2, subject: 10 };
 
 /** FTS5's bm25 relevance of a row, lower for a better match; it takes the weights in column order. */
 const relevance = `bm25(search, ${columnWeights.subject}, ${columnWeights.sender}, ${columnWeights.body})`;
-
-/** Creates each table, index and trigger of the store that it lacks. */
-const createSchema = Effect.gen(function* () {
-	const sql = yield* SqlClient.SqlClient;
-	yield* sql`CREATE TABLE IF NOT EXISTS folders (
-	id TEXT PRIMARY KEY,
-	parent_id TEXT NOT NULL,
-	name TEXT NOT NULL,
-	path TEXT NOT NULL,
-	sent INTEGER NOT NULL,
-	delta_link TEXT
-)`;
-	// The local id each Graph id got. A row stays after its message leaves, so a message that comes back, as after a move
-	// whose source folder synced first, gets its id again, and AUTOINCREMENT never gives an id to a second message.
-	yield* sql`CREATE TABLE IF NOT EXISTS local_ids (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	graph_id TEXT NOT NULL UNIQUE
-)`;
-	// Each lookup of a message by its Graph id, in either mx process, takes the next number in asked as it begins; filed
-	// is the number of the lookup whose answer the store holds. An answer to an earlier lookup than that changes nothing.
-	yield* sql`CREATE TABLE IF NOT EXISTS lookups (
-	graph_id TEXT PRIMARY KEY,
-	asked INTEGER NOT NULL,
-	filed INTEGER NOT NULL
-)`;
-	yield* sql`CREATE TABLE IF NOT EXISTS messages (
-	id INTEGER PRIMARY KEY REFERENCES local_ids (id),
-	graph_id TEXT NOT NULL UNIQUE,
-	folder_id TEXT NOT NULL REFERENCES folders (id) ON DELETE CASCADE,
-	conversation_id TEXT NOT NULL,
-	internet_message_id TEXT,
-	from_name TEXT NOT NULL,
-	from_address TEXT NOT NULL,
-	to_list TEXT NOT NULL,
-	cc_list TEXT NOT NULL,
-	bcc_list TEXT NOT NULL,
-	subject TEXT NOT NULL,
-	received_at INTEGER,
-	sent_at INTEGER,
-	is_read INTEGER NOT NULL,
-	is_draft INTEGER NOT NULL,
-	flag TEXT NOT NULL,
-	categories TEXT NOT NULL,
-	importance TEXT NOT NULL,
-	has_attachments INTEGER NOT NULL,
-	body TEXT NOT NULL
-)`;
-	yield* sql`CREATE INDEX IF NOT EXISTS messages_conversation ON messages (conversation_id)`;
-	yield* sql`CREATE INDEX IF NOT EXISTS messages_folder ON messages (folder_id)`;
-	yield* sql.unsafe(
-		`CREATE VIRTUAL TABLE IF NOT EXISTS search USING ${searchTable}`
-	);
-	yield* sql`CREATE TRIGGER IF NOT EXISTS messages_inserted AFTER INSERT ON messages BEGIN
-	INSERT INTO search (rowid, subject, sender, body) VALUES (new.id, new.subject, new.from_name || ' ' || new.from_address, new.body);
-END`;
-	yield* sql`CREATE TRIGGER IF NOT EXISTS messages_deleted AFTER DELETE ON messages BEGIN
-	DELETE FROM search WHERE rowid = old.id;
-END`;
-	yield* sql`CREATE TRIGGER IF NOT EXISTS messages_updated AFTER UPDATE ON messages BEGIN
-	DELETE FROM search WHERE rowid = old.id;
-	INSERT INTO search (rowid, subject, sender, body) VALUES (new.id, new.subject, new.from_name || ' ' || new.from_address, new.body);
-END`;
-	// What the running mx sync last wrote about itself, in one row that mx status and the read tools read.
-	yield* sql`CREATE TABLE IF NOT EXISTS heartbeat (
-	id INTEGER PRIMARY KEY CHECK (id = 1),
-	written_at INTEGER NOT NULL,
-	last_success_at INTEGER,
-	mode TEXT NOT NULL,
-	version TEXT NOT NULL,
-	last_error TEXT
-)`;
-});
 
 const Address = Schema.Struct({ address: Schema.String, name: Schema.String });
 export type Address = typeof Address.Type;
@@ -378,7 +300,7 @@ export class Store extends Context.Service<
 		) => Effect.Effect<readonly Stored[]>;
 		/** Every address a message in Sent Items came from, lower-cased. */
 		readonly ownAddresses: Effect.Effect<ReadonlySet<string>>;
-		/** Creates the full-text index anew, with the current tokenizer, from the stored rows and returns how many it holds. */
+		/** Rebuilds the full-text index from the stored rows and returns how many it holds. */
 		readonly reindex: Effect.Effect<number>;
 		/** The heartbeat mx sync last wrote, or none when it never ran. */
 		readonly heartbeat: Effect.Effect<Option.Option<Heartbeat>>;
@@ -405,7 +327,7 @@ export class Store extends Context.Service<
 				);
 			}
 			yield* run(sql`PRAGMA foreign_keys = ON`);
-			yield* Effect.orDie(createSchema);
+			yield* migrate(migrations);
 
 			const select = sql`SELECT m.*, f.path AS folder_path, f.sent AS folder_sent FROM messages m JOIN folders f ON f.id = m.folder_id`;
 			/** When the message arrived; a draft has no received time until Graph saves it, so its sent or saved time stands in. */
@@ -657,15 +579,11 @@ export class Store extends Context.Service<
 			);
 
 			const reindex = transaction(
-				Effect.all(
-					[
-						run(sql`DROP TABLE search`),
-						run(sql.unsafe(`CREATE VIRTUAL TABLE search USING ${searchTable}`)),
-						run(
-							sql`INSERT INTO search (rowid, subject, sender, body) SELECT id, subject, from_name || ' ' || from_address, body FROM messages`
-						),
-					],
-					{ discard: true }
+				Effect.andThen(
+					run(sql`DELETE FROM search`),
+					run(
+						sql`INSERT INTO search (rowid, subject, sender, body) SELECT id, subject, from_name || ' ' || from_address, body FROM messages`
+					)
 				)
 			).pipe(
 				Effect.andThen(
