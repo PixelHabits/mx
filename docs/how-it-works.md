@@ -5,9 +5,15 @@
 `mx sync` runs in the background and keeps a local copy of the mailbox in SQLite, with a full-text index.
 
 - **New mail:** mx subscribes to Microsoft Graph change notifications for Inbox and Sent Items. They reach a local webhook through a Cloudflare quick tunnel that `cloudflared` opens. mx uses the `cloudflared` that `MX_CLOUDFLARED` names, or the one on `PATH`. Otherwise it downloads a pinned release and checks its sha256. Each notification starts a delta pass of that folder.
+- **First sync:** `mx install` runs the first sync in the foreground, before it starts `mx sync`, and shows progress from each folder's message count. Each folder's delta link is saved when the folder finishes, so a stopped first sync keeps the finished folders and the next `mx install` reads only the rest. A folder that was part way through starts over.
+- **Folders at once:** a pass syncs 3 folders at a time. Microsoft Graph allows 4 concurrent requests per app and mailbox, so one stays free for `mx mcp`.
 - **Fallback:** while notifications work, mx also polls every folder every 5 minutes. When they don't, it polls every 60 seconds and tries notifications again every 10 minutes.
 - **Stopping:** on Windows, stopping sync also ends its `cloudflared`. A forced stop can't delete the Graph subscriptions, so they expire within 3 days, and the next sync start deletes any that remain.
 - **Health:** `mx sync` records a heartbeat every minute. `mx status` and the read tools use it to tell whether sync is running and how old the mail is.
+
+## Search
+
+`search` uses an SQLite FTS5 index over the subject, sender and new text. The porter stemmer matches word forms, so "approve" also finds "approved" and "approval". With a query, results are ranked by bm25, weighting the subject 10, the sender 2 and the body 1, with newer messages first among equals. Without a query, they are newest first. Each conversation appears once, by its best match, with `(+N in thread)` when it has more messages. `mx reindex` rebuilds the index from the stored messages.
 
 ## Sign-in
 

@@ -53,8 +53,9 @@ pacman then updates mx. To remove it, run `mx uninstall` first, then `pacman -R 
 
 1. Asks which agents to set up: Claude Desktop, Claude Code or Codex. You can also name them with `--agent`.
 2. Signs you in to Microsoft. It asks once for a client id and a tenant, or takes `--client-id` and `--tenant`.
-3. Starts mx in the background, and again each time you sign in to your computer.
-4. Tells you to restart the agents it set up. Do that, and mx is ready.
+3. Copies your mailbox the first time, showing how many messages it has read and about how long is left. This can take a while for a large mailbox. You can stop it with Ctrl-C, and the next `mx install` continues where it stopped.
+4. Starts mx in the background, and again each time you sign in to your computer.
+5. Tells you to restart the agents it set up. Do that, and mx is ready.
 
 mx asks Microsoft for these delegated permissions: `Mail.ReadWrite`, `Mail.Send` and `offline_access`.
 
@@ -72,7 +73,7 @@ Your agent uses these tools:
 
 | Tool | What it does |
 | --- | --- |
-| `search` | Finds messages by words, sender, folder and date. |
+| `search` | Finds conversations by words, sender, folder and date, best match first. Each conversation shows once. |
 | `thread` | Shows a whole conversation, oldest first. |
 | `message` | Shows one message. |
 | `attachment` | Lists a message's attachments, or saves one. |
