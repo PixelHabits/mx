@@ -69,24 +69,11 @@ export class McpClient extends Context.Service<
 	}
 >()("mx/tests/mcp-client/McpClient") {}
 
-export const connect = Effect.gen(function* () {
-	const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done>();
-	const stdout = yield* Queue.unbounded<string | Uint8Array, Cause.Done>();
-	const lines = yield* Queue.unbounded<string>();
-	const encoder = new TextEncoder();
-	yield* Stream.fromQueue(stdout).pipe(
-		Stream.map((chunk) =>
-			typeof chunk === "string" ? encoder.encode(chunk) : chunk
-		),
-		Stream.decodeText,
-		Stream.splitLines,
-		Stream.runForEach((line) => Queue.offer(lines, line)),
-		Effect.forkScoped
-	);
-	const stdio = Stdio.layerTest({
-		stdin: Stream.fromQueue(stdin),
-		stdout: () => Sink.fromQueue(stdout),
-	});
+/** A client that sends each request as one line through `send` and reads the server's lines from `lines`. */
+const makeClient = (
+	lines: Queue.Queue<string>,
+	send: (line: string) => Effect.Effect<void>
+) => {
 	let nextId = 0;
 
 	/** The next frame that answers request `id`, skipping notifications and other answers. */
@@ -111,7 +98,7 @@ export const connect = Effect.gen(function* () {
 			method,
 			params: { ...params, _meta: meta },
 		});
-		yield* Queue.offer(stdin, encoder.encode(`${line}\n`));
+		yield* send(`${line}\n`);
 		const frame = yield* answer(id);
 		if (frame.error !== undefined) {
 			return yield* Effect.die(
@@ -139,8 +126,74 @@ export const connect = Effect.gen(function* () {
 		};
 	});
 
+	return McpClient.of({ call, request });
+};
+
+/** Offers each line of `stream` to `lines`, in a fiber of the scope. */
+const readLines = <E>(stream: Stream.Stream<Uint8Array, E>) =>
+	Effect.gen(function* () {
+		const lines = yield* Queue.unbounded<string>();
+		yield* stream.pipe(
+			Stream.decodeText,
+			Stream.splitLines,
+			Stream.runForEach((line) => Queue.offer(lines, line)),
+			Effect.forkScoped
+		);
+		return lines;
+	});
+
+/** A client and the Stdio of an `mx mcp` that runs in this process. */
+export const connect = Effect.gen(function* () {
+	const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+	const stdout = yield* Queue.unbounded<string | Uint8Array, Cause.Done>();
+	const encoder = new TextEncoder();
+	const lines = yield* readLines(
+		Stream.fromQueue(stdout).pipe(
+			Stream.map((chunk) =>
+				typeof chunk === "string" ? encoder.encode(chunk) : chunk
+			)
+		)
+	);
+	const stdio = Stdio.layerTest({
+		stdin: Stream.fromQueue(stdin),
+		stdout: () => Sink.fromQueue(stdout),
+	});
 	return {
-		client: McpClient.of({ call, request }),
+		client: makeClient(lines, (line) =>
+			Effect.asVoid(Queue.offer(stdin, encoder.encode(line)))
+		),
 		stdio: stdio satisfies Layer.Layer<Stdio.Stdio>,
 	};
 });
+
+/** A client of `exe mcp`, started as its own process with `env`, which the scope stops. */
+export const spawnClient = (exe: string, env: Record<string, string>) =>
+	Effect.gen(function* () {
+		const server = yield* Effect.acquireRelease(
+			Effect.sync(() =>
+				Bun.spawn([exe, "mcp"], {
+					env,
+					stderr: "inherit",
+					stdin: "pipe",
+					stdout: "pipe",
+				})
+			),
+			(started) =>
+				Effect.promise(() => {
+					started.kill();
+					return started.exited;
+				})
+		);
+		const lines = yield* readLines(
+			Stream.fromReadableStream({
+				evaluate: () => server.stdout,
+				onError: (error) => error,
+			})
+		);
+		return makeClient(lines, (line) =>
+			Effect.sync(() => {
+				server.stdin.write(line);
+				server.stdin.flush();
+			})
+		);
+	});

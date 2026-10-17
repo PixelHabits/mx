@@ -217,7 +217,9 @@ bun run check
 bun run test
 ```
 
-The tests run every command against an in-memory Microsoft in `tests/fake-microsoft.ts`, and talk to `mx mcp` over its stdio as a client does. `tests/fake-secrets.ts` stands in for `Bun.secrets`, so no test touches the system's secret store. `tests/fake-processes.ts` stands in for every program mx starts: its cloudflared opens quick tunnels on the fake internet in `tests/fake-push.ts`, where Graph validates the webhook and posts notifications to it. `tests/fake-releases.ts` serves releases signed with a throwaway Ed25519 key.
+The tests run every command against an in-memory Microsoft in `tests/fake-microsoft.ts`, and talk to `mx mcp` over its stdio as a client does. `tests/fake-secrets.ts` stands in for `Bun.secrets`, so only one test touches the system's secret store: on Windows, it saves to Credential Manager and then puts back what was there. `tests/fake-processes.ts` stands in for every program mx starts: its cloudflared opens quick tunnels on the fake internet in `tests/fake-push.ts`, where Graph validates the webhook and posts notifications to it. `tests/fake-releases.ts` serves releases signed with a throwaway Ed25519 key.
+
+The tests run on Linux and on Windows, and skip a test of what only the other has, such as systemd. On Windows they also run `dist/mx-windows-x64.exe`, so build it first with `bun run build windows-x64`. CI builds it on Linux, as a release does.
 
 To try the server by hand, pipe MCP 2026-07-28 requests into it. Each request carries its protocol version in `_meta`, and there is no handshake:
 

@@ -1,0 +1,2 @@
+# Text files keep LF line endings in every checkout, Windows included, as the formatter checks them.
+* text=auto eol=lf

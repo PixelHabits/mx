@@ -3,6 +3,7 @@ import { BunServices } from "@effect/platform-bun";
 import {
 	Array as Arr,
 	type Cause,
+	Config,
 	ConfigProvider,
 	Context,
 	Effect,
@@ -12,6 +13,7 @@ import {
 	Layer,
 	ManagedRuntime,
 	Option,
+	Path,
 	Queue,
 	Record as Rec,
 	Schema,
@@ -24,7 +26,12 @@ import packageJson from "../package.json" with { type: "json" };
 import { savedConfig } from "../src/auth/config.ts";
 import { mx } from "../src/cli.ts";
 import { Paths } from "../src/paths.ts";
-import { deleteAfterExit, stopSync } from "../src/windows.ts";
+import {
+	deleteAfterExit,
+	readUserPath,
+	stopSync,
+	writeUserPath,
+} from "../src/windows.ts";
 import {
 	FakeMicrosoft,
 	inlineImage,
@@ -40,7 +47,10 @@ import {
 	releasesPath,
 } from "./fake-releases.ts";
 import { FakeSecrets } from "./fake-secrets.ts";
-import { connect, McpClient } from "./mcp-client.ts";
+import { connect, McpClient, spawnClient } from "./mcp-client.ts";
+
+/** The Windows exe `bun run build windows-x64` cross-compiles; CI builds it on Linux. */
+const windowsExe = `${import.meta.dir}/../dist/mx-windows-x64.exe`;
 
 /** The temporary home every XDG directory sits in. */
 class Home extends Context.Service<Home, string>()("mx/tests/mx.test/Home") {}
@@ -57,8 +67,13 @@ const [major, minor] = running.split(".");
 const later = (step: number) => `${major}.${Number(minor) + step}.0`;
 const microsoft = new FakeMicrosoft(releases);
 const processes = new FakeProcesses(microsoft.tunnels);
+/** The system's secret store, which the fake below stands in for except in the test of Windows Credential Manager. */
+const systemSecrets = Bun.secrets;
 const secrets = new FakeSecrets();
 secrets.install();
+
+/** The tests run on Linux and on Windows; a test of what only one of them has runs there alone. */
+const windows = process.platform === "win32";
 
 const machine = ManagedRuntime.make(
 	Layer.effect(
@@ -69,6 +84,7 @@ const machine = ManagedRuntime.make(
 	).pipe(Layer.provideMerge(BunServices.layer))
 );
 const home = await machine.runPromise(Home);
+const { dirname, join } = await machine.runPromise(Path.Path);
 
 /** The client id the tests sign in with, and another one, and the tenant. */
 const clientId = "11111111-2222-4333-8444-555555555555";
@@ -76,23 +92,34 @@ const otherClientId = "66666666-7777-4888-9999-000000000000";
 const tenant = "contoso.com";
 
 /** The cloudflared `MX_CLOUDFLARED` names; the fake processes run it as a quick tunnel. */
-const cloudflared = `${home}/bin/cloudflared`;
+const cloudflared = join(home, "bin", "cloudflared");
 
 /** The environment of an mx process: its folders under the test home, cloudflared, a client id and a tenant. */
 const environment = {
-	APPDATA: `${home}/AppData/Roaming`,
+	APPDATA: join(home, "AppData", "Roaming"),
 	HOME: home,
-	LOCALAPPDATA: `${home}/AppData/Local`,
+	LOCALAPPDATA: join(home, "AppData", "Local"),
 	MX_CLIENT_ID: clientId,
 	MX_CLOUDFLARED: cloudflared,
 	MX_TENANT: tenant,
-	PATH: `${home}/path`,
+	PATH: join(home, "path"),
 	USERPROFILE: home,
-	XDG_CACHE_HOME: `${home}/cache`,
-	XDG_CONFIG_HOME: `${home}/config`,
-	XDG_DATA_HOME: `${home}/data`,
-	XDG_STATE_HOME: `${home}/state`,
+	XDG_CACHE_HOME: join(home, "cache"),
+	XDG_CONFIG_HOME: join(home, "config"),
+	XDG_DATA_HOME: join(home, "data"),
+	XDG_STATE_HOME: join(home, "state"),
 };
+
+/** Windows opens no socket in a process without SystemRoot, so a process the tests start keeps it. */
+const systemRoot = await machine.runPromise(
+	Config.option(Config.NonEmptyString("SystemRoot"))
+);
+
+/** `environment` without `MX_CLIENT_ID` and `MX_TENANT`, where only config.json can name a client id and a tenant. */
+const unconfiguredEnvironment = Rec.remove(
+	Rec.remove(environment, "MX_CLIENT_ID"),
+	"MX_TENANT"
+);
 
 /**
  * What every mx process runs on: Microsoft and the internet, Bun with faked child processes, a console that keeps its
@@ -117,10 +144,7 @@ const platformWith = (env: Record<string, string>) =>
 	);
 const platform = platformWith(environment);
 
-/** `platform` without `MX_CLIENT_ID` and `MX_TENANT`, where only config.json can name a client id and a tenant. */
-const unconfigured = platformWith(
-	Rec.remove(Rec.remove(environment, "MX_CLIENT_ID"), "MX_TENANT")
-);
+const unconfigured = platformWith(unconfiguredEnvironment);
 
 /** `mx mcp` as Claude Code starts it, one process for every test, with a client on its stdio. */
 const server = ManagedRuntime.make(
@@ -142,10 +166,26 @@ const server = ManagedRuntime.make(
 
 afterAll(() => server.dispose().then(() => machine.dispose()));
 
+/**
+ * One test, on mx's own runtime. A test of what only one platform has names it in `only`; elsewhere the test is skipped,
+ * and its name says why.
+ */
 const test = <E>(
 	name: string,
-	body: () => Effect.Effect<void, E, Layer.Success<typeof platform> | McpClient>
-) => it(name, () => server.runPromise(body()), 30_000);
+	body: () => Effect.Effect<
+		void,
+		E,
+		Layer.Success<typeof platform> | McpClient
+	>,
+	only?: { readonly platform: "linux" | "win32"; readonly because: string }
+) => {
+	const skipped = only !== undefined && process.platform !== only.platform;
+	return it.skipIf(skipped)(
+		skipped ? `${name} (skipped: ${only.because})` : name,
+		() => server.runPromise(body()),
+		30_000
+	);
+};
 
 /** Everything any mx process printed, to check that no token ever shows. */
 const printed: string[] = [];
@@ -324,7 +364,7 @@ const savedWhileInstalling = (
 				FileSystem.FileSystem.of({
 					...fs,
 					writeFile: (file, data, options) =>
-						file.startsWith(`${home}/.local/bin/`)
+						file.startsWith(dirname(installed))
 							? Effect.andThen(save(fs), fs.writeFile(file, data, options))
 							: fs.writeFile(file, data, options),
 				})
@@ -381,8 +421,17 @@ const graphRequests = (suffix: string) =>
 		request.url.pathname.endsWith(suffix)
 	);
 
-const tokenFile = `${home}/state/mx/refresh-token`;
-const configFile = `${home}/config/mx/config.json`;
+/** Where mx keeps its files: below `%LOCALAPPDATA%\\mx` on Windows, in the XDG folders on Linux. */
+const local = join(home, "AppData", "Local", "mx");
+const configFile = windows
+	? join(local, "config.json")
+	: join(home, "config", "mx", "config.json");
+const dataFolder = windows ? join(local, "data") : join(home, "data", "mx");
+const stateFolder = windows ? join(local, "state") : join(home, "state", "mx");
+const cacheFolder = windows ? join(local, "cache") : join(home, "cache", "mx");
+const tokenFile = join(stateFolder, "refresh-token");
+/** The sign-in's entry in the system's secret store. */
+const credential = { name: "refresh-token", service: "mx" };
 
 /** The refresh token of the sign-in mx saved as `text`, in the secret store or in the sign-in file. */
 const refreshTokenIn = (text: string | null | undefined) =>
@@ -435,28 +484,97 @@ const allFolders = [
 	"folder-archive",
 ];
 
-const installed = `${home}/.local/bin/mx`;
-const windowsFolder = `${home}/AppData/Local/Programs/mx`;
-const background = `${windowsFolder}/mxw.exe`;
+/** Where mx install puts the binary on Windows: mx.exe, and its copy mxw.exe that runs `mx sync`. */
+const windowsFolder = join(home, "AppData", "Local", "Programs", "mx");
+const background = join(windowsFolder, "mxw.exe");
+const installed = windows
+	? join(windowsFolder, "mx.exe")
+	: join(home, ".local", "bin", "mx");
 
-/** A command as `processes.commands` records it, joined by spaces. */
-const commandLine = (command: ChildProcess.StandardCommand) =>
-	Arr.join([command.command, ...command.args], " ");
+/** Where an exe keeps its PE optional header's Subsystem, which tells Windows whether it is a console or a GUI program. */
+const subsystemAt = (exe: Uint8Array) =>
+	new DataView(exe.buffer, exe.byteOffset).getUint32(0x3c, true) + 4 + 20 + 68;
+const subsystem = (exe: Uint8Array) =>
+	new DataView(exe.buffer, exe.byteOffset).getUint16(subsystemAt(exe), true);
+const consoleSubsystem = 3;
+const guiSubsystem = 2;
 
-const newBinary = new TextEncoder().encode(`synthetic mx ${later(1)} binary`);
-const otherBinary = new TextEncoder().encode(
-	"synthetic binary nobody released"
-);
+/** A binary with a PE header, as mx reads one when it writes mxw.exe on Windows, and `label` after it. */
+const syntheticExe = (label: string) => {
+	const exe = new Uint8Array(0x2_00);
+	const view = new DataView(exe.buffer);
+	view.setUint32(0x3c, 0x80, true);
+	exe.set(new TextEncoder().encode("PE\0\0"), 0x80);
+	view.setUint16(subsystemAt(exe), consoleSubsystem, true);
+	exe.set(new TextEncoder().encode(label), 0x1_00);
+	return exe;
+};
+const newBinary = syntheticExe(`synthetic mx ${later(1)} binary`);
+const otherBinary = syntheticExe("synthetic binary nobody released");
 
 /** How often mx downloaded the binary of `version`. */
 const downloads = (version: string) =>
 	Arr.filter(microsoft.received, (request) =>
 		request.url.pathname.startsWith(`${releasesPath}download/v${version}/`)
 	).length;
-const unitFile = `${home}/config/systemd/user/mx-sync.service`;
+const unitFile = join(home, "config", "systemd", "user", "mx-sync.service");
 const mxEntry = { args: ["mcp"], command: installed };
 
-const claudeCodeConfig = `${home}/.claude.json`;
+/** What mx uninstall deletes: the binary, the background copy or unit that runs `mx sync`, and each of mx's folders. */
+const mxFiles = [
+	installed,
+	windows ? background : unitFile,
+	configFile,
+	dataFolder,
+	cacheFolder,
+	stateFolder,
+];
+
+const runKey = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+/** A command as `processes.commands` records it, joined by spaces. */
+const commandLine = (command: ChildProcess.StandardCommand) =>
+	Arr.join([command.command, ...command.args], " ");
+const stopBackground = commandLine(stopSync(process.pid));
+
+/**
+ * The programs mx runs to register, restart and remove the background `mx sync`, and to ask whether it is registered:
+ * systemd on Linux; on Windows the Run key, and the user PATH that holds the program folder.
+ */
+const syncCommands = windows
+	? {
+			register: [
+				commandLine(readUserPath),
+				`reg add ${runKey} /v mx /t REG_SZ /d "${background}" sync /f`,
+			],
+			registered: [`reg query ${runKey} /v mx`],
+			remove: [
+				stopBackground,
+				`reg delete ${runKey} /v mx /f`,
+				commandLine(readUserPath),
+				commandLine(writeUserPath("")),
+			],
+			restart: [stopBackground, `${background} sync`],
+		}
+	: {
+			register: [
+				"systemctl --user daemon-reload",
+				"systemctl --user enable mx-sync.service",
+			],
+			registered: ["systemctl --user is-enabled --quiet mx-sync.service"],
+			remove: [
+				"systemctl --user disable --now mx-sync.service",
+				"systemctl --user daemon-reload",
+			],
+			restart: ["systemctl --user restart --no-block mx-sync.service"],
+		};
+
+/** The agents mx offers here, as `--agent` names them; Claude Desktop only on Windows. */
+const offeredAgents = windows
+	? "claude-desktop, claude-code, codex"
+	: "claude-code, codex";
+
+const claudeCodeConfig = join(home, ".claude.json");
 const claudeCodeSettings = {
 	mcpServers: {
 		mx: { args: ["mcp"], command: "/old/mx", env: { MX_DEBUG: "1" } },
@@ -466,9 +584,17 @@ const claudeCodeSettings = {
 	projects: { [home]: { allowedTools: [] } },
 };
 
-const desktopConfig = `${home}/AppData/Roaming/Claude/claude_desktop_config.json`;
+const desktopConfig = join(
+	home,
+	"AppData",
+	"Roaming",
+	"Claude",
+	"claude_desktop_config.json"
+);
 
-const codexConfig = `${home}/.codex/config.toml`;
+const codexConfig = join(home, ".codex", "config.toml");
+/** The `command` line of `[mcp_servers.mx]`, with the installed binary quoted as TOML quotes it. */
+const codexCommand = Bun.TOML.stringify({ command: installed }).trim();
 const codexSettings = `# Codex settings for the test machine.
 model = "gpt-6.1-sol"
 
@@ -510,7 +636,7 @@ const codexWithMx = `# Codex settings for the test machine.
 model = "gpt-6.1-sol"
 
 [mcp_servers.mx]
-command = "${installed}"
+${codexCommand}
 args = ["mcp"]
 
 [mcp_servers.mx.env]
@@ -527,8 +653,8 @@ const codexSendApproved = codexSettings.replace(
 );
 
 /** Claude Code's user settings, linked into a dotfiles folder, where the user denies mx's `delete`. */
-const claudeCodeSettingsFile = `${home}/.claude/settings.json`;
-const dotfile = `${home}/dotfiles/claude/settings.json`;
+const claudeCodeSettingsFile = join(home, ".claude", "settings.json");
+const dotfile = join(home, "dotfiles", "claude", "settings.json");
 const userSettings = {
 	model: "opus",
 	permissions: { allow: ["Bash(ls *)"], deny: ["mcp__mx__delete"] },
@@ -612,17 +738,25 @@ describe("mx", () => {
 			expect(frames.length).toBeGreaterThan(10);
 			expect(frames[0]).toStartWith("\u001b[?25l");
 			expect(frames.at(-1)).toBe("\u001b[?25h");
+			const banner = Arr.join(
+				[
+					"  ┌───────┐      ✉ ─ ─ ─ ─ ─ ─►      ┌───────┐",
+					"  │╲     ╱│                          │  ▤▤▤  │",
+					"  │  ╲ ╱  │      ◄─ ─ ─ ─ ─ ─ ✉      │ inbox │",
+					"  └───────┘                          └───────┘",
+					"                      mx",
+				],
+				"\n"
+			);
+			// Windows draws the envelope, the tray and the flap in code page 437 glyphs.
 			expect(frames.at(-2)).toContain(
-				Arr.join(
-					[
-						"  ┌───────┐      ✉ ─ ─ ─ ─ ─ ─►      ┌───────┐",
-						"  │╲     ╱│                          │  ▤▤▤  │",
-						"  │  ╲ ╱  │      ◄─ ─ ─ ─ ─ ─ ✉      │ inbox │",
-						"  └───────┘                          └───────┘",
-						"                      mx",
-					],
-					"\n"
-				)
+				windows
+					? banner
+							.replaceAll("✉", "≡")
+							.replaceAll("▤", "≡")
+							.replaceAll("╲", "\\")
+							.replaceAll("╱", "/")
+					: banner
 			);
 			expect(output).toContain("SUBCOMMANDS");
 		}));
@@ -685,6 +819,44 @@ describe("mx", () => {
 			}
 		}));
 
+	test(
+		"the Windows exe that bun run build cross-compiles starts, answers --version and lists the ten tools over MCP",
+		() =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				if (!(yield* fs.exists(windowsExe))) {
+					return yield* Effect.die(
+						`${windowsExe} is missing. Build it with bun run build windows-x64, as CI does on Linux.`
+					);
+				}
+				// The exe keeps its folders apart from the ones the other tests use.
+				const own = join(home, "exe");
+				const env = {
+					APPDATA: join(own, "Roaming"),
+					LOCALAPPDATA: join(own, "Local"),
+					USERPROFILE: own,
+					...Rec.getSomes({ SystemRoot: systemRoot }),
+				};
+				const version = Bun.spawn([windowsExe, "--version"], {
+					env,
+					stderr: "inherit",
+					stdin: "ignore",
+					stdout: "pipe",
+				});
+				const [code, answer] = yield* Effect.promise(() =>
+					Promise.all([version.exited, new Response(version.stdout).text()])
+				);
+				expect(code).toBe(0);
+				expect(answer.trim()).toBe(`mx v${running}`);
+				const client = yield* spawnClient(windowsExe, env);
+				const { tools: listed } = (yield* client.request("tools/list")) as {
+					tools: { name: string }[];
+				};
+				expect(Arr.map(listed, ({ name }) => name).sort()).toEqual(tools);
+			}).pipe(Effect.scoped),
+		{ because: "it runs the Windows exe", platform: "win32" }
+	);
+
 	test("run from source with no client id saved and no terminal, mx login fails, says how to give the client id, and saves nothing", () =>
 		Effect.gen(function* () {
 			const login = Bun.spawn(
@@ -692,13 +864,10 @@ describe("mx", () => {
 				{
 					cwd: `${import.meta.dir}/..`,
 					env: {
-						HOME: home,
+						...unconfiguredEnvironment,
 						// Nothing reaches Microsoft: every request goes to a closed port.
 						HTTPS_PROXY: "http://127.0.0.1:9",
-						XDG_CACHE_HOME: `${home}/cache`,
-						XDG_CONFIG_HOME: `${home}/config`,
-						XDG_DATA_HOME: `${home}/data`,
-						XDG_STATE_HOME: `${home}/state`,
+						...Rec.getSomes({ SystemRoot: systemRoot }),
 					},
 					stderr: "pipe",
 					stdin: "ignore",
@@ -810,29 +979,78 @@ describe("mx", () => {
 			expect(yield* readJson(configFile)).toEqual(before);
 		}));
 
-	test("without a secret store, mx login saves the refresh token in a file only the user can read", () =>
-		Effect.gen(function* () {
-			secrets.machine = "none";
-			yield* cli("login");
-			const fs = yield* FileSystem.FileSystem;
-			expect((yield* fs.stat(tokenFile)).mode % 0o1000).toBe(0o600);
-			expect(yield* refreshTokenIn(yield* fs.readFileString(tokenFile))).toBe(
-				issued(1)
-			);
-		}));
+	test(
+		"without a secret store, mx login saves the refresh token in a file only the user can read",
+		() =>
+			Effect.gen(function* () {
+				secrets.machine = "none";
+				yield* cli("login");
+				const fs = yield* FileSystem.FileSystem;
+				expect((yield* fs.stat(tokenFile)).mode % 0o1000).toBe(0o600);
+				expect(yield* refreshTokenIn(yield* fs.readFileString(tokenFile))).toBe(
+					issued(1)
+				);
+			}).pipe(
+				Effect.ensuring(
+					Effect.sync(() => {
+						secrets.machine = "store";
+					})
+				)
+			),
+		{
+			because:
+				"only a Linux machine can lack a secret store, and Windows has no file modes",
+			platform: "linux",
+		}
+	);
 
 	test("a secret store that fails for any other reason fails loudly and writes no file", () =>
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
-			const before = yield* fs.readFileString(tokenFile);
+			const before = yield* Effect.option(fs.readFileString(tokenFile));
 			secrets.machine = "broken";
 			const failure = yield* Effect.flip(cli("login"));
-			secrets.machine = "none";
+			secrets.machine = "store";
 			expect(failure.message).toContain(
 				"The secret store failed: Could not connect"
 			);
-			expect(yield* fs.readFileString(tokenFile)).toBe(before);
+			expect(yield* Effect.option(fs.readFileString(tokenFile))).toEqual(
+				before
+			);
 		}));
+
+	test(
+		"on Windows, mx login saves the refresh token in Credential Manager, where mx status finds it",
+		() =>
+			Effect.acquireUseRelease(
+				// A developer's own mx sign-in on this machine goes back in place after the test.
+				Effect.promise(() => systemSecrets.get(credential)).pipe(
+					Effect.tap(() =>
+						Effect.sync(() => {
+							Reflect.set(Bun, "secrets", systemSecrets);
+						})
+					)
+				),
+				() =>
+					Effect.gen(function* () {
+						yield* cli("login");
+						expect(
+							yield* refreshTokenIn(
+								yield* Effect.promise(() => systemSecrets.get(credential))
+							)
+						).toBe(issued(1));
+						expect(lines((yield* status).output)).toContain("Sign-in: saved");
+					}),
+				(saved) =>
+					Effect.promise(() => {
+						secrets.install();
+						return saved === null
+							? systemSecrets.delete(credential).then(() => undefined)
+							: systemSecrets.set({ ...credential, value: saved });
+					})
+			),
+		{ because: "it saves to Windows Credential Manager", platform: "win32" }
+	);
 
 	test("a draft written before the first sync is stored with its folder and answers its local id", () =>
 		Effect.gen(function* () {
@@ -885,10 +1103,7 @@ describe("mx", () => {
 				Arr.map(processes.commands.slice(before), (command) =>
 					Arr.join(command, " ")
 				)
-			).toEqual([
-				"systemctl --user is-enabled --quiet mx-sync.service",
-				"systemctl --user restart --no-block mx-sync.service",
-			]);
+			).toEqual([...syncCommands.registered, ...syncCommands.restart]);
 			expect(lines(output).at(-1)).toBe("Restarted mx sync.");
 		}));
 
@@ -961,11 +1176,7 @@ describe("mx", () => {
 			);
 			expect(refreshes).toHaveLength(before + 1);
 			expect(refreshes.at(-1)?.get("refresh_token")).toBe(issued(2));
-			expect(
-				yield* refreshTokenIn(
-					yield* (yield* FileSystem.FileSystem).readFileString(tokenFile)
-				)
-			).toBe(issued(1));
+			expect(yield* savedRefreshToken).toBe(issued(1));
 		}));
 
 	test("search finds by words in the subject, the sender and the new text, with folder, from and since filters", () =>
@@ -1026,7 +1237,7 @@ describe("mx", () => {
 			expect(listing[0]).toMatch(imageLine);
 			expect(listing[1]).toMatch(sheetLine);
 			const saved = yield* tool("attachment", { id, n: 1 });
-			expect(saved.startsWith(`${home}/cache/mx/`)).toBe(true);
+			expect(saved.startsWith(cacheFolder)).toBe(true);
 			const fs = yield* FileSystem.FileSystem;
 			expect([...(yield* fs.readFile(saved))]).toEqual([...inlineImage]);
 		}));
@@ -1650,9 +1861,7 @@ describe("mx", () => {
 			const before = processes.commands.length;
 			const { errors, exit } = yield* withStdinTerminal(false)(run("install"));
 			expect(Exit.isFailure(exit)).toBe(true);
-			expect(errors).toContain("--agent");
-			expect(errors).toContain("claude-code, codex");
-			expect(errors).not.toContain("claude-desktop");
+			expect(errors).toContain(`--agent: ${offeredAgents}.`);
 			expect(processes.commands).toHaveLength(before);
 			expect(yield* fs.exists(installed)).toBe(false);
 		}));
@@ -1683,7 +1892,7 @@ describe("mx", () => {
 			const drawn = Arr.join(frames, "");
 			expect(drawn).toContain("Claude Code");
 			expect(drawn).toContain("Codex");
-			expect(drawn).not.toContain("Claude Desktop");
+			expect(drawn.includes("Claude Desktop")).toBe(windows);
 			expect(yield* readJson(claudeCodeConfig)).toEqual({
 				...claudeCodeSettings,
 				mcpServers: {
@@ -1744,13 +1953,13 @@ describe("mx", () => {
 			});
 			const codex = yield* fs.readFileString(codexConfig);
 			expect(codex).toContain('[mcp_servers.notes]\ncommand = "notes"');
-			expect(codex).toContain(`command = "${installed}"`);
+			expect(codex).toContain(codexCommand);
 			expect(lines(output).at(-1)).toBe(
 				"Quit and reopen Claude Code and Codex now. An agent left open can write its old settings back and drop mx."
 			);
 		}));
 
-	test("mx install, run twice, installs the binary, enables the systemd unit, sets the command and args of one mx entry in each agent's config and keeps everything else, the entry's other keys too, and starts sync", () =>
+	test("mx install, run twice, installs the binary, registers mx sync to start at sign-in, sets the command and args of one mx entry in each agent's config and keeps everything else, the entry's other keys too, and starts sync", () =>
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
 			yield* writeJson(claudeCodeConfig, claudeCodeSettings);
@@ -1761,15 +1970,7 @@ describe("mx", () => {
 			expect((yield* fs.stat(installed)).size).toBe(
 				(yield* fs.stat(process.execPath)).size
 			);
-			expect((yield* fs.stat(installed)).mode % 0o1000).toBe(0o755);
-			expect(yield* fs.readFileString(unitFile)).toContain(
-				`ExecStart="${installed}" sync`
-			);
-			const once = [
-				"systemctl --user daemon-reload",
-				"systemctl --user enable mx-sync.service",
-				"systemctl --user restart --no-block mx-sync.service",
-			];
+			const once = [...syncCommands.register, ...syncCommands.restart];
 			expect(
 				Arr.map(processes.commands.slice(before), (command) =>
 					Arr.join(command, " ")
@@ -1784,6 +1985,51 @@ describe("mx", () => {
 			});
 			expect(yield* fs.readFileString(codexConfig)).toBe(codexWithMx);
 		}));
+
+	test(
+		"mx install writes the systemd user unit that runs the installed binary, and makes the binary executable",
+		() =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				expect((yield* fs.stat(installed)).mode % 0o1000).toBe(0o755);
+				expect(yield* fs.readFileString(unitFile)).toContain(
+					`ExecStart="${installed}" sync`
+				);
+			}),
+		{ because: "systemd and file modes are Linux's", platform: "linux" }
+	);
+
+	test(
+		"mx install writes mxw.exe, the installed exe marked a Windows GUI program, and mxw.exe runs",
+		() =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const exe = yield* fs.readFile(installed);
+				// readFile answers a Buffer, whose slice shares its bytes; this copies them.
+				const marked = new Uint8Array(exe);
+				new DataView(marked.buffer).setUint16(
+					subsystemAt(exe),
+					guiSubsystem,
+					true
+				);
+				expect(subsystem(exe)).toBe(consoleSubsystem);
+				expect(Buffer.from(yield* fs.readFile(background)).equals(marked)).toBe(
+					true
+				);
+				const started = Bun.spawn([background, "--version"], {
+					stderr: "pipe",
+					stdin: "ignore",
+					stdout: "pipe",
+				});
+				const [code, version] = yield* Effect.promise(() =>
+					Promise.all([started.exited, new Response(started.stdout).text()])
+				);
+				expect(code).toBe(0);
+				// mx install copied the Bun that runs the tests, as mx.exe and mxw.exe.
+				expect(version.trim()).toBe(Bun.version);
+			}),
+		{ because: "it runs the installed exe", platform: "win32" }
+	);
 
 	test("with CLAUDE_CONFIG_DIR set, mx install writes Claude Code's .claude.json and settings.json in that folder and leaves ~/.claude.json alone", () =>
 		Effect.gen(function* () {
@@ -1861,15 +2107,13 @@ describe("mx", () => {
 				globalShortcut: "Ctrl+Space",
 				isUsingBuiltInNodeForMcp: true,
 			};
-			yield* fs.makeDirectory(`${home}/AppData/Roaming/Claude`, {
-				recursive: true,
-			});
+			yield* fs.makeDirectory(dirname(desktopConfig), { recursive: true });
 			yield* writeJson(desktopConfig, settings);
 			yield* onWindows(cli("install", "--agent", "claude-desktop"));
 			expect(yield* readJson(desktopConfig)).toEqual({
 				...settings,
 				mcpServers: {
-					mx: { args: ["mcp"], command: `${windowsFolder}/mx.exe` },
+					mx: { args: ["mcp"], command: join(windowsFolder, "mx.exe") },
 				},
 			});
 		}));
@@ -1877,7 +2121,7 @@ describe("mx", () => {
 	test("mx install on Windows that stops while it writes the new mx.exe leaves the installed one whole", () =>
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
-			const exe = `${windowsFolder}/mx.exe`;
+			const exe = join(windowsFolder, "mx.exe");
 			const before = new TextEncoder().encode("synthetic installed mx.exe");
 			yield* fs.makeDirectory(windowsFolder, { recursive: true });
 			yield* fs.writeFile(exe, before);
@@ -1900,12 +2144,11 @@ describe("mx", () => {
 			expect(output).toContain(`Updated mx to ${later(1)}`);
 			const fs = yield* FileSystem.FileSystem;
 			expect([...(yield* fs.readFile(installed))]).toEqual([...newBinary]);
-			expect((yield* fs.stat(installed)).mode % 0o1000).toBe(0o755);
 			expect(
 				Arr.map(processes.commands.slice(before), (command) =>
 					Arr.join(command, " ")
 				)
-			).toEqual(["systemctl --user restart --no-block mx-sync.service"]);
+			).toEqual(syncCommands.restart);
 		}));
 
 	test("mx update refuses a manifest that another key signed, and installs nothing", () =>
@@ -2024,7 +2267,7 @@ describe("mx", () => {
 			expect(failure.message).toContain("mx uninstall --yes");
 			expect(processes.commands).toHaveLength(before);
 			expect(yield* fs.exists(installed)).toBe(true);
-			expect(yield* fs.exists(`${home}/data/mx/mx.sqlite`)).toBe(true);
+			expect(yield* fs.exists(join(dataFolder, "mx.sqlite"))).toBe(true);
 		}));
 
 	test("mx uninstall lists what it removes and asks first, and removes nothing when the answer is no", () =>
@@ -2037,14 +2280,7 @@ describe("mx", () => {
 				cliOn(system)("uninstall")
 			);
 			const prompt = Arr.join(frames, "");
-			for (const path of [
-				installed,
-				unitFile,
-				configFile,
-				`${home}/data/mx`,
-				`${home}/cache/mx`,
-				`${home}/state/mx`,
-			]) {
+			for (const path of mxFiles) {
 				expect(prompt).toContain(path);
 			}
 			expect(prompt).toContain("the saved sign-in");
@@ -2052,6 +2288,12 @@ describe("mx", () => {
 				`mcpServers.mx in ${claudeCodeConfig}`,
 				`the permission rules that name mx in ${claudeCodeSettingsFile}`,
 				`[mcp_servers.mx] with its tool tables in ${codexConfig}`,
+				...(windows
+					? [
+							`the mx value under ${runKey}`,
+							`mcpServers.mx in ${desktopConfig}`,
+						]
+					: []),
 			]) {
 				expect(prompt).toContain(entry);
 			}
@@ -2077,16 +2319,13 @@ describe("mx", () => {
 			processes.onSpawn = () => {
 				signedInWhenSyncStopped ||= secrets.entries.has("mx/refresh-token");
 			};
-			yield* cli("uninstall", "--yes");
+			const { output } = yield* cli("uninstall", "--yes");
 			processes.onSpawn = undefined;
 			expect(
 				Arr.map(processes.commands.slice(before), (command) =>
 					Arr.join(command, " ")
 				)
-			).toEqual([
-				"systemctl --user disable --now mx-sync.service",
-				"systemctl --user daemon-reload",
-			]);
+			).toEqual(syncCommands.remove);
 			expect(signedInWhenSyncStopped).toBe(true);
 			const { mx: _, ...others } = claudeCodeSettings.mcpServers;
 			expect(yield* readJson(claudeCodeConfig)).toEqual({
@@ -2098,71 +2337,82 @@ describe("mx", () => {
 				model: "opus",
 				permissions: { allow: ["Bash(ls *)"], deny: ["mcp__other__send"] },
 			});
-			for (const path of [
-				installed,
-				unitFile,
-				configFile,
-				`${home}/data/mx`,
-				`${home}/cache/mx`,
-				`${home}/state/mx`,
-			]) {
-				expect(yield* fs.exists(path)).toBe(false);
+			// On Windows, the mx mcp these tests talk to holds the mail store open, so it stays.
+			for (const path of mxFiles) {
+				expect(yield* fs.exists(path)).toBe(windows && path === dataFolder);
 			}
+			expect(
+				output.includes(
+					`Could not delete ${dataFolder} while mx mcp has it open.`
+				)
+			).toBe(windows);
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
 		}));
 
-	test("mx install from the Arch package copies no binary and writes no unit, enables the package's unit and registers /usr/bin/mx", () =>
-		Effect.gen(function* () {
-			const fs = yield* FileSystem.FileSystem;
-			yield* fs.makeDirectory(`${home}/.codex`, { recursive: true });
-			yield* fs.writeFileString(codexConfig, codexSettings);
-			const before = processes.commands.length;
-			yield* fromPackage(cli("install", "--agent", "codex"));
-			expect(
-				Arr.map(processes.commands.slice(before), (command) =>
-					Arr.join(command, " ")
-				)
-			).toEqual([
-				"systemctl --user daemon-reload",
-				"systemctl --user enable mx-sync.service",
-				"systemctl --user restart --no-block mx-sync.service",
-			]);
-			expect(yield* fs.exists(installed)).toBe(false);
-			expect(yield* fs.exists(unitFile)).toBe(false);
-			expect(yield* fs.readFileString(codexConfig)).toContain(
-				`command = "${packaged}"`
-			);
-		}));
+	test(
+		"mx install from the Arch package copies no binary and writes no unit, enables the package's unit and registers /usr/bin/mx",
+		() =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				yield* fs.makeDirectory(`${home}/.codex`, { recursive: true });
+				yield* fs.writeFileString(codexConfig, codexSettings);
+				const before = processes.commands.length;
+				yield* fromPackage(cli("install", "--agent", "codex"));
+				expect(
+					Arr.map(processes.commands.slice(before), (command) =>
+						Arr.join(command, " ")
+					)
+				).toEqual([
+					"systemctl --user daemon-reload",
+					"systemctl --user enable mx-sync.service",
+					"systemctl --user restart --no-block mx-sync.service",
+				]);
+				expect(yield* fs.exists(installed)).toBe(false);
+				expect(yield* fs.exists(unitFile)).toBe(false);
+				expect(yield* fs.readFileString(codexConfig)).toContain(
+					`command = "${packaged}"`
+				);
+			}),
+		{ because: "the Arch package is for Arch Linux", platform: "linux" }
+	);
 
-	test("mx update from the Arch package refuses, says to update with pacman, and fetches no release", () =>
-		Effect.gen(function* () {
-			const asked = Arr.filter(microsoft.received, (request) =>
-				isReleaseRequest(request.url)
-			).length;
-			const failure = yield* Effect.flip(fromPackage(cli("update")));
-			expect(failure.message).toContain("pacman");
-			expect(
-				Arr.filter(microsoft.received, (request) =>
+	test(
+		"mx update from the Arch package refuses, says to update with pacman, and fetches no release",
+		() =>
+			Effect.gen(function* () {
+				const asked = Arr.filter(microsoft.received, (request) =>
 					isReleaseRequest(request.url)
-				)
-			).toHaveLength(asked);
-		}));
+				).length;
+				const failure = yield* Effect.flip(fromPackage(cli("update")));
+				expect(failure.message).toContain("pacman");
+				expect(
+					Arr.filter(microsoft.received, (request) =>
+						isReleaseRequest(request.url)
+					)
+				).toHaveLength(asked);
+			}),
+		{ because: "the Arch package is for Arch Linux", platform: "linux" }
+	);
 
-	test("mx uninstall --yes from the Arch package disables the unit and leaves the binary and the unit to pacman", () =>
-		Effect.gen(function* () {
-			const before = processes.commands.length;
-			const { output } = yield* fromPackage(cli("uninstall", "--yes"));
-			expect(
-				Arr.map(processes.commands.slice(before), (command) =>
-					Arr.join(command, " ")
-				)
-			).toEqual([
-				"systemctl --user disable --now mx-sync.service",
-				"systemctl --user daemon-reload",
-			]);
-			expect(output).toContain("pacman -R mx");
-			expect(output).not.toContain(`Removed ${packaged}`);
-		}));
+	test(
+		"mx uninstall --yes from the Arch package disables the unit and leaves the binary and the unit to pacman",
+		() =>
+			Effect.gen(function* () {
+				const before = processes.commands.length;
+				const { output } = yield* fromPackage(cli("uninstall", "--yes"));
+				expect(
+					Arr.map(processes.commands.slice(before), (command) =>
+						Arr.join(command, " ")
+					)
+				).toEqual([
+					"systemctl --user disable --now mx-sync.service",
+					"systemctl --user daemon-reload",
+				]);
+				expect(output).toContain("pacman -R mx");
+				expect(output).not.toContain(`Removed ${packaged}`);
+			}),
+		{ because: "the Arch package is for Arch Linux", platform: "linux" }
+	);
 
 	test("mx install on Windows adds the program folder to the user PATH once and keeps every other entry, and mx uninstall takes out only that folder", () =>
 		onWindows(
@@ -2194,7 +2444,7 @@ describe("mx", () => {
 				yield* cli("uninstall", "--yes");
 				processes.onSpawn = undefined;
 				expect(Arr.join(processes.commands[before] ?? [], " ")).toBe(
-					commandLine(stopSync(process.pid))
+					stopBackground
 				);
 				expect(installedWhenSyncStopped).toBe(true);
 				expect(yield* fs.exists(background)).toBe(false);
@@ -2205,10 +2455,10 @@ describe("mx", () => {
 		onWindows(
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
-				const exe = `${windowsFolder}/mx.exe`;
+				const exe = join(windowsFolder, "mx.exe");
 				const movedAside = [
-					`${windowsFolder}/mx.old.exe`,
-					`${windowsFolder}/mxw.old.exe`,
+					join(windowsFolder, "mx.old.exe"),
+					join(windowsFolder, "mxw.old.exe"),
 				];
 				yield* cli("install", "--agent", "codex");
 				yield* Effect.forEach(movedAside, (file) =>
