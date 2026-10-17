@@ -107,7 +107,7 @@ Change the defaults in your agent's own settings. A reinstall keeps your changes
 mx status
 ```
 
-`mx status` says whether mx is running in the background, when your mail last synced, and any error.
+`mx status` says whether mx is running in the background, when your mail last synced, and any error. Once a day, mx also checks its copy against your mailbox and repairs anything that drifted.
 
 When your mail may be out of date, your agent sees a warning line before its answer, such as `⚠ Mail last synced 3 h ago and mx sync is not running. Run mx status.` If the warning says `Sign-in expired. Run mx login.`, run `mx login`. mx restarts its background sync, and your agents use the new sign-in from their next request.
 

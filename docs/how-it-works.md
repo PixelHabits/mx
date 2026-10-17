@@ -7,9 +7,16 @@
 - **New mail:** mx subscribes to Microsoft Graph change notifications for Inbox and Sent Items. They reach a local webhook through a Cloudflare quick tunnel that `cloudflared` opens. mx uses the `cloudflared` that `MX_CLOUDFLARED` names, or the one on `PATH`. Otherwise it downloads a pinned release and checks its sha256. Each notification starts a delta pass of that folder.
 - **First sync:** `mx install` runs the first sync in the foreground, before it starts `mx sync`, and shows progress from each folder's message count. Each folder's delta link is saved when the folder finishes, so a stopped first sync keeps the finished folders and the next `mx install` reads only the rest. A folder that was part way through starts over.
 - **Folders at once:** a pass syncs 3 folders at a time. Microsoft Graph allows 4 concurrent requests per app and mailbox, so one stays free for `mx mcp`.
+- **Self-check:** after its first pass, and then once a day, `mx sync` compares every folder's message ids with Graph's. It adds messages the delta missed, refiles messages stored in the wrong folder, removes messages Graph no longer has, and drops deleted folders. It logs one line, such as `Reconciled 12 folders: 0 added, 0 refiled, 0 removed.`, and delta passes wait while it runs. A check that fails runs again an hour later.
+- **Moves:** a delta page never moves a stored message out of the folder it is filed in. When a page and the store disagree, mx asks Graph where the message is now. Lookups from `mx sync` and `mx mcp` are applied in the order they began, so an older answer never overwrites a newer one.
+- **Refusals:** a folder or message that Graph refuses is skipped and shown as the last error in `mx status`, and sync carries on. The next folder listing drops a folder that is gone. Only an expired sign-in or a failing secret store stops `mx sync`.
 - **Fallback:** while notifications work, mx also polls every folder every 5 minutes. When they don't, it polls every 60 seconds and tries notifications again every 10 minutes.
 - **Stopping:** on Windows, stopping sync also ends its `cloudflared`. A forced stop can't delete the Graph subscriptions, so they expire within 3 days, and the next sync start deletes any that remain.
 - **Health:** `mx sync` records a heartbeat every minute. `mx status` and the read tools use it to tell whether sync is running and how old the mail is.
+
+## When a message is gone
+
+When a tool's request to Graph, including a draft tool's, answers 404 for a stored message, mx looks the message up by its id. If Graph still has it, mx refiles it where Graph says and returns the error. If Graph no longer has it, mx removes it from the store, and the tool answers, for example, `#12 is no longer in the mailbox.`
 
 ## Search
 
