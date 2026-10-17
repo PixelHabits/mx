@@ -39,6 +39,8 @@ Description=mx: keep the local copy of the mailbox in step with Microsoft Graph
 [Service]
 Type=exec
 ExecStart="${bin}" sync
+# mx sync exits 130 when it stops on SIGTERM, as on systemctl --user stop or restart.
+SuccessExitStatus=130
 # A refused sign-in stops mx sync with "Run mx login."; it starts again by itself after the next login.
 Restart=on-failure
 RestartSec=5min

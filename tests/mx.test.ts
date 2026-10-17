@@ -2540,14 +2540,14 @@ describe("mx", () => {
 		}));
 
 	test(
-		"mx install writes the systemd user unit that runs the installed binary, and makes the binary executable",
+		"mx install writes the systemd user unit that runs the installed binary and counts a stop as a clean exit, and makes the binary executable",
 		() =>
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
 				expect((yield* fs.stat(installed)).mode % 0o1000).toBe(0o755);
-				expect(yield* fs.readFileString(unitFile)).toContain(
-					`ExecStart="${installed}" sync`
-				);
+				const unit = lines(yield* fs.readFileString(unitFile));
+				expect(unit).toContain(`ExecStart="${installed}" sync`);
+				expect(unit).toContain("SuccessExitStatus=130");
 			}),
 		{ because: "systemd and file modes are Linux's", platform: "linux" }
 	);
