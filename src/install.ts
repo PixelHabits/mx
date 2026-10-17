@@ -1,12 +1,15 @@
+import { userInfo } from "node:os";
 import {
 	Array as Arr,
 	Console,
 	Context,
+	Duration,
 	Effect,
 	FileSystem,
 	Layer,
 	Option,
 	Path,
+	Schedule,
 	Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -47,6 +50,58 @@ RestartSec=5min
 
 [Install]
 WantedBy=default.target
+`;
+
+/** The label of the LaunchAgent that runs `mx sync` on macOS, and the name of its plist in `~/Library/LaunchAgents`. */
+const agentLabel = "io.github.pixelhabits.mx.sync";
+
+/**
+ * How long mx waits for launchd to remove the LaunchAgent it unloaded before it loads the agent again; `mx sync` takes
+ * up to 10 seconds to delete its Graph subscriptions as it stops.
+ */
+const agentRemovalWait = Duration.seconds(20);
+
+/** How often mx asks launchd whether it still holds the LaunchAgent it unloaded. */
+const agentRemovalCheckInterval = Duration.millis(100);
+
+/**
+ * The LaunchAgent's plist, for `mx sync` from `bin` with its output in `log`. launchd starts it when it loads the agent,
+ * at sign-in and on `launchctl bootstrap`. KeepAlive starts it again after any exit but 0, at most once every 5
+ * minutes, as the systemd unit's RestartSec does; launchd knows no clean exit status but 0, so it also restarts the 130
+ * of a SIGTERM. mx stops it for good with `launchctl bootout`, which unloads the agent.
+ */
+const launchAgent = ({
+	bin,
+	log,
+}: {
+	readonly bin: string;
+	readonly log: string;
+}) => `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${agentLabel}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>${Bun.escapeHTML(bin)}</string>
+		<string>sync</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>300</integer>
+	<key>StandardOutPath</key>
+	<string>${Bun.escapeHTML(log)}</string>
+	<key>StandardErrorPath</key>
+	<string>${Bun.escapeHTML(log)}</string>
+</dict>
+</plist>
 `;
 
 /** The per-user Run key: Windows runs each value's command at sign-in, and writing it needs no admin rights. */
@@ -91,6 +146,36 @@ export interface Removal {
 	readonly what: string;
 }
 
+/** What starts `mx sync` at sign-in on one system, and how mx starts and stops that `mx sync`. */
+interface SyncAtSignIn {
+	/** Sets up the start at sign-in; it stops and starts nothing, so an `mx sync` that runs goes on until `reload`. */
+	readonly register: Effect.Effect<void, InstallFailed>;
+	/** Whether `register` set it up on this machine. */
+	readonly registered: Effect.Effect<boolean, InstallFailed>;
+	/** Starts `mx sync` as `register` set it up, stopping the one that runs. */
+	readonly reload: Effect.Effect<void, InstallFailed>;
+	/** What `mx uninstall` removes of it; stopping sync comes with it. */
+	readonly removals: Effect.Effect<readonly Removal[], InstallFailed>;
+	/** Starts `mx sync` from the installed binary, stopping the one that runs; `mx sync` runs it on itself after an update. */
+	readonly restart: Effect.Effect<void, InstallFailed>;
+}
+
+/** The choice for the system mx runs on, where Linux stands for any system that is not macOS or Windows. */
+const onSystem = <A>(choices: {
+	readonly darwin: A;
+	readonly linux: A;
+	readonly win32: A;
+}) => {
+	switch (process.platform) {
+		case "darwin":
+			return choices.darwin;
+		case "win32":
+			return choices.win32;
+		default:
+			return choices.linux;
+	}
+};
+
 /**
  * Installs mx for the signed-in user: the binary, the background `mx sync`, and `mx mcp` in the config of each agent
  * chosen. Each step writes the state it wants, so running it again reinstalls without duplicating anything.
@@ -100,7 +185,7 @@ export class Installer extends Context.Service<
 	{
 		/**
 		 * Sets up `agents`, signs in with `login` when there is no sign-in saved for it, runs `firstSync` and then starts
-		 * the background `mx sync`.
+		 * the background `mx sync`, which it starts as well when a step after its registration fails.
 		 */
 		readonly install: (options: {
 			readonly agents: readonly AgentId[];
@@ -139,13 +224,12 @@ export class Installer extends Context.Service<
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 			const credentials = yield* Credentials;
 			const auth = yield* Auth;
-			const { bin, cache, config, configFile, data, packaged, state } =
+			const { bin, cache, config, configFile, data, home, packaged, state } =
 				yield* Paths;
 			const offered = yield* agents;
 			const windows = process.platform === "win32";
 			const folder = path.dirname(bin);
 			const background = path.join(folder, backgroundName);
-			const unitFile = path.join(config, "systemd", "user", unitName);
 			const failed = (step: string) => (error: { readonly message: string }) =>
 				InstallFailed.make({ message: `${step}: ${error.message}` });
 
@@ -249,52 +333,46 @@ export class Installer extends Context.Service<
 				)
 			);
 
-			/** Stops every other background `mx sync` on Windows, with the cloudflared each started, and waits for them. */
-			const stopRunningSync = execute(
-				"The PowerShell that stops mx sync",
-				stopSync(process.pid)
-			);
+			/** A file or folder mx removes when it exists, named `what`. */
+			const removeFile = (what: string, file: string) =>
+				Effect.map(fs.exists(file), (exists) =>
+					exists
+						? [
+								{
+									remove: fs
+										.remove(file, { force: true, recursive: true })
+										.pipe(
+											Effect.mapError(failed(`Could not delete ${file}`)),
+											Effect.andThen(Console.log(`Removed ${what}: ${file}.`))
+										),
+									what: `${what}: ${file}`,
+								},
+							]
+						: []
+				).pipe(Effect.mapError(failed(`Could not look for ${file}`)));
 
-			const restartSync = windows
-				? Effect.andThen(
-						stopRunningSync,
-						startDetached(
-							`Could not start ${background}`,
-							ChildProcess.make(background, ["sync"], {
-								detached: true,
-								stderr: "ignore",
-								stdin: "ignore",
-								stdout: "ignore",
-							})
-						)
-					)
-				: run("systemctl", ["--user", "restart", "--no-block", unitName]);
-
-			const syncRegistered = windows
-				? succeeds("reg", ["query", runKey, "/v", "mx"])
-				: succeeds("systemctl", ["--user", "is-enabled", "--quiet", unitName]);
-
-			const resumeSync = Effect.gen(function* () {
-				if (!(yield* syncRegistered)) {
-					return;
-				}
-				yield* restartSync;
-				yield* Console.log("Restarted mx sync.");
-			});
-
-			const registerSync = windows
-				? run("reg", [
-						"add",
-						runKey,
-						"/v",
-						"mx",
-						"/t",
-						"REG_SZ",
-						"/d",
-						`"${background}" sync`,
-						"/f",
-					])
-				: Effect.gen(function* () {
+			/** The systemd user unit that runs `mx sync` from login to logout, on Linux. */
+			const systemdUnit = (): SyncAtSignIn => {
+				const unitFile = path.join(config, "systemd", "user", unitName);
+				const unregister = Effect.gen(function* () {
+					yield* run("systemctl", ["--user", "disable", "--now", unitName], {
+						allowFailure: true,
+					});
+					if (!packaged) {
+						yield* fs
+							.remove(unitFile, { force: true })
+							.pipe(Effect.mapError(failed(`Could not delete ${unitFile}`)));
+					}
+					yield* run("systemctl", ["--user", "daemon-reload"]);
+				});
+				const restart = run("systemctl", [
+					"--user",
+					"restart",
+					"--no-block",
+					unitName,
+				]);
+				return {
+					register: Effect.gen(function* () {
 						// The Arch package ships the unit in /usr/lib/systemd/user.
 						if (!packaged) {
 							yield* fs
@@ -306,26 +384,197 @@ export class Installer extends Context.Service<
 						}
 						yield* run("systemctl", ["--user", "daemon-reload"]);
 						yield* run("systemctl", ["--user", "enable", unitName]);
-					});
+					}),
+					registered: succeeds("systemctl", [
+						"--user",
+						"is-enabled",
+						"--quiet",
+						unitName,
+					]),
+					// systemd runs the unit as the daemon-reload in register read it.
+					reload: restart,
+					removals: packaged
+						? Effect.succeed([
+								{
+									remove: Effect.andThen(
+										unregister,
+										Console.log(
+											`Stopped mx sync and disabled ${unitName}. pacman -R mx removes ${bin} and the unit.`
+										)
+									),
+									what: `the start of mx sync at sign-in: systemctl --user disable ${unitName}`,
+								},
+							])
+						: Effect.map(
+								removeFile("the sync unit", unitFile),
+								Arr.map(
+									(removal): Removal => ({
+										remove: Effect.andThen(
+											unregister,
+											Console.log(`Stopped mx sync and removed ${unitFile}.`)
+										),
+										what: removal.what,
+									})
+								)
+							),
+					restart,
+				};
+			};
 
-			const unregisterSync = windows
-				? Effect.andThen(
-						stopRunningSync,
-						run("reg", ["delete", runKey, "/v", "mx", "/f"], {
-							allowFailure: true,
+			/** The Run key value that starts mxw.exe at sign-in, on Windows. */
+			const runKeyValue = (): SyncAtSignIn => {
+				/** Stops every other background `mx sync`, with the cloudflared each started, and waits for them. */
+				const stopRunningSync = execute(
+					"The PowerShell that stops mx sync",
+					stopSync(process.pid)
+				);
+				const restart = Effect.andThen(
+					stopRunningSync,
+					startDetached(
+						`Could not start ${background}`,
+						ChildProcess.make(background, ["sync"], {
+							detached: true,
+							stderr: "ignore",
+							stdin: "ignore",
+							stdout: "ignore",
 						})
 					)
-				: Effect.gen(function* () {
-						yield* run("systemctl", ["--user", "disable", "--now", unitName], {
-							allowFailure: true,
-						});
-						if (!packaged) {
-							yield* fs
-								.remove(unitFile, { force: true })
-								.pipe(Effect.mapError(failed(`Could not delete ${unitFile}`)));
+				);
+				return {
+					register: run("reg", [
+						"add",
+						runKey,
+						"/v",
+						"mx",
+						"/t",
+						"REG_SZ",
+						"/d",
+						`"${background}" sync`,
+						"/f",
+					]),
+					registered: succeeds("reg", ["query", runKey, "/v", "mx"]),
+					// The restart starts the command the Run key holds.
+					reload: restart,
+					removals: Effect.succeed([
+						{
+							remove: stopRunningSync.pipe(
+								Effect.andThen(
+									run("reg", ["delete", runKey, "/v", "mx", "/f"], {
+										allowFailure: true,
+									})
+								),
+								Effect.andThen(
+									Console.log("Stopped mx sync and removed its registration.")
+								)
+							),
+							what: `the mx value under ${runKey}, which starts mx sync at sign-in`,
+						},
+					]),
+					restart,
+				};
+			};
+
+			/** The LaunchAgent in the user's GUI session, on macOS; `man launchctl` describes its targets. */
+			const launchdAgent = (): SyncAtSignIn => {
+				const agentFile = path.join(
+					home,
+					"Library",
+					"LaunchAgents",
+					`${agentLabel}.plist`
+				);
+				const domain = `gui/${userInfo().uid}`;
+				const target = `${domain}/${agentLabel}`;
+				/** Unloads the agent, which stops its `mx sync`; launchctl fails when none is loaded, which is as wanted. */
+				const bootout = Effect.asVoid(
+					succeeds("launchctl", ["bootout", target])
+				);
+				/**
+				 * Waits until launchd holds no agent of this label. bootout can return while the agent's `mx sync` still stops,
+				 * and launchctl bootstrap fails for a label launchd still holds. launchctl print exits non-zero once the agent is
+				 * gone; its output is no interface, but its exit status is.
+				 */
+				const removed = succeeds("launchctl", ["print", target]).pipe(
+					Effect.repeat({
+						schedule: Schedule.spaced(agentRemovalCheckInterval),
+						until: (held) => !held,
+					}),
+					Effect.timeoutOrElse({
+						duration: agentRemovalWait,
+						orElse: () =>
+							InstallFailed.make({
+								message: `launchd still held ${target} ${Duration.format(agentRemovalWait)} after launchctl bootout.`,
+							}),
+					}),
+					Effect.asVoid
+				);
+				/** Loads the agent from its plist, which starts its `mx sync`. */
+				const bootstrap = run("launchctl", ["bootstrap", domain, agentFile]);
+				return {
+					register: Effect.gen(function* () {
+						yield* fs
+							.makeDirectory(path.dirname(agentFile), { recursive: true })
+							.pipe(Effect.mapError(failed(`Could not create ${agentFile}`)));
+						yield* fs
+							.writeFileString(
+								agentFile,
+								launchAgent({ bin, log: path.join(state, "sync.log") })
+							)
+							.pipe(Effect.mapError(failed(`Could not write ${agentFile}`)));
+						// launchd opens the log as it starts mx sync, and creates no folder for it.
+						yield* fs
+							.makeDirectory(state, { recursive: true })
+							.pipe(Effect.mapError(failed(`Could not create ${state}`)));
+					}),
+					registered: fs
+						.exists(agentFile)
+						.pipe(Effect.mapError(failed(`Could not look for ${agentFile}`))),
+					// A loaded agent runs the plist it loaded with, so the agent unloads and loads again to run the one register wrote.
+					reload: Effect.gen(function* () {
+						yield* bootout;
+						yield* removed;
+						yield* bootstrap;
+					}),
+					removals: Effect.map(
+						removeFile("the LaunchAgent", agentFile),
+						Arr.map(
+							(removal): Removal => ({
+								remove: Effect.gen(function* () {
+									yield* bootout;
+									yield* fs
+										.remove(agentFile, { force: true })
+										.pipe(
+											Effect.mapError(failed(`Could not delete ${agentFile}`))
+										);
+									yield* Console.log(
+										`Stopped mx sync and removed ${agentFile}.`
+									);
+								}),
+								what: removal.what,
+							})
+						)
+					),
+					// kickstart restarts a loaded agent, as after an update; bootstrap loads one that is not, which starts it.
+					restart: Effect.gen(function* () {
+						if (!(yield* succeeds("launchctl", ["kickstart", "-k", target]))) {
+							yield* bootstrap;
 						}
-						yield* run("systemctl", ["--user", "daemon-reload"]);
-					});
+					}),
+				};
+			};
+
+			const syncAtSignIn = onSystem({
+				darwin: launchdAgent,
+				linux: systemdUnit,
+				win32: runKeyValue,
+			})();
+
+			const resumeSync = Effect.gen(function* () {
+				if (!(yield* syncAtSignIn.registered)) {
+					return;
+				}
+				yield* syncAtSignIn.restart;
+				yield* Console.log("Restarted mx sync.");
+			});
 
 			/** The user's own PATH on Windows, as stored. A PATH mx could not read fails, so mx never writes over one. */
 			const userPath = Effect.scoped(
@@ -497,25 +746,33 @@ export class Installer extends Context.Service<
 					if (windows) {
 						yield* addToPath;
 					}
-					yield* registerSync;
+					yield* syncAtSignIn.register;
 					yield* Console.log("Registered mx sync to start at sign-in.");
-					// Each config is read again as it is written, so what an agent saved to it in the meantime stays.
-					for (const agent of set) {
-						for (const file of agent.files) {
-							yield* change(
-								file,
-								setUp(agent, file),
-								`Registered mx with ${agent.app} in ${file.path}.`
-							);
-						}
-					}
-					yield* credentials.use(login);
-					if (!(yield* signedIn)) {
-						yield* signIn(auth, login);
-					}
-					yield* firstSync;
-					yield* restartSync;
-					yield* Console.log("Started mx sync.");
+					// Whatever fails or stops mx install from here, as a refused sign-in in the first sync, mx sync starts as registered.
+					yield* Effect.onExit(
+						Effect.gen(function* () {
+							// Each config is read again as it is written, so what an agent saved to it in the meantime stays.
+							for (const agent of set) {
+								for (const file of agent.files) {
+									yield* change(
+										file,
+										setUp(agent, file),
+										`Registered mx with ${agent.app} in ${file.path}.`
+									);
+								}
+							}
+							yield* credentials.use(login);
+							if (!(yield* signedIn)) {
+								yield* signIn(auth, login);
+							}
+							yield* firstSync;
+						}),
+						() =>
+							Effect.andThen(
+								syncAtSignIn.reload,
+								Console.log("Started mx sync.")
+							)
+					);
 					yield* Console.log(
 						`Quit and reopen ${listed.format(Arr.map(set, ({ app }) => app))} now. An agent left open can write its old settings back and drop mx.`
 					);
@@ -524,24 +781,6 @@ export class Installer extends Context.Service<
 					Effect.fail(failed("Could not read the saved sign-in")(error))
 				)
 			);
-
-			/** A file or folder mx removes when it exists, named `what`. */
-			const removeFile = (what: string, file: string) =>
-				Effect.map(fs.exists(file), (exists) =>
-					exists
-						? [
-								{
-									remove: fs
-										.remove(file, { force: true, recursive: true })
-										.pipe(
-											Effect.mapError(failed(`Could not delete ${file}`)),
-											Effect.andThen(Console.log(`Removed ${what}: ${file}.`))
-										),
-									what: `${what}: ${file}`,
-								},
-							]
-						: []
-				);
 
 			/** Whether `file` is the exe this process runs; Windows compares paths without case. */
 			const isThisExe = (file: string) =>
@@ -618,44 +857,6 @@ export class Installer extends Context.Service<
 				what: `${folder} in your PATH`,
 			};
 
-			/** What starts `mx sync` at sign-in, as `mx uninstall` removes it; stopping sync comes with it. */
-			const syncRegistration = Effect.gen(function* () {
-				if (packaged) {
-					return [
-						{
-							remove: Effect.andThen(
-								unregisterSync,
-								Console.log(
-									`Stopped mx sync and disabled ${unitName}. pacman -R mx removes ${bin} and the unit.`
-								)
-							),
-							what: `the start of mx sync at sign-in: systemctl --user disable ${unitName}`,
-						},
-					];
-				}
-				if (windows) {
-					return [
-						{
-							remove: Effect.andThen(
-								unregisterSync,
-								Console.log("Stopped mx sync and removed its registration.")
-							),
-							what: `the mx value under ${runKey}, which starts mx sync at sign-in`,
-						},
-					];
-				}
-				return Arr.map(
-					yield* removeFile("the sync unit", unitFile),
-					(removal): Removal => ({
-						remove: Effect.andThen(
-							unregisterSync,
-							Console.log(`Stopped mx sync and removed ${unitFile}.`)
-						),
-						what: removal.what,
-					})
-				);
-			});
-
 			/** What mx install wrote of the program; none when the package owns the binary. */
 			const programRemovals = Effect.gen(function* () {
 				if (packaged) {
@@ -695,12 +896,12 @@ export class Installer extends Context.Service<
 			);
 
 			/**
-			 * Sync stops first, so nothing writes to the store as it goes. On Linux it deletes its Graph subscriptions as it
-			 * stops, while its sign-in is still saved; on Windows nothing can ask it to stop, so they stay until they expire,
-			 * on a tunnel that is gone.
+			 * Sync stops first, so nothing writes to the store as it goes. On Linux and macOS it deletes its Graph
+			 * subscriptions as it stops, while its sign-in is still saved; on Windows nothing can ask it to stop, so they stay
+			 * until they expire, on a tunnel that is gone.
 			 */
 			const removals = Effect.gen(function* () {
-				const registration = yield* syncRegistration;
+				const registration = yield* syncAtSignIn.removals;
 				const signInRemoval: readonly Removal[] = (yield* signedIn)
 					? [
 							{
@@ -739,7 +940,14 @@ export class Installer extends Context.Service<
 					yield* removeStore,
 					signInRemoval,
 					yield* removeFile("the attachment cache", cache),
-					yield* removeFile("the state folder", state),
+					yield* removeFile(
+						onSystem({
+							darwin: "the log folder",
+							linux: "the state folder",
+							win32: "the state folder",
+						}),
+						state
+					),
 				]);
 			}).pipe(
 				Effect.catchTags({
@@ -764,7 +972,7 @@ export class Installer extends Context.Service<
 				removals,
 				removeOldBinaries,
 				replaceBinary,
-				restartSync,
+				restartSync: syncAtSignIn.restart,
 				resumeSync,
 			});
 		})

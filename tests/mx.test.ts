@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it, mock } from "bun:test";
+import { userInfo } from "node:os";
 import { BunServices } from "@effect/platform-bun";
 import {
 	Array as Arr,
@@ -304,20 +305,24 @@ const fakeTerminal = (system: typeof platform, keys: readonly string[]) => {
 	return { frames, system: Layer.merge(system, terminal) };
 };
 
-/** Runs `effect` as if on Windows; mx reads `process.platform` as it builds its layers. */
-const onWindows = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-	Effect.acquireUseRelease(
-		Effect.sync(() => {
-			const actual = process.platform;
-			Object.defineProperty(process, "platform", { value: "win32" });
-			return actual;
-		}),
-		() => effect,
-		(actual) =>
+/** Runs `effect` as if on `system`; mx reads `process.platform` as it builds its layers. */
+const asIfOn =
+	(system: OperatingSystem) =>
+	<A, E, R>(effect: Effect.Effect<A, E, R>) =>
+		Effect.acquireUseRelease(
 			Effect.sync(() => {
-				Object.defineProperty(process, "platform", { value: actual });
-			})
-	);
+				const actual = process.platform;
+				Object.defineProperty(process, "platform", { value: system });
+				return actual;
+			}),
+			() => effect,
+			(actual) =>
+				Effect.sync(() => {
+					Object.defineProperty(process, "platform", { value: actual });
+				})
+		);
+const onWindows = asIfOn("win32");
+const onMac = asIfOn("darwin");
 
 /** Where the Arch package installs mx. */
 const packaged = "/usr/bin/mx";
@@ -558,10 +563,19 @@ const downloads = (version: string) =>
 const unitFile = join(home, "config", "systemd", "user", "mx-sync.service");
 const mxEntry = { args: ["mcp"], command: installed };
 
-/** What mx uninstall deletes: the binary, the background copy or unit that runs `mx sync`, and each of mx's folders. */
+/** The LaunchAgent that runs `mx sync` on macOS, and launchd's names for the user's GUI session and for the agent in it. */
+const agentLabel = "io.github.pixelhabits.mx.sync";
+const agentFile = join(home, "Library", "LaunchAgents", `${agentLabel}.plist`);
+const agentDomain = `gui/${userInfo().uid}`;
+const agentTarget = `${agentDomain}/${agentLabel}`;
+
+/**
+ * What mx uninstall deletes: the binary, the background copy, unit or LaunchAgent that runs `mx sync`, and each of mx's
+ * folders.
+ */
 const mxFiles = [
 	installed,
-	windows ? background : unitFile,
+	onThisSystem({ darwin: agentFile, linux: unitFile, win32: background }),
 	configFile,
 	dataFolder,
 	cacheFolder,
@@ -577,35 +591,57 @@ const stopBackground = commandLine(stopSync(process.pid));
 
 /**
  * The programs mx runs to register, restart and remove the background `mx sync`, and to ask whether it is registered:
- * systemd on Linux; on Windows the Run key, and the user PATH that holds the program folder.
+ * systemd on Linux; launchd on macOS, where `start` loads the agent that `restart` finds unloaded, and `reload`, after
+ * mx install, unloads the agent and loads it again once launchd has removed it; on Windows the Run key, and the user
+ * PATH that holds the program folder.
  */
-const syncCommands = windows
-	? {
-			register: [
-				commandLine(readUserPath),
-				`reg add ${runKey} /v mx /t REG_SZ /d "${background}" sync /f`,
-			],
-			registered: [`reg query ${runKey} /v mx`],
-			remove: [
-				stopBackground,
-				`reg delete ${runKey} /v mx /f`,
-				commandLine(readUserPath),
-				commandLine(writeUserPath("")),
-			],
-			restart: [stopBackground, `${background} sync`],
-		}
-	: {
-			register: [
-				"systemctl --user daemon-reload",
-				"systemctl --user enable mx-sync.service",
-			],
-			registered: ["systemctl --user is-enabled --quiet mx-sync.service"],
-			remove: [
-				"systemctl --user disable --now mx-sync.service",
-				"systemctl --user daemon-reload",
-			],
-			restart: ["systemctl --user restart --no-block mx-sync.service"],
-		};
+const syncCommands = onThisSystem({
+	darwin: {
+		register: [],
+		registered: [],
+		reload: [
+			`launchctl bootout ${agentTarget}`,
+			`launchctl print ${agentTarget}`,
+			`launchctl bootstrap ${agentDomain} ${agentFile}`,
+		],
+		remove: [`launchctl bootout ${agentTarget}`],
+		restart: [`launchctl kickstart -k ${agentTarget}`],
+		start: [
+			`launchctl kickstart -k ${agentTarget}`,
+			`launchctl bootstrap ${agentDomain} ${agentFile}`,
+		],
+	},
+	linux: {
+		register: [
+			"systemctl --user daemon-reload",
+			"systemctl --user enable mx-sync.service",
+		],
+		registered: ["systemctl --user is-enabled --quiet mx-sync.service"],
+		reload: ["systemctl --user restart --no-block mx-sync.service"],
+		remove: [
+			"systemctl --user disable --now mx-sync.service",
+			"systemctl --user daemon-reload",
+		],
+		restart: ["systemctl --user restart --no-block mx-sync.service"],
+		start: ["systemctl --user restart --no-block mx-sync.service"],
+	},
+	win32: {
+		register: [
+			commandLine(readUserPath),
+			`reg add ${runKey} /v mx /t REG_SZ /d "${background}" sync /f`,
+		],
+		registered: [`reg query ${runKey} /v mx`],
+		reload: [stopBackground, `${background} sync`],
+		remove: [
+			stopBackground,
+			`reg delete ${runKey} /v mx /f`,
+			commandLine(readUserPath),
+			commandLine(writeUserPath("")),
+		],
+		restart: [stopBackground, `${background} sync`],
+		start: [stopBackground, `${background} sync`],
+	},
+});
 
 /** The agents mx offers here, as `--agent` names them; Claude Desktop only on Windows and macOS. */
 const offeredAgents =
@@ -1211,13 +1247,19 @@ describe("mx", () => {
 
 	test("mx login restarts mx sync where mx install registered it, so sync runs under the new sign-in", () =>
 		Effect.gen(function* () {
+			if (mac) {
+				// On macOS, what mx install registers is the LaunchAgent's plist; launchd has not loaded it yet.
+				const fs = yield* FileSystem.FileSystem;
+				yield* fs.makeDirectory(dirname(agentFile), { recursive: true });
+				yield* fs.writeFileString(agentFile, "");
+			}
 			const before = processes.commands.length;
 			const { output } = yield* cliOn(unconfigured)("login");
 			expect(
 				Arr.map(processes.commands.slice(before), (command) =>
 					Arr.join(command, " ")
 				)
-			).toEqual([...syncCommands.registered, ...syncCommands.restart]);
+			).toEqual([...syncCommands.registered, ...syncCommands.start]);
 			expect(lines(output).at(-1)).toBe("Restarted mx sync.");
 		}));
 
@@ -2550,7 +2592,7 @@ describe("mx", () => {
 			expect((yield* fs.stat(installed)).size).toBe(
 				(yield* fs.stat(process.execPath)).size
 			);
-			const once = [...syncCommands.register, ...syncCommands.restart];
+			const once = [...syncCommands.register, ...syncCommands.reload];
 			expect(
 				Arr.map(processes.commands.slice(before), (command) =>
 					Arr.join(command, " ")
@@ -2577,6 +2619,33 @@ describe("mx", () => {
 				expect(unit).toContain("SuccessExitStatus=130");
 			}),
 		{ because: "systemd and file modes are Linux's", systems: ["linux"] }
+	);
+
+	test(
+		"mx install writes a LaunchAgent that runs the installed binary at sign-in, starts it again at most every 5 minutes after it fails, and logs to ~/Library/Logs/mx, and makes the binary executable",
+		() =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				expect((yield* fs.stat(installed)).mode % 0o1000).toBe(0o755);
+				// launchd refuses a LaunchAgent that its group or others can write.
+				expect((yield* fs.stat(agentFile)).mode % 0o1000).toBe(0o644);
+				const plutil = yield* Effect.sync(() =>
+					Bun.spawnSync(["plutil", "-convert", "json", "-o", "-", agentFile], {
+						stderr: "inherit",
+					})
+				);
+				expect(plutil.exitCode).toBe(0);
+				expect(yield* parseJson(plutil.stdout.toString())).toEqual({
+					KeepAlive: { SuccessfulExit: false },
+					Label: agentLabel,
+					ProgramArguments: [installed, "sync"],
+					RunAtLoad: true,
+					StandardErrorPath: join(stateFolder, "sync.log"),
+					StandardOutPath: join(stateFolder, "sync.log"),
+					ThrottleInterval: 300,
+				});
+			}),
+		{ because: "plutil and launchd are macOS's", systems: ["darwin"] }
 	);
 
 	test(
@@ -2749,6 +2818,38 @@ describe("mx", () => {
 				Effect.sync(() => {
 					microsoft.release("folder-inbox");
 				})
+			)
+		));
+
+	test("on macOS, mx install that fails after it registered mx sync, as when Microsoft refuses the sign-in during the first sync, leaves the LaunchAgent loaded", () =>
+		onMac(
+			Effect.gen(function* () {
+				const system = yield* neverSynced("first-sync-refused");
+				yield* cli("install", "--agent", "codex");
+				microsoft.refuseRefresh = true;
+				const failure = yield* Effect.flip(
+					withStdoutTerminal(false)(
+						cliOn(system)("install", "--agent", "claude-code")
+					)
+				);
+				expect(failure.message).toContain("Run mx login.");
+				expect(processes.loaded.has(agentTarget)).toBe(true);
+			}).pipe(Effect.ensuring(acceptRefresh))
+		));
+
+	test("on macOS, mx install loads the LaunchAgent again only once launchd has removed the one it unloaded", () =>
+		onMac(
+			Effect.gen(function* () {
+				yield* cli("install", "--agent", "codex");
+				processes.removalLag = 3;
+				yield* cli("install", "--agent", "codex");
+				expect(processes.loaded.has(agentTarget)).toBe(true);
+			}).pipe(
+				Effect.ensuring(
+					Effect.sync(() => {
+						processes.removalLag = 0;
+					})
+				)
 			)
 		));
 
@@ -3185,4 +3286,57 @@ describe("mx", () => {
 				expect(output).not.toContain(`Could not delete ${windowsFolder}`);
 			})
 		));
+
+	test(
+		"on macOS, mx install loads the LaunchAgent with launchctl bootstrap once it unloads the one loaded before, mx login restarts it with kickstart, and mx uninstall unloads it and deletes it with the log folder",
+		() =>
+			onMac(
+				Effect.gen(function* () {
+					const fs = yield* FileSystem.FileSystem;
+					const logs = join(library, "Logs", "mx");
+					const bin = join(home, ".local", "bin", "mx");
+					const before = processes.commands.length;
+					yield* cli("install", "--agent", "codex");
+					yield* cli("install", "--agent", "codex");
+					const plist = yield* fs.readFileString(agentFile);
+					expect(plist).toContain(`<string>${bin}</string>`);
+					expect(plist).toContain(`<string>${join(logs, "sync.log")}</string>`);
+					expect(yield* fs.exists(logs)).toBe(true);
+					yield* cliOn(unconfigured)("login");
+					yield* cli("uninstall", "--yes");
+					const bootout = `launchctl bootout ${agentTarget}`;
+					const print = `launchctl print ${agentTarget}`;
+					const kickstart = `launchctl kickstart -k ${agentTarget}`;
+					const bootstrap = `launchctl bootstrap ${agentDomain} ${agentFile}`;
+					expect(
+						Arr.map(processes.commands.slice(before), (command) =>
+							Arr.join(command, " ")
+						)
+					).toEqual([
+						bootout,
+						print,
+						bootstrap,
+						bootout,
+						print,
+						bootstrap,
+						kickstart,
+						bootout,
+					]);
+					for (const path of [
+						agentFile,
+						logs,
+						bin,
+						join(support, "config.json"),
+						join(support, "data"),
+					]) {
+						expect(yield* fs.exists(path)).toBe(false);
+					}
+				})
+			),
+		{
+			because:
+				"on macOS the install, login and uninstall tests above run these steps",
+			systems: ["linux", "win32"],
+		}
+	);
 });

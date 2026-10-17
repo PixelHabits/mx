@@ -34,11 +34,14 @@ const commandLine = (command: ChildProcess.StandardCommand) =>
 const pathRead = commandLine(readUserPath);
 const pathWrite = commandLine(writeUserPath(""));
 
+/** A LaunchAgent's label: its plist's name without `.plist`. */
+const plistLabel = /([^/\\]+)\.plist$/u;
+
 /**
  * Every program mx starts, recorded and faked. `cloudflared tunnel` opens a quick tunnel on the fake internet, named
  * `tunnel-<n>.trycloudflare.com`, that runs until the scope that started it closes or `exit` ends it. The PowerShell
- * that reads the user PATH on Windows prints `userPath` as it does, and the one that writes it sets `userPath`. Any
- * other program exits 0 at once.
+ * that reads the user PATH on Windows prints `userPath` as it does, and the one that writes it sets `userPath`.
+ * `launchctl` loads and unloads LaunchAgents and fails as it does on macOS. Any other program exits 0 at once.
  */
 export class FakeProcesses {
 	readonly commands: (readonly string[])[] = [];
@@ -46,7 +49,16 @@ export class FakeProcesses {
 	userPath = "";
 	/** Runs as each program starts, for a test that checks what holds at that moment. */
 	onSpawn: (() => void) | undefined;
+	/**
+	 * How many times `launchctl print` still finds an agent that `launchctl bootout` unloaded: launchd removes it only
+	 * once its `mx sync` has exited.
+	 */
+	removalLag = 0;
+	/** The service targets of the LaunchAgents loaded, such as `gui/501/io.github.pixelhabits.mx.sync`. */
+	readonly loaded = new Set<string>();
 	private opened = 0;
+	/** The agents unloaded that launchd has not removed yet, with how many more `launchctl print` calls find each. */
+	private readonly removing = new Map<string, number>();
 	private readonly running = new Map<
 		string,
 		Deferred.Deferred<ChildProcessSpawner.ExitCode>
@@ -70,6 +82,59 @@ export class FakeProcesses {
 		return exit === undefined
 			? Effect.die(`No tunnel runs at ${host}.`)
 			: Effect.asVoid(Deferred.succeed(exit, ExitCode(1)));
+	}
+
+	/**
+	 * How a program that runs to its end exits. launchctl fails as it does on macOS: `bootstrap` of a loaded agent with
+	 * 5 and of one launchd has not removed yet with 37, `bootout` and `kickstart` of one that is not loaded with 3 and
+	 * 113, and `print` of one launchd does not hold with 113.
+	 */
+	private exitCode(command: ChildProcess.StandardCommand) {
+		if (command.command !== "launchctl") {
+			return 0;
+		}
+		const [subcommand, target = "", plist = ""] = command.args;
+		switch (subcommand) {
+			case "bootstrap": {
+				const service = `${target}/${plistLabel.exec(plist)?.[1] ?? ""}`;
+				if (this.loaded.has(service)) {
+					return 5;
+				}
+				if (this.removing.has(service)) {
+					return 37;
+				}
+				this.loaded.add(service);
+				return 0;
+			}
+			case "bootout":
+				if (!this.loaded.delete(target)) {
+					return 3;
+				}
+				if (this.removalLag > 0) {
+					this.removing.set(target, this.removalLag);
+				}
+				return 0;
+			case "kickstart":
+				return this.loaded.has(command.args.at(-1) ?? "") ? 0 : 113;
+			case "print":
+				return this.loaded.has(target) || this.stillHeld(target) ? 0 : 113;
+			default:
+				return 0;
+		}
+	}
+
+	/** Whether launchd still holds `target`, unloaded but not removed; it removes it once `print` found it `removalLag` times. */
+	private stillHeld(target: string) {
+		const left = this.removing.get(target);
+		if (left === undefined) {
+			return false;
+		}
+		if (left > 1) {
+			this.removing.set(target, left - 1);
+		} else {
+			this.removing.delete(target);
+		}
+		return true;
 	}
 
 	private spawn(command: ChildProcess.Command) {
@@ -96,7 +161,7 @@ export class FakeProcesses {
 			(exit) => {
 				if (command.args[0] !== "tunnel") {
 					return Effect.as(
-						Deferred.succeed(exit, ExitCode(0)),
+						Deferred.succeed(exit, ExitCode(this.exitCode(command))),
 						handle(this.commands.length, exit, stdout)
 					);
 				}
