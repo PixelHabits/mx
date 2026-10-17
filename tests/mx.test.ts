@@ -181,6 +181,7 @@ const cliOn =
 
 const run = runOn(platform);
 const cli = cliOn(platform);
+const status = run("status");
 
 /** Runs `effect` with stdin a terminal or not; mx asks for what a command needs only on a terminal. */
 const withStdinTerminal =
@@ -402,6 +403,7 @@ const eventually = <E = never, R = never>(
 
 /** Lets work that the test does not wait on run for a while on the real clock. */
 const settle = Effect.promise(() => Bun.sleep(1500));
+const settleBriefly = Effect.promise(() => Bun.sleep(100));
 
 const deltaRequests = (folderId: string) =>
 	Arr.filter(graphRequests("/messages/delta"), (request) =>
@@ -551,6 +553,8 @@ const earlyDraftLine =
 	/^#\d+ .* Drafts \| to bob@example\.test \| Before sync \| draft$/u;
 const replyDraftLine = /^#\d+ .* Drafts \| to Carol Example/u;
 const permanent = /permanentDelete/u;
+const runningLine = /^mx sync: running, last heard from \d+ s ago$/u;
+const lastSyncLine = /^Last sync: \d{4}-\d{2}-\d{2} \d{2}:\d{2}, \d+ s ago$/u;
 const loopbackUrl = /^http:\/\/127\.0\.0\.1:\d+$/u;
 const loopbackAddress = /^127\.0\.0\.1:\d+$/u;
 const lineIn = (id: number, folder: string) =>
@@ -813,6 +817,33 @@ describe("mx", () => {
 				"systemctl --user restart --no-block mx-sync.service",
 			]);
 			expect(lines(output).at(-1)).toBe("Restarted mx sync.");
+		}));
+
+	test("mx sync records a heartbeat after its first pass, and mx status reports it running with its mode, both versions, a saved sign-in, the client id and the tenant, and no error", () =>
+		Effect.gen(function* () {
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"a heartbeat after the first pass",
+				Effect.map(
+					status,
+					({ output: report }) =>
+						report.includes("Mode: poll") &&
+						!report.includes("Last sync: never")
+				)
+			);
+			yield* Fiber.interrupt(service);
+			const { exit, output } = yield* status;
+			expect(Exit.isSuccess(exit)).toBe(true);
+			expect(lines(output)).toEqual([
+				expect.stringMatching(runningLine),
+				expect.stringMatching(lastSyncLine),
+				"Mode: poll",
+				`Version: mx sync ${running}, this binary ${running}`,
+				"Sign-in: saved",
+				"Client id: set",
+				`Tenant: ${tenant}`,
+				"Last error: none",
+			]);
 		}));
 
 	test("mx sync --once stores every mail folder, child folders included, through Graph delta with text bodies and immutable ids", () =>
@@ -1316,6 +1347,19 @@ describe("mx", () => {
 			);
 		}));
 
+	test("while push is up, mx status reports sync running in push mode", () =>
+		Effect.gen(function* () {
+			yield* eventually(
+				"push mode in mx status",
+				Effect.map(status, ({ output: report }) =>
+					report.includes("Mode: push")
+				)
+			);
+			const { exit, output } = yield* status;
+			expect(Exit.isSuccess(exit)).toBe(true);
+			expect(lines(output)[0]).toMatch(runningLine);
+		}));
+
 	test("a change notification brings a new message into the store within seconds, and the webhook answers 202", () =>
 		Effect.gen(function* () {
 			yield* Effect.promise(() => microsoft.receive("Push arrives"));
@@ -1438,6 +1482,92 @@ describe("mx", () => {
 			yield* Fiber.interrupt(service);
 		}).pipe(
 			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test and its mx sync run on.
+			Effect.provide(TestClock.layer())
+		));
+
+	test("while a pass runs for many minutes, as when Graph throttles every request, mx status reports sync running", () =>
+		Effect.gen(function* () {
+			microsoft.throttleEach = 3;
+			microsoft.retryAfter = 50;
+			const before = Arr.map(allFolders, deltaRequests);
+			const asked = microsoft.graphRequests().length;
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"a throttled answer",
+				() => microsoft.graphRequests().length > asked
+			);
+			for (let minute = 0; minute < 11; minute += 1) {
+				// Answers in flight arrive before the clock moves past their deadlines.
+				yield* settleBriefly;
+				yield* TestClock.adjust("1 minute");
+			}
+			const { output } = yield* status;
+			expect(
+				Arr.every(
+					allFolders,
+					(folder, index) => deltaRequests(folder) > (before[index] ?? 0)
+				)
+			).toBe(false);
+			expect(lines(output)[0]).toMatch(runningLine);
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.throttleEach = 0;
+					microsoft.retryAfter = 1;
+				})
+			),
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test, its mx sync and mx status run on.
+			Effect.provide(TestClock.layer())
+		));
+
+	test("while Graph fails for hours, read tools say how old the mail is and name the last error, and mx status exits non-zero", () =>
+		Effect.gen(function* () {
+			const threeHoursAgo =
+				Temporal.Now.instant().epochMilliseconds - 3 * 60 * 60 * 1000;
+			yield* TestClock.setTime(threeHoursAgo);
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"a pass 3 hours ago",
+				Effect.map(call("search", { limit: 1 }), ({ text }) =>
+					text.startsWith("⚠ Mail last synced 3 h ago")
+				)
+			);
+			microsoft.outage = 503;
+			yield* TestClock.setTime(Temporal.Now.instant().epochMilliseconds);
+			yield* eventually(
+				"the outage in the heartbeat",
+				TestClock.adjust("5 seconds").pipe(
+					Effect.andThen(status),
+					Effect.map(({ output: report }) =>
+						report.includes("Last error: Microsoft")
+					)
+				)
+			);
+			expect(lines(yield* tool("search", { limit: 1 }))[0]).toBe(
+				"⚠ Mail last synced 3 h ago. Last error: Microsoft Graph answered 503 ServiceUnavailable. Run mx status."
+			);
+			const { exit, output } = yield* status;
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(lines(output)[0]).toMatch(runningLine);
+			microsoft.outage = 0;
+			yield* eventually(
+				"a pass after the outage",
+				TestClock.adjust("1 minute").pipe(
+					Effect.andThen(status),
+					Effect.map(({ output: report }) =>
+						report.includes("Last error: none")
+					)
+				)
+			);
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.outage = 0;
+				})
+			),
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test, its mx sync and mx status run on.
 			Effect.provide(TestClock.layer())
 		));
 
@@ -1750,6 +1880,56 @@ describe("mx", () => {
 			expect([
 				...(yield* (yield* FileSystem.FileSystem).readFile(installed)),
 			]).toEqual([...newBinary]);
+		}));
+
+	test("after mx sync stops, read tools say when mail last synced, and mx status exits non-zero", () =>
+		Effect.gen(function* () {
+			const threeHoursAgo =
+				Temporal.Now.instant().epochMilliseconds - 3 * 60 * 60 * 1000;
+			yield* Effect.gen(function* () {
+				yield* TestClock.setTime(threeHoursAgo);
+				const service = yield* Effect.forkChild(cli("sync"));
+				yield* eventually(
+					"a pass 3 hours ago",
+					Effect.map(call("search", { limit: 1 }), ({ text }) =>
+						text.startsWith("⚠ Mail last synced 3 h ago")
+					)
+				);
+				yield* Fiber.interrupt(service);
+			}).pipe(
+				// @effect-diagnostics-next-line strictEffectProvide:off - the test clock the stopped mx sync ran on.
+				Effect.provide(TestClock.layer())
+			);
+			const [warning, ...answer] = lines(yield* tool("search", { limit: 1 }));
+			expect(warning).toBe(
+				"⚠ Mail last synced 3 h ago and mx sync is not running. Run mx status."
+			);
+			expect(answer).toHaveLength(1);
+			for (const name of ["thread", "message", "attachment"]) {
+				expect(
+					lines(yield* tool(name, { id: idOf(answer[0] ?? "", "#") }))[0]
+				).toBe(warning);
+			}
+			const { exit, output } = yield* status;
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(lines(output)[0]).toBe(
+				"mx sync: not running, last heard from 3 h ago"
+			);
+		}));
+
+	test("when Microsoft refuses the saved sign-in, mx sync records Sign-in expired before it stops, mx status shows it, and read tools say so", () =>
+		Effect.gen(function* () {
+			microsoft.refuseRefresh = true;
+			const failure = yield* Effect.flip(cli("sync"));
+			expect(failure.message).toContain("Run mx login.");
+			const { exit, output } = yield* status;
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(lines(output)).toContain(
+				"Last error: Sign-in expired. Run mx login."
+			);
+			expect(lines(yield* tool("search", { limit: 1 }))[0]).toBe(
+				"⚠ Sign-in expired. Run mx login."
+			);
 		}));
 
 	test("a refused refresh token fails loudly with run mx login, and no token is ever printed", () =>

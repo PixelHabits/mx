@@ -30,3 +30,11 @@ export const InstantFromString = Schema.String.pipe(
 		encode: SchemaGetter.transform((value) => value.toString()),
 	})
 );
+
+const twoDigits = (value: number) => String(value).padStart(2, "0");
+
+/** `2026-10-14 09:12` in the machine's time zone. */
+export const localTime = (instant: Temporal.Instant) => {
+	const local = instant.toZonedDateTimeISO(Temporal.Now.timeZoneId());
+	return `${local.toPlainDate().toString()} ${twoDigits(local.hour)}:${twoDigits(local.minute)}`;
+};

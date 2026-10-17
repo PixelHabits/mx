@@ -13,11 +13,14 @@ import {
 } from "effect";
 import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientResponse } from "effect/http";
+import packageJson from "../package.json" with { type: "json" };
 import { PushUnavailable } from "./errors.ts";
 import type { Subscription } from "./graph/api.ts";
 import { Graph, type GraphError } from "./graph/graph.ts";
 import { policy } from "./http-policy.ts";
 import { Cloudflared } from "./push/cloudflared.ts";
+import { beatInterval, signInExpired } from "./status.ts";
+import { Store, type SyncMode } from "./store.ts";
 import { type Pass, Sync, summary } from "./sync.ts";
 
 /** How often every folder is polled while push notifications arrive. */
@@ -102,29 +105,20 @@ const webhook =
 const randomHex = (bytes: number) =>
 	Hex.encode(crypto.getRandomValues(new Uint8Array(bytes)));
 
-/** A pass that logs what it changed; an outage waits for the next pass. */
-const logged = (pass: Effect.Effect<Pass, GraphError>) =>
-	pass.pipe(
-		Effect.tap((done) =>
-			done.saved + done.removed > 0
-				? Effect.logInfo(summary(done))
-				: Effect.void
-		),
-		Effect.catchTag("MicrosoftUnavailable", (error) =>
-			Effect.logWarning(error.message)
-		)
-	);
-
 /**
  * `mx sync` as a service: Graph push notifications first, polling as the fallback. Push runs a cloudflared quick tunnel
  * to a local webhook and two Graph subscriptions, on Inbox and Sent Items; each notification runs a delta pass for its
  * folder. Every folder is also polled, every 5 minutes while push is up and every 60 seconds while it is down, and push
- * tries again every 10 minutes.
+ * tries again every 10 minutes. The heartbeat row in the store says how it goes: mx sync writes it every minute, and
+ * after every pass and on every change of mode.
  */
 export class Watch extends Context.Service<
 	Watch,
 	{
-		/** Runs until a pass fails with anything but an outage; ending it deletes this run's subscriptions. */
+		/**
+		 * Runs until a pass fails with anything but an outage, and records that failure in the heartbeat first; ending it
+		 * deletes this run's subscriptions.
+		 */
 		readonly run: Effect.Effect<never, GraphError>;
 	}
 >()("mx/watch") {
@@ -134,17 +128,75 @@ export class Watch extends Context.Service<
 			const graph = yield* Graph;
 			const sync = yield* Sync;
 			const cloudflared = yield* Cloudflared;
+			const store = yield* Store;
 			const http = policy(yield* HttpClient.HttpClient);
 			/** Graph sends it back on every notification; at most 128 characters. */
 			const clientState = randomHex(32);
 			/** The subscription ids of this run's current tunnel by folder, which renewals keep and shutdown deletes. */
 			const subscribed = yield* Ref.make(new Map<Watched, string>());
-			const mode = yield* Ref.make<"starting" | "up" | "down">("starting");
+			const mode = yield* Ref.make<SyncMode>("starting");
 			const lastPoll = yield* Ref.make(0);
+			/** How the passes went, carried over from the heartbeat an earlier mx sync wrote. */
+			const outcome = yield* Ref.make(
+				Option.match(yield* store.heartbeat, {
+					onNone: () => ({
+						error: Option.none<string>(),
+						lastSuccess: Option.none<Temporal.Instant>(),
+					}),
+					onSome: ({ error, lastSuccess }) => ({ error, lastSuccess }),
+				})
+			);
 
-			const changeMode = (next: "up" | "down", line: string) =>
+			const currentInstant = Effect.map(Clock.currentTimeMillis, (millis) =>
+				Temporal.Instant.fromEpochMilliseconds(millis)
+			);
+
+			const beat = Effect.gen(function* () {
+				const { error, lastSuccess } = yield* Ref.get(outcome);
+				yield* store.beat({
+					at: yield* currentInstant,
+					error,
+					lastSuccess,
+					mode: yield* Ref.get(mode),
+					version: packageJson.version,
+				});
+			});
+
+			const recordError = (message: string) =>
+				Ref.update(outcome, (current) => ({
+					...current,
+					error: Option.some(message),
+				})).pipe(Effect.andThen(beat));
+
+			/** A pass that logs what it changed and records how it went; an outage waits for the next pass. */
+			const logged = (pass: Effect.Effect<Pass, GraphError>) =>
+				pass.pipe(
+					Effect.tap((done) =>
+						done.saved + done.removed > 0
+							? Effect.logInfo(summary(done))
+							: Effect.void
+					),
+					Effect.andThen(currentInstant),
+					Effect.flatMap((at) =>
+						Ref.set(outcome, {
+							error: Option.none(),
+							lastSuccess: Option.some(at),
+						})
+					),
+					Effect.andThen(beat),
+					Effect.catchTag("MicrosoftUnavailable", (error) =>
+						Effect.andThen(
+							Effect.logWarning(error.message),
+							recordError(error.message)
+						)
+					)
+				);
+
+			const changeMode = (next: "push" | "poll", line: string) =>
 				Effect.flatMap(Ref.getAndSet(mode, next), (previous) =>
-					previous === next ? Effect.void : Effect.logInfo(line)
+					previous === next
+						? Effect.void
+						: Effect.andThen(Effect.logInfo(line), beat)
 				);
 
 			const unavailable = (message: string) =>
@@ -316,7 +368,7 @@ export class Watch extends Context.Service<
 				);
 				yield* logged(sync.pass);
 				yield* changeMode(
-					"up",
+					"push",
 					`Push is up through ${url}; polling every ${Duration.format(healthyPollInterval)}.`
 				);
 				return yield* Effect.raceAllFirst([
@@ -337,15 +389,15 @@ export class Watch extends Context.Service<
 			/** A tunnel that ends after it came up is replaced at once; a start that fails waits before the next one. */
 			const push = Effect.gen(function* () {
 				const failure = yield* Effect.flip(session);
-				if ((yield* Ref.get(mode)) === "up") {
+				if ((yield* Ref.get(mode)) === "push") {
 					yield* changeMode(
-						"down",
+						"poll",
 						`Push is down: ${failure.message} Polling every ${Duration.format(fallbackPollInterval)} while a new tunnel starts.`
 					);
 					return;
 				}
 				yield* changeMode(
-					"down",
+					"poll",
 					`Push is unavailable: ${failure.message} Polling every ${Duration.format(fallbackPollInterval)}; push tries again every ${Duration.format(pushRetryInterval)}.`
 				);
 				yield* Effect.sleep(pushRetryInterval);
@@ -355,7 +407,7 @@ export class Watch extends Context.Service<
 			const poll = Effect.gen(function* () {
 				const now = yield* Clock.currentTimeMillis;
 				const due =
-					(yield* Ref.get(mode)) !== "up" ||
+					(yield* Ref.get(mode)) !== "push" ||
 					now - (yield* Ref.get(lastPoll)) >=
 						Duration.toMillis(healthyPollInterval);
 				if (!due) {
@@ -365,8 +417,16 @@ export class Watch extends Context.Service<
 				yield* logged(sync.pass);
 			}).pipe(Effect.repeat(Schedule.spaced(fallbackPollInterval)));
 
-			const run = Effect.raceFirst(push, poll).pipe(
+			/** The heartbeat from start to stop, so mx sync looks alive however long a pass takes. */
+			const heartbeat = beat.pipe(Effect.repeat(Schedule.spaced(beatInterval)));
+
+			const run = Effect.raceAllFirst([heartbeat, push, poll]).pipe(
 				Effect.andThen(Effect.never),
+				Effect.tapError((error) =>
+					recordError(
+						error._tag === "LoginRequired" ? signInExpired : error.message
+					)
+				),
 				Effect.withSpan("Watch.run")
 			);
 
@@ -375,6 +435,8 @@ export class Watch extends Context.Service<
 	);
 
 	static readonly layer = Watch.layerNoDeps.pipe(
-		Layer.provide(Layer.mergeAll(Sync.layer, Graph.layer, Cloudflared.layer))
+		Layer.provide(
+			Layer.mergeAll(Sync.layer, Graph.layer, Cloudflared.layer, Store.layer)
+		)
 	);
 }

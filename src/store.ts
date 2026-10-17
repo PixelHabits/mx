@@ -67,6 +67,15 @@ CREATE TRIGGER IF NOT EXISTS messages_updated AFTER UPDATE ON messages BEGIN
 	DELETE FROM search WHERE rowid = old.id;
 	INSERT INTO search (rowid, subject, sender, body) VALUES (new.id, new.subject, new.from_name || ' ' || new.from_address, new.body);
 END;
+-- What the running mx sync last wrote about itself, in one row that mx status and the read tools read.
+CREATE TABLE IF NOT EXISTS heartbeat (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	written_at INTEGER NOT NULL,
+	last_success_at INTEGER,
+	mode TEXT NOT NULL,
+	version TEXT NOT NULL,
+	last_error TEXT
+);
 `;
 
 const Address = Schema.Struct({ address: Schema.String, name: Schema.String });
@@ -97,6 +106,31 @@ const Row = Schema.Struct({
 	subject: Schema.String,
 	to_list: Schema.fromJsonString(Schema.Array(Address)),
 });
+
+/** How mx sync follows the mailbox: starting up, through push notifications, or by polling while push is down. */
+export const SyncMode = Schema.Literals(["starting", "push", "poll"]);
+export type SyncMode = typeof SyncMode.Type;
+
+const HeartbeatRow = Schema.Struct({
+	last_error: Schema.NullOr(Schema.String),
+	last_success_at: Schema.NullOr(Schema.Int),
+	mode: SyncMode,
+	version: Schema.String,
+	written_at: Schema.Int,
+});
+
+/** What mx sync last wrote about itself, after a pass or when its mode changed. */
+export interface Heartbeat {
+	/** When mx sync wrote it. */
+	readonly at: Temporal.Instant;
+	/** The last error as a one-line message for the user; none once a pass succeeds. */
+	readonly error: Option.Option<string>;
+	/** When a pass last succeeded. */
+	readonly lastSuccess: Option.Option<Temporal.Instant>;
+	readonly mode: SyncMode;
+	/** The version of the mx that runs mx sync. */
+	readonly version: string;
+}
 
 const FolderRow = Schema.Struct({
 	delta_link: Schema.NullOr(Schema.String),
@@ -249,6 +283,10 @@ export class Store extends Context.Service<
 		readonly ownAddresses: Effect.Effect<ReadonlySet<string>>;
 		/** Rebuilds the full-text index from the stored rows and returns how many it holds. */
 		readonly reindex: Effect.Effect<number>;
+		/** The heartbeat mx sync last wrote, or none when it never ran. */
+		readonly heartbeat: Effect.Effect<Option.Option<Heartbeat>>;
+		/** Replaces the heartbeat. */
+		readonly beat: (heartbeat: Heartbeat) => Effect.Effect<void>;
 	}
 >()("mx/store") {
 	static readonly layer = Layer.effect(
@@ -538,11 +576,46 @@ export class Store extends Context.Service<
 				Effect.map(Arr.reduce(0, (total, row) => total + row.count))
 			);
 
+			const heartbeat = all(
+				HeartbeatRow,
+				"SELECT written_at, last_success_at, mode, version, last_error FROM heartbeat"
+			).pipe(
+				Effect.map((rows) =>
+					Option.map(
+						Arr.head(rows),
+						(row): Heartbeat => ({
+							at: Temporal.Instant.fromEpochMilliseconds(row.written_at),
+							error: Option.fromNullishOr(row.last_error),
+							lastSuccess: instant(row.last_success_at),
+							mode: row.mode,
+							version: row.version,
+						})
+					)
+				)
+			);
+
+			const beat = (written: Heartbeat) =>
+				run(
+					`INSERT INTO heartbeat (id, written_at, last_success_at, mode, version, last_error) VALUES (1, $at, $lastSuccess, $mode, $version, $error)
+					ON CONFLICT (id) DO UPDATE SET written_at = excluded.written_at, last_success_at = excluded.last_success_at, mode = excluded.mode, version = excluded.version, last_error = excluded.last_error`,
+					{
+						at: written.at.epochMilliseconds,
+						error: Option.getOrNull(written.error),
+						lastSuccess: Option.getOrNull(
+							Option.map(written.lastSuccess, (at) => at.epochMilliseconds)
+						),
+						mode: written.mode,
+						version: written.version,
+					}
+				);
+
 			return Store.of({
+				beat,
 				byId,
 				conversation,
 				folders,
 				hasFolder,
+				heartbeat,
 				keepOnly,
 				ownAddresses,
 				reindex,

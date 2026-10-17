@@ -12,6 +12,7 @@ import {
 	LoginRequired,
 	MicrosoftUnavailable,
 	SignInFailed,
+	SyncUnhealthy,
 	UpdateFailed,
 } from "./errors.ts";
 import { Paths } from "./paths.ts";
@@ -32,6 +33,7 @@ const isExplained = Schema.is(
 		LoginRequired,
 		MicrosoftUnavailable,
 		SignInFailed,
+		SyncUnhealthy,
 		UpdateFailed,
 	])
 );

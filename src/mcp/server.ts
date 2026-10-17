@@ -1,5 +1,6 @@
 import {
 	Array as Arr,
+	Clock,
 	Context,
 	Effect,
 	FileSystem,
@@ -22,6 +23,7 @@ import {
 import { FlagStatus, type Message, type Recipient } from "../graph/api.ts";
 import { type Compose, Graph } from "../graph/graph.ts";
 import { Paths } from "../paths.ts";
+import { syncWarning } from "../status.ts";
 import { Store, type Stored, type StoredFolder } from "../store.ts";
 import { PlainDateFromString } from "../temporal.ts";
 import {
@@ -302,8 +304,9 @@ const textResult = (text: string, isError: boolean) =>
 	});
 
 /**
- * Registers `tool` with a handler that answers plain text. `McpServer.toolkit` would answer every result as JSON and
- * repeat it as structured content, which Claude Code shows the model in place of the text.
+ * Registers `tool` with a handler that answers plain text, with the line `note` gives, if any, before it.
+ * `McpServer.toolkit` would answer every result as JSON and repeat it as structured content, which Claude Code shows the
+ * model in place of the text.
  */
 const register = Effect.fnUntraced(function* <
 	P extends Schema.Top & { readonly DecodingServices: never },
@@ -317,7 +320,8 @@ const register = Effect.fnUntraced(function* <
 			readonly success: Schema.Top;
 		}
 	>,
-	run: (params: P["Type"]) => Effect.Effect<string, ToolError>
+	run: (params: P["Type"]) => Effect.Effect<string, ToolError>,
+	note: Effect.Effect<Option.Option<string>> = Effect.succeedNone
 ) {
 	const server = yield* McpServer.McpServer;
 	const decode = Schema.decodeUnknownEffect(tool.parametersSchema);
@@ -331,9 +335,20 @@ const register = Effect.fnUntraced(function* <
 				Effect.flatMap((params) =>
 					run(params).pipe(
 						Effect.match({
-							onFailure: (error) => textResult(error.message, true),
-							onSuccess: (text) => textResult(text, false),
+							onFailure: (error) => ({ isError: true, text: error.message }),
+							onSuccess: (text) => ({ isError: false, text }),
 						})
+					)
+				),
+				Effect.flatMap(({ isError, text }) =>
+					Effect.map(note, (warning) =>
+						textResult(
+							Option.match(warning, {
+								onNone: () => text,
+								onSome: (first) => `${first}\n${text}`,
+							}),
+							isError
+						)
 					)
 				)
 			),
@@ -367,6 +382,17 @@ export const tools = Layer.effectDiscard(
 		const fs = yield* FileSystem.FileSystem;
 		const path = yield* Path.Path;
 		const { cache } = yield* Paths;
+
+		/** For the read tools, which answer from the store: a line when mx sync never ran, stopped or lost its sign-in. */
+		const storeNote = Effect.gen(function* () {
+			const now = Temporal.Instant.fromEpochMilliseconds(
+				yield* Clock.currentTimeMillis
+			);
+			return syncWarning(yield* store.heartbeat, now);
+		});
+
+		const registerRead: typeof register = (tool, run) =>
+			register(tool, run, storeNote);
 
 		const stored = Effect.fnUntraced(function* (id: number) {
 			const found = yield* store.byId(id);
@@ -578,7 +604,7 @@ export const tools = Layer.effectDiscard(
 			return answer;
 		});
 
-		yield* register(search, (params) =>
+		yield* registerRead(search, (params) =>
 			Effect.gen(function* () {
 				const folder = yield* Effect.transposeOption(
 					Option.map(Option.fromUndefinedOr(params.folder), (name) =>
@@ -601,7 +627,7 @@ export const tools = Layer.effectDiscard(
 			})
 		);
 
-		yield* register(thread, ({ id }) =>
+		yield* registerRead(thread, ({ id }) =>
 			Effect.gen(function* () {
 				const found = yield* stored(id);
 				const conversation = yield* store.conversation(found.conversationId);
@@ -609,7 +635,7 @@ export const tools = Layer.effectDiscard(
 			})
 		);
 
-		yield* register(message, ({ full, id }) =>
+		yield* registerRead(message, ({ full, id }) =>
 			Effect.gen(function* () {
 				const found = yield* stored(id);
 				const body =
@@ -618,7 +644,7 @@ export const tools = Layer.effectDiscard(
 			})
 		);
 
-		yield* register(attachment, ({ id, n }) =>
+		yield* registerRead(attachment, ({ id, n }) =>
 			Effect.gen(function* () {
 				const found = yield* stored(id);
 				const list = yield* numbered(found);

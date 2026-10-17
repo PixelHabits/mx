@@ -107,8 +107,15 @@ export class FakeMicrosoft {
 	pendingPolls = 1;
 	/** When set, every refresh answers `invalid_grant`. */
 	refuseRefresh = false;
-	/** Graph requests still to answer 429 with `Retry-After: 1`. */
+	/** Graph requests still to answer 429. */
 	throttle = 0;
+	/** How many times each Graph request, by method and URL, answers 429 before Graph answers it. */
+	throttleEach = 0;
+	private readonly throttled = new Map<string, number>();
+	/** The seconds each 429 asks the client to wait in `Retry-After`. */
+	retryAfter = 1;
+	/** The status Graph answers every request with during an outage, such as 503; 0 while Graph is up. */
+	outage = 0;
 	readonly refreshTokens: string[] = [];
 	private issued = 0;
 	private accessToken = "";
@@ -378,8 +385,14 @@ export class FakeMicrosoft {
 				"Access token is empty or invalid."
 			);
 		}
-		if (this.throttle > 0) {
-			this.throttle -= 1;
+		const key = `${request.method} ${url.href}`;
+		const throttled = this.throttled.get(key) ?? 0;
+		if (this.throttle > 0 || throttled < this.throttleEach) {
+			if (this.throttle > 0) {
+				this.throttle -= 1;
+			} else {
+				this.throttled.set(key, throttled + 1);
+			}
 			return json(
 				{
 					error: {
@@ -388,8 +401,11 @@ export class FakeMicrosoft {
 					},
 				},
 				429,
-				{ "retry-after": "1" }
+				{ "retry-after": String(this.retryAfter) }
 			);
+		}
+		if (this.outage > 0) {
+			return graphError(this.outage, "ServiceUnavailable", "Synthetic outage.");
 		}
 		const asText =
 			request.headers

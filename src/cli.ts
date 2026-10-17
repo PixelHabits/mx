@@ -1,5 +1,7 @@
 import {
 	Array as Arr,
+	Clock,
+	Config,
 	Console,
 	Duration,
 	Effect,
@@ -13,11 +15,19 @@ import { CliError, Command, Flag, Prompt } from "effect/cli";
 import packageJson from "../package.json" with { type: "json" };
 import { agentFlag } from "./agents.ts";
 import { Auth, signIn } from "./auth/auth.ts";
-import { clientIdFlag, tenantFlag } from "./auth/config.ts";
-import type { InstallFailed } from "./errors.ts";
+import {
+	clientIdConfig,
+	clientIdFlag,
+	organizations,
+	tenantConfig,
+	tenantFlag,
+} from "./auth/config.ts";
+import { Credentials } from "./auth/credentials.ts";
+import { type InstallFailed, SyncUnhealthy } from "./errors.ts";
 import { Installer, type Removal } from "./install.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
+import { statusReport } from "./status.ts";
 import { Store } from "./store.ts";
 import { Sync, summary } from "./sync.ts";
 import { Updater } from "./update.ts";
@@ -204,6 +214,56 @@ const mcp = Command.make("mcp", {}, () =>
 	)
 );
 
+const status = Command.make("status", {}, () =>
+	Effect.gen(function* () {
+		const heartbeat = yield* (yield* Store).heartbeat;
+		const saved = yield* (yield* Credentials).read.pipe(
+			Effect.as({ line: "saved", problem: Option.none<string>() }),
+			Effect.catchTags({
+				CredentialFailed: (error) =>
+					Effect.succeed({
+						line: `unknown. ${error.message}`,
+						problem: Option.some(error.message),
+					}),
+				LoginRequired: () =>
+					Effect.succeed({
+						line: "none saved. Run mx login.",
+						problem: Option.none<string>(),
+					}),
+			})
+		);
+		const now = Temporal.Instant.fromEpochMilliseconds(
+			yield* Clock.currentTimeMillis
+		);
+		const report = statusReport({
+			clientId: Option.isSome(
+				yield* Config.option(clientIdConfig).pipe(Effect.orDie)
+			),
+			heartbeat,
+			now,
+			signIn: saved,
+			tenant: yield* tenantConfig.pipe(
+				Config.withDefault(organizations),
+				Effect.orDie
+			),
+			version: packageJson.version,
+		});
+		yield* Console.log(report.text);
+		if (Option.isSome(report.problem)) {
+			return yield* SyncUnhealthy.make({ message: report.problem.value });
+		}
+	})
+).pipe(
+	Command.provide(
+		Layer.mergeAll(Store.layer, Credentials.layer).pipe(
+			Layer.provide(Paths.layer)
+		)
+	),
+	Command.withDescription(
+		"Say whether mx sync is running, when it last synced, its mode and version, whether a sign-in is saved and a client id is set, the tenant, and its last error. Exits non-zero when sync is not running, mail is out of date, or sync reports an error."
+	)
+);
+
 const reindex = Command.make("reindex", {}, () =>
 	Effect.gen(function* () {
 		const count = yield* (yield* Store).reindex;
@@ -223,6 +283,7 @@ export const mx = Command.make("mx").pipe(
 	Command.withSubcommands([
 		login,
 		sync,
+		status,
 		mcp,
 		reindex,
 		install,

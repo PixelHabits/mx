@@ -102,3 +102,11 @@ export class UpdateFailed extends Schema.TaggedError<
 >("mx/errors/UpdateFailed")("UpdateFailed", {
 	message: Schema.String,
 }) {}
+
+/** `mx status` found mx sync stopped or reporting an error; `message` says which. */
+export class SyncUnhealthy extends Schema.TaggedError<
+	SyncUnhealthy,
+	{ readonly brand: unique symbol }
+>("mx/errors/SyncUnhealthy")("SyncUnhealthy", {
+	message: Schema.String,
+}) {}

@@ -89,6 +89,27 @@ The log says in one line each time push comes up or goes down. On start, mx dele
 
 mx runs the `cloudflared` that `MX_CLOUDFLARED` names, or else the one on your `PATH`. Without either, it downloads cloudflared 2026.10.1 from Cloudflare's GitHub releases into its data folder and checks the file's sha256 first.
 
+## Is it running?
+
+```sh
+mx status
+```
+
+It prints whether `mx sync` is running, when mail last synced, the mode, the version of `mx sync` and of the binary you ran, whether a sign-in is saved, whether a client id is set, the tenant, and the last error. The mode is `push` while Graph push notifications arrive, `poll` while push is down, and `starting` before either. `mx sync` writes this to the mail store every minute while it runs, however long a pass takes, and also after every pass and whenever its mode changes. `mx status` counts sync as running when it wrote within the last 3 minutes, and counts mail as out of date when no pass succeeded in the last 15 minutes. It exits with a non-zero code when sync is not running, mail is out of date, or sync reports an error. `mx sync --once` writes none of it.
+
+The read tools, `search`, `thread`, `message` and `attachment`, put one line before their answer when the mail may be out of date: the sign-in expired, `mx sync` never ran or is not running, or mail last synced more than 15 minutes ago, even while `mx sync` runs. The line says how old the mail is and names the last error, if there is one. A sign-in that expired comes first. For example:
+
+- `⚠ Sign-in expired. Run mx login.`
+- `⚠ mx sync has never run. Run mx status.`
+- `⚠ Mail last synced 3 h ago and mx sync is not running. Run mx status.`
+- `⚠ Mail last synced 3 h ago. Last error: Microsoft Graph answered 503 ServiceUnavailable. Run mx status.`
+
+The background `mx sync` logs to:
+
+| Linux | Windows |
+| --- | --- |
+| the systemd journal: `journalctl --user -u mx-sync -f` | `%LOCALAPPDATA%\mx\state\sync.log` |
+
 ## When a command says "Run mx login."
 
 Microsoft refused the saved sign-in, or there is none. Run `mx login` again. On Linux the service retries every 5 minutes, so it picks up the new sign-in by itself. On Windows, run `mx install` again to start sync.
@@ -98,7 +119,7 @@ Microsoft refused the saved sign-in, or there is none. Run `mx login` again. On 
 | Linux | Windows | Holds |
 | --- | --- | --- |
 | `$XDG_CONFIG_HOME/mx/config.json` | `%LOCALAPPDATA%\mx\config.json` | The client id and the tenant `mx login` saved. |
-| `$XDG_DATA_HOME/mx/mx.sqlite` | `%LOCALAPPDATA%\mx\data\mx.sqlite` | The messages, the folders and their delta links, and the full-text index. |
+| `$XDG_DATA_HOME/mx/mx.sqlite` | `%LOCALAPPDATA%\mx\data\mx.sqlite` | The messages, the folders and their delta links, the full-text index, and the heartbeat `mx sync` writes for `mx status`. |
 | `$XDG_DATA_HOME/mx/cloudflared/` | `%LOCALAPPDATA%\mx\data\cloudflared\` | The cloudflared release mx downloaded, when neither `MX_CLOUDFLARED` nor `PATH` has one. |
 | `$XDG_STATE_HOME/mx/refresh-token` | | The refresh token, only on a machine without a secret store. The file has mode 0600. |
 | | `%LOCALAPPDATA%\mx\state\sync.log` | The log of the background `mx sync`. |

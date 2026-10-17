@@ -1,24 +1,17 @@
 import { Array as Arr, Option } from "effect";
 import type { Attachment } from "../graph/api.ts";
 import type { Address, Stored } from "../store.ts";
+import { localTime } from "../temporal.ts";
 
 /** Exchange writes an inline image into a text body as `[cid:<content id>]`. */
 const cidReference = /\[cid:([^\]\s]+)\]/gu;
-
-const twoDigits = (value: number) => String(value).padStart(2, "0");
-
-/** `2026-10-14 09:12` in the machine's time zone. */
-const when = (instant: Temporal.Instant) => {
-	const local = instant.toZonedDateTimeISO(Temporal.Now.timeZoneId());
-	return `${local.toPlainDate().toString()} ${twoDigits(local.hour)}:${twoDigits(local.minute)}`;
-};
 
 const date = (message: Stored) =>
 	Option.match(
 		Option.orElse(message.received, () => message.sent),
 		{
 			onNone: () => "(no date)",
-			onSome: when,
+			onSome: localTime,
 		}
 	);
 
