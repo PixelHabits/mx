@@ -15,6 +15,19 @@ import { Paths } from "./paths.ts";
 /** Waits this long for a write lock that the other mx process holds. */
 const busyTimeoutMillis = 5000;
 
+/**
+ * The full-text index over subject, sender and new text. The porter stemmer indexes each word by its stem, so approve,
+ * approved and approval match one another.
+ */
+const searchTable =
+	"fts5 (subject, sender, body, tokenize = 'porter unicode61 remove_diacritics 2')";
+
+/** How much a match in each column of the index counts toward relevance. */
+const columnWeights = { body: 1, sender: 2, subject: 10 };
+
+/** FTS5's bm25 relevance of a row, lower for a better match; it takes the weights in column order. */
+const relevance = `bm25(search, ${columnWeights.subject}, ${columnWeights.sender}, ${columnWeights.body})`;
+
 const schema = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -56,7 +69,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_conversation ON messages (conversation_id);
 CREATE INDEX IF NOT EXISTS messages_folder ON messages (folder_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5 (subject, sender, body, tokenize = 'unicode61 remove_diacritics 2');
+CREATE VIRTUAL TABLE IF NOT EXISTS search USING ${searchTable};
 CREATE TRIGGER IF NOT EXISTS messages_inserted AFTER INSERT ON messages BEGIN
 	INSERT INTO search (rowid, subject, sender, body) VALUES (new.id, new.subject, new.from_name || ' ' || new.from_address, new.body);
 END;
@@ -106,6 +119,9 @@ const Row = Schema.Struct({
 	subject: Schema.String,
 	to_list: Schema.fromJsonString(Schema.Array(Address)),
 });
+
+/** A message row with how many other messages its conversation holds. */
+const FoundRow = Schema.Struct({ ...Row.fields, others: Schema.Int });
 
 /** How mx sync follows the mailbox: starting up, through push notifications, or by polling while push is down. */
 export const SyncMode = Schema.Literals(["starting", "push", "poll"]);
@@ -164,6 +180,13 @@ export interface Stored {
 	readonly to: readonly Address[];
 }
 
+/** One conversation a search found, by its best match. */
+export interface Found {
+	readonly message: Stored;
+	/** The conversation's other messages, in every folder, whether they match or not. */
+	readonly others: number;
+}
+
 export interface StoredFolder {
 	readonly deltaLink: Option.Option<string>;
 	readonly id: string;
@@ -217,9 +240,8 @@ const address = ({ emailAddress }: Recipient): Address => ({
 const select =
 	"SELECT m.*, f.path AS folder_path, f.sent AS folder_sent FROM messages m JOIN folders f ON f.id = m.folder_id";
 
-/** The newest first; a draft has no received time until Graph saves it, so its sent or saved time stands in. */
-const newestFirst =
-	"ORDER BY COALESCE(m.received_at, m.sent_at) DESC, m.id DESC";
+/** When the message arrived; a draft has no received time until Graph saves it, so its sent or saved time stands in. */
+const arrived = "COALESCE(m.received_at, m.sent_at)";
 
 const whitespace = /\s+/u;
 
@@ -268,20 +290,24 @@ export class Store extends Context.Service<
 		) => Effect.Effect<void>;
 		readonly transaction: <A>(run: Effect.Effect<A>) => Effect.Effect<A>;
 		readonly byId: (id: number) => Effect.Effect<Option.Option<Stored>>;
+		/**
+		 * Up to `limit` conversations with a message that passes the filter, one per conversation: with `text`, the best
+		 * match of each, best first; without it, the newest of each, newest first.
+		 */
 		readonly search: (filter: {
 			readonly folderId: Option.Option<string>;
 			readonly from: Option.Option<string>;
 			readonly limit: number;
 			readonly since: Option.Option<Temporal.Instant>;
 			readonly text: Option.Option<string>;
-		}) => Effect.Effect<readonly Stored[]>;
+		}) => Effect.Effect<readonly Found[]>;
 		/** The conversation's messages in every folder, oldest first. */
 		readonly conversation: (
 			conversationId: string
 		) => Effect.Effect<readonly Stored[]>;
 		/** Every address a message in Sent Items came from, lower-cased. */
 		readonly ownAddresses: Effect.Effect<ReadonlySet<string>>;
-		/** Rebuilds the full-text index from the stored rows and returns how many it holds. */
+		/** Creates the full-text index anew, with the current tokenizer, from the stored rows and returns how many it holds. */
 		readonly reindex: Effect.Effect<number>;
 		/** The heartbeat mx sync last wrote, or none when it never ran. */
 		readonly heartbeat: Effect.Effect<Option.Option<Heartbeat>>;
@@ -521,12 +547,28 @@ export class Store extends Context.Service<
 				Effect.map(messages("WHERE m.id = $id", { id }), Arr.head);
 
 			const search: Store["Service"]["search"] = (filter) =>
-				messages(
-					`WHERE ($text IS NULL OR m.id IN (SELECT rowid FROM search WHERE search MATCH $text))
-					AND ($folderId IS NULL OR m.folder_id = $folderId)
-					AND ($from IS NULL OR m.from_address LIKE $from ESCAPE '!' OR m.from_name LIKE $from ESCAPE '!')
-					AND ($since IS NULL OR COALESCE(m.received_at, m.sent_at) >= $since)
-					${newestFirst} LIMIT $limit`,
+				all(
+					FoundRow,
+					`WITH candidates AS (${Option.match(filter.text, {
+						onNone: () => "SELECT id, 0 AS rank FROM messages",
+						onSome: () =>
+							`SELECT rowid AS id, ${relevance} AS rank FROM search WHERE search MATCH $text`,
+					})}),
+					matched AS (
+						SELECT m.id, m.conversation_id, c.rank, ${arrived} AS at FROM candidates c JOIN messages m ON m.id = c.id
+						WHERE ($folderId IS NULL OR m.folder_id = $folderId)
+						AND ($from IS NULL OR m.from_address LIKE $from ESCAPE '!' OR m.from_name LIKE $from ESCAPE '!')
+						AND ($since IS NULL OR ${arrived} >= $since)
+					),
+					best AS (
+						SELECT id, rank, at, row_number() OVER (PARTITION BY conversation_id ORDER BY rank, at DESC, id DESC) AS place
+						FROM matched
+					)
+					SELECT m.*, f.path AS folder_path, f.sent AS folder_sent,
+						(SELECT count(*) FROM messages t WHERE t.conversation_id = m.conversation_id) - 1 AS others
+					FROM best b JOIN messages m ON m.id = b.id JOIN folders f ON f.id = m.folder_id
+					WHERE b.place = 1
+					ORDER BY b.rank, b.at DESC, b.id DESC LIMIT $limit`,
 					{
 						folderId: Option.getOrNull(filter.folderId),
 						from: Option.getOrNull(
@@ -541,6 +583,12 @@ export class Store extends Context.Service<
 						),
 						text: Option.getOrNull(Option.map(filter.text, ftsQuery)),
 					}
+				).pipe(
+					Effect.map(
+						Arr.map(
+							(row): Found => ({ message: stored(row), others: row.others })
+						)
+					)
 				);
 
 			const conversation = (conversationId: string) =>
@@ -561,7 +609,8 @@ export class Store extends Context.Service<
 
 			const reindex = transaction(
 				Effect.sync(() => {
-					db.run("DELETE FROM search");
+					db.run("DROP TABLE search");
+					db.run(`CREATE VIRTUAL TABLE search USING ${searchTable}`);
 					db.run(
 						"INSERT INTO search (rowid, subject, sender, body) SELECT id, subject, from_name || ' ' || from_address, body FROM messages"
 					);

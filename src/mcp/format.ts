@@ -1,6 +1,6 @@
 import { Array as Arr, Option } from "effect";
 import type { Attachment } from "../graph/api.ts";
-import type { Address, Stored } from "../store.ts";
+import type { Address, Found, Stored } from "../store.ts";
 import { localTime } from "../temporal.ts";
 
 /** Exchange writes an inline image into a text body as `[cid:<content id>]`. */
@@ -66,10 +66,18 @@ export const line = (message: Stored) => {
 	return `#${message.id} ${date(message)} ${message.folder} | ${party} | ${message.subject || "(no subject)"}${flags === "" ? "" : ` | ${flags}`}`;
 };
 
-export const listing = (messages: readonly Stored[]) =>
-	messages.length === 0
+/** One line per conversation found, ending in `(+N in thread)` when the conversation holds N more messages. */
+export const listing = (found: readonly Found[]) =>
+	found.length === 0
 		? "No messages."
-		: Arr.join(Arr.map(messages, line), "\n");
+		: Arr.join(
+				Arr.map(
+					found,
+					({ message, others }) =>
+						`${line(message)}${others === 0 ? "" : ` (+${others} in thread)`}`
+				),
+				"\n"
+			);
 
 /** Headers, then `body`: the new text from the store, or the whole body Graph returned. */
 export const messageText = (stored: Stored, body: string) => {

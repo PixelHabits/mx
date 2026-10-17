@@ -44,7 +44,7 @@ type ToolError =
 	| LoginRequired
 	| CredentialFailed;
 
-/** The listing size when the agent names none, and the most one search returns. */
+/** The conversations a search lists when the agent names no limit, and the most it lists. */
 const defaultLimit = 20;
 const maxLimit = 200;
 
@@ -142,7 +142,7 @@ const decodeSend = Schema.decodeUnknownEffect(
 
 const search = Tool.make("search", {
 	description:
-		"Search the local copy of the mailbox. query matches words in the subject, the sender and the message's new text; every filter is optional, and without a query the newest messages are listed. Answers one line per message, newest first: #id date folder | sender | subject | markers.",
+		"Search the local copy of the mailbox. query matches words and their other forms in the subject, the sender and the message's new text; every filter is optional. Answers one line per conversation, best match first, or newest first without a query: #id date folder | sender | subject | markers, and (+N in thread) when the conversation holds N more messages, which thread shows.",
 	parameters: Schema.Struct({
 		folder: Schema.optionalKey(
 			Schema.String.annotate({
@@ -158,7 +158,7 @@ const search = Tool.make("search", {
 			Schema.Int.check(
 				Schema.isBetween({ maximum: maxLimit, minimum: 1 })
 			).annotate({
-				description: `How many messages to list, ${defaultLimit} unless given.`,
+				description: `How many conversations to list, ${defaultLimit} unless given.`,
 			})
 		),
 		query: Schema.optionalKey(Schema.String),

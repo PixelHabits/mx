@@ -287,6 +287,16 @@ export class FakeMicrosoft {
 		return this.subscriptions.notify("inbox", added.id);
 	}
 
+	/** A message to the user arrives in a folder without a notification, so the next pass brings it in. */
+	deliver(
+		message: Pick<
+			FakeMessage,
+			"body" | "conversationId" | "parentFolderId" | "received" | "subject"
+		> & { readonly from: Address }
+	) {
+		return this.add({ ...message, id: this.newId("message"), to: [devin] });
+	}
+
 	/** The messages in a folder as Graph holds them now. */
 	inFolder(folderId: string): readonly FakeMessage[] {
 		return Arr.filter(

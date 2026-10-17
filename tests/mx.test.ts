@@ -699,8 +699,28 @@ const runningLine = /^mx sync: running, last heard from \d+ s ago$/u;
 const lastSyncLine = /^Last sync: \d{4}-\d{2}-\d{2} \d{2}:\d{2}, \d+ s ago$/u;
 const loopbackUrl = /^http:\/\/127\.0\.0\.1:\d+$/u;
 const loopbackAddress = /^127\.0\.0\.1:\d+$/u;
+const aliceLatestLine =
+	/^#\d+ .* \| Alice Example <alice@example\.test> \| RE: Quarterly budget \| unread \(\+2 in thread\)$/u;
+const bookClubLine =
+	/ \| Priya Example <priya@example\.com> \| Book club: the next novel \| unread \(\+1 in thread\)$/u;
+const bookClubReplyLine =
+	/ \| Jonas Example <jonas@example\.com> \| RE: Book club: the next novel \| unread \(\+1 in thread\)$/u;
+const recipeSwapLine = /Recipe swap \| unread \(\+3 in thread\)$/u;
 const lineIn = (id: number, folder: string) =>
 	new RegExp(`^#${id} .* ${folder} \\|`, "u");
+
+/** The people and the notifier of the synthetic mail the search tests add. */
+const jonas = { address: "jonas@example.com", name: "Jonas Example" };
+const marta = { address: "marta@example.com", name: "Marta Example" };
+const priya = { address: "priya@example.com", name: "Priya Example" };
+const alerts = { address: "alerts@example.com", name: "Backup Notifier" };
+
+/** A nightly backup that failed, by the day of October it failed and the share it backed up. */
+const nightlyBackups = [
+	["08", "photos"],
+	["09", "documents"],
+	["10", "music"],
+] as const;
 
 const tools = [
 	"attachment",
@@ -1159,7 +1179,8 @@ describe("mx", () => {
 			}
 			const answer = yield* call("search", { limit: 50 });
 			expect(answer.structured).toBeUndefined();
-			expect(lines(answer.text)).toHaveLength(6);
+			expect(lines(answer.text)).toHaveLength(4);
+			expect(answer.text).toContain("(+2 in thread)");
 			expect(answer.text).toContain("Inbox/Projects | Bob Example");
 		}));
 
@@ -1181,22 +1202,120 @@ describe("mx", () => {
 
 	test("search finds by words in the subject, the sender and the new text, with folder, from and since filters", () =>
 		Effect.gen(function* () {
-			expect(lines(yield* tool("search", { query: "travel" }))).toHaveLength(2);
+			expect(lines(yield* tool("search", { query: "travel" }))).toHaveLength(1);
 			expect(yield* tool("search", { query: "carol" })).toContain(
 				"Lunch plans"
 			);
 			const inbox = yield* tool("search", { folder: "Inbox", query: "budget" });
-			expect(lines(inbox)).toHaveLength(2);
+			expect(lines(inbox)).toHaveLength(1);
 			expect(inbox).not.toContain("Sent Items");
-			expect(
-				lines(yield* tool("search", { from: "alice@example.test" }))
-			).toHaveLength(2);
+			expect(yield* tool("search", { from: "alice@example.test" })).toMatch(
+				aliceLatestLine
+			);
 			const since = yield* tool("search", { since: "2026-10-03" });
 			expect(since).toContain("Lunch plans");
 			expect(since).not.toContain("Kickoff notes");
 			expect(yield* tool("search", { query: "nothing-matches-this" })).toBe(
 				"No messages."
 			);
+		}));
+
+	test("search ranks a thread whose subject matches above newer automated messages that only mention the word in their body, and limit counts conversations", () =>
+		Effect.gen(function* () {
+			microsoft.deliver({
+				body: "Let us pick the next novel by Friday.",
+				conversationId: "conversation-book-club",
+				from: priya,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-07T10:00:00Z",
+				subject: "Book club: the next novel",
+			});
+			microsoft.deliver({
+				body: "I vote for the mystery.",
+				conversationId: "conversation-book-club",
+				from: jonas,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-07T12:00:00Z",
+				subject: "RE: Book club: the next novel",
+			});
+			for (const [day, share] of nightlyBackups) {
+				microsoft.deliver({
+					body: `The nightly backup of ${share} failed. Skipped: novel-draft.txt.`,
+					conversationId: `conversation-backup-${day}`,
+					from: alerts,
+					parentFolderId: "folder-inbox",
+					received: `2026-10-${day}T01:00:00Z`,
+					subject: `Nightly backup failed: ${share}`,
+				});
+			}
+			yield* cli("sync", "--once");
+			const found = lines(yield* tool("search", { query: "novel" }));
+			expect(found).toEqual([
+				expect.stringMatching(bookClubLine),
+				expect.stringContaining("| Nightly backup failed: music |"),
+				expect.stringContaining("| Nightly backup failed: documents |"),
+				expect.stringContaining("| Nightly backup failed: photos |"),
+			]);
+			expect(
+				lines(yield* tool("search", { limit: 2, query: "novel" }))
+			).toEqual(found.slice(0, 2));
+		}));
+
+	test("search matches other forms of a word: approve finds approved and approval", () =>
+		Effect.gen(function* () {
+			microsoft.deliver({
+				body: "The seed order was approved this morning.",
+				conversationId: "conversation-garden",
+				from: marta,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-03T09:30:00Z",
+				subject: "Garden supplies order",
+			});
+			microsoft.deliver({
+				body: "The itinerary waits for your approval.",
+				conversationId: "conversation-trip",
+				from: jonas,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-03T10:30:00Z",
+				subject: "Trip itinerary",
+			});
+			yield* cli("sync", "--once");
+			const found = lines(yield* tool("search", { query: "approve" }));
+			expect(found).toHaveLength(2);
+			expect(Arr.join(found, "\n")).toContain("| Garden supplies order |");
+			expect(Arr.join(found, "\n")).toContain("| Trip itinerary |");
+		}));
+
+	test("search lists a conversation with several matching messages once, with how many more messages its thread holds", () =>
+		Effect.gen(function* () {
+			for (const [hour, from, body] of [
+				["08", jonas, "Bring your best lasagna recipe."],
+				["09", priya, "My lasagna uses spinach."],
+				["10", marta, "Lasagna with mushrooms here."],
+				["11", jonas, "See you on Saturday."],
+			] as const) {
+				microsoft.deliver({
+					body,
+					conversationId: "conversation-recipes",
+					from,
+					parentFolderId: "folder-inbox",
+					received: `2026-10-02T${hour}:00:00Z`,
+					subject: hour === "08" ? "Recipe swap" : "RE: Recipe swap",
+				});
+			}
+			yield* cli("sync", "--once");
+			const found = lines(yield* tool("search", { query: "lasagna" }));
+			expect(found).toEqual([expect.stringMatching(recipeSwapLine)]);
+		}));
+
+	test("search without a query lists conversations newest first, each by its newest message", () =>
+		Effect.gen(function* () {
+			expect(lines(yield* tool("search", { limit: 4 }))).toEqual([
+				expect.stringContaining("| Nightly backup failed: music |"),
+				expect.stringContaining("| Nightly backup failed: documents |"),
+				expect.stringContaining("| Nightly backup failed: photos |"),
+				expect.stringMatching(bookClubReplyLine),
+			]);
 		}));
 
 	test("thread returns the conversation across Inbox and Sent Items, oldest first, marking the user's own message", () =>
@@ -1329,7 +1448,7 @@ describe("mx", () => {
 			expect(yield* tool("message", { id })).toContain("Second draft.");
 			expect(yield* tool("attachment", { id })).toContain("notes.txt");
 			const received = idOf(
-				yield* tool("search", { query: "kickoff" }),
+				yield* tool("search", { folder: "Inbox/Projects", query: "kickoff" }),
 				"Inbox/Projects"
 			);
 			expect(yield* refusal("update_draft", { body: "x", id: received })).toBe(
@@ -1455,7 +1574,7 @@ describe("mx", () => {
 	test("update reads, flags, categorizes and moves several messages, and each keeps its local id", () =>
 		Effect.gen(function* () {
 			const kickoff = idOf(
-				yield* tool("search", { query: "kickoff" }),
+				yield* tool("search", { folder: "Inbox/Projects", query: "kickoff" }),
 				"Inbox/Projects"
 			);
 			const answer = idOf(
@@ -1488,7 +1607,10 @@ describe("mx", () => {
 
 	test("update refuses to move messages to Deleted Items, where only delete moves them", () =>
 		Effect.gen(function* () {
-			const lunch = idOf(yield* tool("search", { query: "lunch" }), "Inbox");
+			const lunch = idOf(
+				yield* tool("search", { folder: "Inbox", query: "lunch" }),
+				"Inbox"
+			);
 			const moves = graphRequests("/move").length;
 			expect(
 				yield* refusal("update", { ids: [lunch], move_to: "Deleted Items" })
@@ -1501,9 +1623,12 @@ describe("mx", () => {
 
 	test("delete moves several messages to Deleted Items and nothing deletes a message for good", () =>
 		Effect.gen(function* () {
-			const lunch = idOf(yield* tool("search", { query: "lunch" }), "Inbox");
+			const lunch = idOf(
+				yield* tool("search", { folder: "Inbox", query: "lunch" }),
+				"Inbox"
+			);
 			const kickoff = idOf(
-				yield* tool("search", { query: "kickoff" }),
+				yield* tool("search", { folder: "Archive", query: "kickoff" }),
 				"Archive"
 			);
 			const deleted = lines(yield* tool("delete", { ids: [lunch, kickoff] }));
