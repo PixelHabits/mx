@@ -2213,6 +2213,59 @@ describe("mx", () => {
 			Effect.provide(TestClock.layer())
 		));
 
+	test("a tool call on a message Graph no longer holds removes it from the store and says so", () =>
+		Effect.gen(function* () {
+			const notice = microsoft.deliver({
+				body: "The water trough is fixed.",
+				conversationId: "conversation-trough",
+				from: rosa,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-09T09:00:00Z",
+				subject: "Trough fixed",
+			});
+			yield* cli("sync", "--once");
+			const id = idOf(yield* tool("search", { query: "trough" }), "Trough");
+			microsoft.purge(notice.id);
+			expect(lines(yield* refusal("message", { full: true, id })).at(-1)).toBe(
+				`#${id} is no longer in the mailbox.`
+			);
+			expect(yield* refusal("message", { id })).toContain(`No message #${id}.`);
+		}));
+
+	test("update_draft and delete_draft on a draft deleted in Outlook after mx checked it say it is no longer in the mailbox and remove it from the store", () =>
+		Effect.gen(function* () {
+			/** A new draft that Graph deletes for good right after its next read; answers its local id. */
+			const vanishing = (subject: string) =>
+				Effect.gen(function* () {
+					const id = idOf(
+						yield* tool("draft", { kind: "new", subject }),
+						subject
+					);
+					const drafted = Arr.findFirst(
+						microsoft.inFolder("folder-drafts"),
+						(draft) => draft.subject === subject
+					);
+					microsoft.vanishAfterRead(Option.getOrThrow(drafted).id);
+					return id;
+				});
+			const edited = yield* vanishing("Gate code for the allotment");
+			expect(
+				yield* refusal("update_draft", {
+					body: "The code is 4321.",
+					id: edited,
+				})
+			).toBe(`#${edited} is no longer in the mailbox.`);
+			const discarded = yield* vanishing("Spare key for the shed");
+			expect(yield* refusal("delete_draft", { id: discarded })).toBe(
+				`#${discarded} is no longer in the mailbox.`
+			);
+			for (const id of [edited, discarded]) {
+				expect(yield* refusal("message", { id })).toContain(
+					`No message #${id}.`
+				);
+			}
+		}));
+
 	test("while a pass runs for many minutes, as when Graph throttles every request, mx status reports sync running", () =>
 		Effect.gen(function* () {
 			microsoft.throttleEach = 3;

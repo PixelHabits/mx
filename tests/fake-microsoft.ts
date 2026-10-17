@@ -116,6 +116,8 @@ export class FakeMicrosoft {
 	/** How many times each Graph request, by method and URL, answers 429 before Graph answers it. */
 	throttleEach = 0;
 	private readonly throttled = new Map<string, number>();
+	/** Messages Graph deletes for good right after it answers their next read. */
+	private readonly vanishing = new Set<string>();
 	/** The seconds each 429 asks the client to wait in `Retry-After`. */
 	retryAfter = 1;
 	/** The status Graph answers every request with during an outage, such as 503; 0 while Graph is up. */
@@ -382,6 +384,11 @@ export class FakeMicrosoft {
 			message.parentFolderId = folderId;
 			this.changes.push({ folderId, id });
 		}
+	}
+
+	/** Makes Graph answer the next read of the message by its id, then delete the message for good, as Outlook can. */
+	vanishAfterRead(id: string) {
+		this.vanishing.add(id);
 	}
 
 	/** Adds a mail folder below `parentFolderId`, as the user makes one in Outlook. */
@@ -913,7 +920,11 @@ export class FakeMicrosoft {
 		action: string | undefined
 	) {
 		if (action === undefined && method === "GET") {
-			return json(this.messageJson(message, asText));
+			const answer = json(this.messageJson(message, asText));
+			if (this.vanishing.delete(message.id)) {
+				this.purge(message.id);
+			}
+			return answer;
 		}
 		if (action === undefined && method === "PATCH") {
 			this.patch(message, body);

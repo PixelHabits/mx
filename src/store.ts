@@ -112,6 +112,7 @@ const Row = Schema.Struct({
 	cc_list: Schema.fromJsonString(Schema.Array(Address)),
 	conversation_id: Schema.String,
 	flag: Schema.Literals(["notFlagged", "flagged", "complete"]),
+	folder_id: Schema.String,
 	folder_path: Schema.String,
 	folder_sent: Flag,
 	from_address: Schema.String,
@@ -175,6 +176,7 @@ export interface Stored {
 	readonly draft: boolean;
 	readonly flag: "notFlagged" | "flagged" | "complete";
 	readonly folder: string;
+	readonly folderId: string;
 	readonly from: Option.Option<Address>;
 	readonly graphId: string;
 	readonly id: number;
@@ -225,6 +227,7 @@ const stored = (row: typeof Row.Type): Stored => ({
 	draft: row.is_draft === 1,
 	flag: row.flag,
 	folder: row.folder_path,
+	folderId: row.folder_id,
 	from:
 		row.from_address === "" && row.from_name === ""
 			? Option.none()

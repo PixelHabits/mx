@@ -21,7 +21,7 @@ import {
 	Refused,
 } from "../errors.ts";
 import { FlagStatus, type Message, type Recipient } from "../graph/api.ts";
-import { type Compose, Graph } from "../graph/graph.ts";
+import { type Compose, Graph, isNotFound } from "../graph/graph.ts";
 import { Paths } from "../paths.ts";
 import { syncWarning } from "../status.ts";
 import { Store, type Stored, type StoredFolder } from "../store.ts";
@@ -406,19 +406,52 @@ export const tools = Layer.effectDiscard(
 			return found.value;
 		});
 
-		/** The message as Graph holds it now, refused unless it is still a draft. */
-		const currentDraft = Effect.fnUntraced(function* (id: number) {
-			const current = yield* graph.message((yield* stored(id)).graphId);
-			if (!current.isDraft) {
-				return yield* Refused.make({ message: `#${id} is not a draft.` });
-			}
-			return current;
-		});
+		/**
+		 * Runs `request`, the call or reads that name the stored message, on its Graph id. When Graph answers 404, mx looks
+		 * the message up by its immutable id, which a move within the mailbox keeps: one Graph no longer holds leaves the
+		 * store, and the tool says so; one Graph still holds is refiled, and the tool answers the 404.
+		 */
+		const onMessage = <A>(
+			found: Stored,
+			request: (graphId: string) => Effect.Effect<A, ToolError>
+		) =>
+			request(found.graphId).pipe(
+				Effect.catchIf(isNotFound, (missing) =>
+					Effect.gen(function* () {
+						if (Option.isNone(yield* sync.locate(found.graphId))) {
+							return yield* NotFound.make({
+								message: `#${found.id} is no longer in the mailbox.`,
+							});
+						}
+						return yield* missing;
+					})
+				)
+			);
+
+		/**
+		 * Runs `write` on the draft as Graph holds it now, refused unless it is still a draft. The read and the write run
+		 * through `onMessage` together, so a draft deleted between them is answered as any message Graph no longer holds.
+		 */
+		const onDraft = <A>(
+			id: number,
+			write: (draft: Message) => Effect.Effect<A, ToolError>
+		) =>
+			Effect.flatMap(stored(id), (found) =>
+				onMessage(found, (graphId) =>
+					Effect.gen(function* () {
+						const current = yield* graph.message(graphId);
+						if (!current.isDraft) {
+							return yield* Refused.make({ message: `#${id} is not a draft.` });
+						}
+						return yield* write(current);
+					})
+				)
+			);
 
 		/** Looks a message up in Graph after a write, files it and answers its listing line. */
-		const savedLine = Effect.fnUntraced(function* (written: Message) {
-			yield* sync.locate(written.id);
-			const saved = yield* store.byGraphId(written.id);
+		const savedLine = Effect.fnUntraced(function* (graphId: string) {
+			yield* sync.locate(graphId);
+			const saved = yield* store.byGraphId(graphId);
 			if (Option.isNone(saved)) {
 				return yield* NotFound.make({
 					message: "The message is no longer in the mailbox.",
@@ -466,13 +499,12 @@ export const tools = Layer.effectDiscard(
 			);
 		});
 
-		const numbered = Effect.fnUntraced(function* (found: Stored) {
-			const [list, body] = yield* Effect.all(
-				[graph.attachments(found.graphId), graph.body(found.graphId)],
-				{ concurrency: 2 }
-			);
-			return inBodyOrder(list, body);
-		});
+		const numbered = (found: Stored) =>
+			onMessage(found, (graphId) =>
+				Effect.all([graph.attachments(graphId), graph.body(graphId)], {
+					concurrency: 2,
+				})
+			).pipe(Effect.map(([list, body]) => inBodyOrder(list, body)));
 
 		/** Reads every file before any write, so a bad path changes nothing in the mailbox. */
 		const readFiles = (paths: readonly string[]) =>
@@ -485,18 +517,19 @@ export const tools = Layer.effectDiscard(
 				)
 			);
 
-		const attachFiles = Effect.fnUntraced(function* (
-			target: Message,
+		const attachFiles = (
+			graphId: string,
 			files: readonly { readonly bytes: Uint8Array; readonly name: string }[]
-		) {
-			let current = target;
-			for (const file of files) {
-				current = yield* graph.attach({ ...file, id: target.id });
-			}
-			return current;
-		});
+		) =>
+			Effect.forEach(files, (file) => graph.attach({ ...file, id: graphId }), {
+				discard: true,
+			});
 
-		const composed = Effect.fnUntraced(function* (input: ComposeInput) {
+		/** Runs `request` on the message `input` composes; a reply or forward names its message through `onMessage`. */
+		const composing = Effect.fnUntraced(function* <A>(
+			input: ComposeInput,
+			request: (compose: Compose) => Effect.Effect<A, ToolError>
+		) {
 			const fields = {
 				bcc: input.bcc,
 				cc: input.cc,
@@ -510,71 +543,69 @@ export const tools = Layer.effectDiscard(
 						message: "kind new answers no message; leave message out.",
 					});
 				}
-				return { ...fields, kind: input.kind } satisfies Compose;
+				return yield* request({ ...fields, kind: input.kind });
 			}
 			if (input.message === undefined) {
 				return yield* Refused.make({
 					message: `kind ${input.kind} needs message, the local id of the message it answers.`,
 				});
 			}
-			const found = yield* stored(input.message);
-			return {
-				...fields,
-				id: found.graphId,
-				kind: input.kind,
-			} satisfies Compose;
+			const { kind } = input;
+			return yield* onMessage(yield* stored(input.message), (id) =>
+				request({ ...fields, id, kind })
+			);
 		});
 
-		/** A new draft with its files attached. */
+		/** A new draft with its files attached; answers its Graph id. */
 		const drafted = Effect.fnUntraced(function* (input: ComposeInput) {
-			const compose = yield* composed(input);
 			const files = yield* readFiles(input.attach ?? []);
-			return yield* attachFiles(yield* graph.draft(compose), files);
+			const id = yield* composing(input, graph.draft);
+			yield* attachFiles(id, files);
+			return id;
 		});
 
 		/**
 		 * Sends a draft only when `to`, `cc`, `bcc` and `subject` repeat its own, so the client's approval prompt shows
 		 * everyone it goes to. Graph sends the draft as it stands, so each of them counts.
 		 */
-		const sendDraft = Effect.fnUntraced(function* ({
+		const sendDraft = ({
 			draft: id,
 			subject,
 			...repeated
-		}: typeof SendDraft.Type) {
-			const current = yield* currentDraft(id);
-			const actual = {
-				bcc: addressesOf(current.bccRecipients),
-				cc: addressesOf(current.ccRecipients),
-				to: addressesOf(current.toRecipients),
-			};
-			const actualSubject = current.subject ?? "";
-			if (
-				actualSubject !== subject ||
-				!Arr.every(["to", "cc", "bcc"] as const, (field) =>
-					sameAddresses(actual[field], repeated[field])
-				)
-			) {
-				return yield* Refused.make({
-					message: `Nothing was sent: #${id} goes to ${recipientsText(actual)} with the subject "${actualSubject}". Repeat to, cc, bcc and subject exactly to send it.`,
-				});
-			}
-			yield* graph.sendDraft(current.id);
-			yield* store.remove(current.id, current.parentFolderId);
-			return `Sent #${id} to ${recipientsText(actual)}: ${actualSubject || "(no subject)"}`;
-		});
+		}: typeof SendDraft.Type) =>
+			onDraft(id, (current) =>
+				Effect.gen(function* () {
+					const actual = {
+						bcc: addressesOf(current.bccRecipients),
+						cc: addressesOf(current.ccRecipients),
+						to: addressesOf(current.toRecipients),
+					};
+					const actualSubject = current.subject ?? "";
+					if (
+						actualSubject !== subject ||
+						!Arr.every(["to", "cc", "bcc"] as const, (field) =>
+							sameAddresses(actual[field], repeated[field])
+						)
+					) {
+						return yield* Refused.make({
+							message: `Nothing was sent: #${id} goes to ${recipientsText(actual)} with the subject "${actualSubject}". Repeat to, cc, bcc and subject exactly to send it.`,
+						});
+					}
+					yield* graph.sendDraft(current.id);
+					yield* store.remove(current.id, current.parentFolderId);
+					return `Sent #${id} to ${recipientsText(actual)}: ${actualSubject || "(no subject)"}`;
+				})
+			);
 
 		/** Sends in one request, or through a draft when files go with it, since only a draft takes attachments. */
 		const sendNow = Effect.fnUntraced(function* (input: ComposeInput) {
-			const compose = yield* composed(input);
 			const files = yield* readFiles(input.attach ?? []);
 			if (Arr.isReadonlyArrayNonEmpty(files)) {
-				const withFiles = yield* attachFiles(
-					yield* graph.draft(compose),
-					files
-				);
-				yield* graph.sendDraft(withFiles.id);
+				const id = yield* composing(input, graph.draft);
+				yield* attachFiles(id, files);
+				yield* graph.sendDraft(id);
 			} else {
-				yield* graph.send(compose);
+				yield* composing(input, graph.send);
 			}
 			return input.kind === "new"
 				? `Sent to ${recipientsText({ bcc: input.bcc ?? [], cc: input.cc ?? [], to: input.to ?? [] })}: ${input.subject || "(no subject)"}`
@@ -637,9 +668,11 @@ export const tools = Layer.effectDiscard(
 		yield* registerRead(message, ({ full, id }) =>
 			Effect.gen(function* () {
 				const found = yield* stored(id);
-				const body =
-					full === true ? yield* graph.body(found.graphId) : found.body;
-				return messageText(found, body);
+				if (full !== true) {
+					return messageText(found, found.body);
+				}
+				const body = yield* onMessage(found, graph.body);
+				return messageText(yield* stored(id), body);
 			})
 		);
 
@@ -680,29 +713,33 @@ export const tools = Layer.effectDiscard(
 		);
 
 		yield* register(updateDraft, ({ attach, bcc, body, cc, id, subject, to }) =>
-			Effect.gen(function* () {
-				const current = yield* currentDraft(id);
-				const files = yield* readFiles(attach ?? []);
-				const changed = Arr.some(
-					[bcc, body, cc, subject, to],
-					(field) => field !== undefined
-				)
-					? yield* graph.update(current.id, {
+			onDraft(id, (current) =>
+				Effect.gen(function* () {
+					const files = yield* readFiles(attach ?? []);
+					if (
+						Arr.some(
+							[bcc, body, cc, subject, to],
+							(field) => field !== undefined
+						)
+					) {
+						yield* graph.update(current.id, {
 							bcc,
 							cc,
 							subject,
 							text: body,
 							to,
-						})
-					: current;
-				return yield* savedLine(yield* attachFiles(changed, files));
-			})
+						});
+					}
+					yield* attachFiles(current.id, files);
+					return current.id;
+				})
+			).pipe(Effect.flatMap(savedLine))
 		);
 
 		yield* register(deleteDraft, ({ id }) =>
-			Effect.flatMap(currentDraft(id), (current) =>
-				graph.move(current.id, "deleteditems")
-			).pipe(Effect.flatMap(savedLine))
+			onDraft(id, (current) => graph.move(current.id, "deleteditems")).pipe(
+				Effect.flatMap(savedLine)
+			)
 		);
 
 		yield* register(send, (params) =>
@@ -745,21 +782,20 @@ export const tools = Layer.effectDiscard(
 				return yield* each(ids, (id) =>
 					Effect.gen(function* () {
 						const found = yield* stored(id);
-						const patched =
-							categories === undefined &&
-							flag === undefined &&
-							read === undefined
-								? yield* graph.message(found.graphId)
-								: yield* graph.update(found.graphId, {
-										categories,
-										flag,
-										isRead: read,
-									});
-						return yield* savedLine(
-							Option.isSome(destination)
-								? yield* graph.move(patched.id, destination.value.id)
-								: patched
-						);
+						const moved = (graphId: string) =>
+							Option.match(destination, {
+								onNone: () => Effect.succeed(graphId),
+								onSome: (folder) => graph.move(graphId, folder.id),
+							});
+						const written = Arr.some(
+							[categories, flag, read],
+							(field) => field !== undefined
+						)
+							? yield* onMessage(found, (graphId) =>
+									graph.update(graphId, { categories, flag, isRead: read })
+								).pipe(Effect.andThen(moved(found.graphId)))
+							: yield* onMessage(found, moved);
+						return yield* savedLine(written);
 					})
 				);
 			})
@@ -768,7 +804,7 @@ export const tools = Layer.effectDiscard(
 		yield* register(deleteMessages, ({ ids }) =>
 			each(ids, (id) =>
 				Effect.flatMap(stored(id), (found) =>
-					graph.move(found.graphId, "deleteditems")
+					onMessage(found, (graphId) => graph.move(graphId, "deleteditems"))
 				).pipe(Effect.flatMap(savedLine))
 			)
 		);

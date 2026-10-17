@@ -1,11 +1,4 @@
-import {
-	Array as Arr,
-	Context,
-	Effect,
-	Layer,
-	Option,
-	type Schema,
-} from "effect";
+import { Array as Arr, Context, Effect, Layer, Option, Schema } from "effect";
 import { Base64 } from "effect/encoding";
 import {
 	HttpClient,
@@ -46,9 +39,12 @@ export type GraphError =
 	| LoginRequired
 	| CredentialFailed;
 
+const isGraphRefused = Schema.is(GraphRefused);
+
 /** Graph's 404: the item the request names does not exist (https://learn.microsoft.com/graph/errors). */
-export const isNotFound = (error: GraphError): error is GraphRefused =>
-	error._tag === "GraphRefused" && error.status === 404;
+export const isNotFound = (error: {
+	readonly _tag: string;
+}): error is GraphRefused => isGraphRefused(error) && error.status === 404;
 
 const graphBase = "https://graph.microsoft.com/v1.0";
 
@@ -190,7 +186,8 @@ const reaction = ({ bcc, cc, subject, text, to }: Fields): Reaction => ({
 /**
  * Microsoft Graph for the signed-in mailbox. Every request asks for text bodies and immutable ids. Reads retry
  * transient failures and writes retry only Graph's 429, each waiting at least as long as `Retry-After` asks; the
- * policy in `http-policy.ts` owns both. A write answers the message as Graph holds it afterwards.
+ * policy in `http-policy.ts` owns both. A write answers no more than the id of the message it wrote: Graph answers a
+ * write without `uniqueBody`, so `message` reads the message back where a caller needs it.
  */
 export class Graph extends Context.Service<
 	Graph,
@@ -229,14 +226,17 @@ export class Graph extends Context.Service<
 				readonly text?: string;
 				readonly to?: readonly string[];
 			}
-		) => Effect.Effect<Message, GraphError>;
-		/** Moves the message to a folder id or a well-known folder name such as `deleteditems`. */
+		) => Effect.Effect<void, GraphError>;
+		/** Moves the message to a folder id or a well-known folder name such as `deleteditems`, and answers its id. */
 		readonly move: (
 			id: string,
 			destination: string
-		) => Effect.Effect<Message, GraphError>;
-		/** Creates a draft in Drafts; a reply, reply-all or forward quotes the conversation below its text. */
-		readonly draft: (compose: Compose) => Effect.Effect<Message, GraphError>;
+		) => Effect.Effect<string, GraphError>;
+		/**
+		 * Creates a draft in Drafts and answers its id; a reply, reply-all or forward quotes the conversation below its
+		 * text.
+		 */
+		readonly draft: (compose: Compose) => Effect.Effect<string, GraphError>;
 		/** Sends at once through `sendMail`, or the reply, reply-all or forward action, which quotes as a draft does. */
 		readonly send: (compose: Compose) => Effect.Effect<void, GraphError>;
 		readonly sendDraft: (id: string) => Effect.Effect<void, GraphError>;
@@ -244,7 +244,7 @@ export class Graph extends Context.Service<
 			readonly bytes: Uint8Array;
 			readonly id: string;
 			readonly name: string;
-		}) => Effect.Effect<Message, GraphError>;
+		}) => Effect.Effect<void, GraphError>;
 		/** This app's subscriptions for the signed-in user. */
 		readonly subscriptions: Effect.Effect<readonly Subscription[], GraphError>;
 		readonly subscribe: (input: {
@@ -450,7 +450,6 @@ export class Graph extends Context.Service<
 							},
 						})
 					);
-					return yield* message(id);
 				}
 			);
 
@@ -461,7 +460,7 @@ export class Graph extends Context.Service<
 				const moved = yield* settle(
 					mail.move({ params: { id }, payload: { destinationId: destination } })
 				);
-				return yield* message(moved.id);
+				return moved.id;
 			});
 
 			const reactions = {
@@ -479,7 +478,7 @@ export class Graph extends Context.Service<
 								payload: reaction(compose),
 							})
 				);
-				return yield* message(drafted.id);
+				return drafted.id;
 			});
 
 			const send = Effect.fn("Graph.send")((compose: Compose) =>
@@ -515,7 +514,7 @@ export class Graph extends Context.Service<
 								},
 							})
 						);
-						return yield* message(id);
+						return;
 					}
 					const { uploadUrl } = yield* settle(
 						mail.createUploadSession({
@@ -546,7 +545,6 @@ export class Graph extends Context.Service<
 							)
 						);
 					}
-					return yield* message(id);
 				}
 			);
 
