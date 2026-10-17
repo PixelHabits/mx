@@ -1,11 +1,16 @@
 # release-please keeps a release PR open from the conventional commits on main. When that PR merges, it tags the merge
-# commit v<version> and creates the GitHub release as a draft. The release job then builds and signs the release files,
-# uploads them to the draft, attests them and publishes it. mx reads only the newest published release, so it never
-# sees a release without its files.
+# commit v<version> and creates the GitHub release as a draft. Three jobs then finish the release, in this order:
 #
-# The release job runs in the release environment, which waits for a required reviewer. The secret
-# MX_RELEASE_SIGNING_KEY, the release signing key as an Ed25519 private key in PKCS #8 PEM, belongs to that
-# environment, so no other job can read it. RELEASING.md has the steps and the settings.
+# 1. build, on Linux, compiles every binary and writes the third-party notices.
+# 2. sign, on macOS, signs the macOS binaries with the Developer ID certificate and has Apple notarize them. Then it
+#    writes the manifest of every binary's size and sha256, of the bytes as they ship, and signs it with the release
+#    key.
+# 3. publish, on Linux, uploads the files to the draft, attests them and publishes it.
+#
+# mx reads only the newest published release, so it never sees a release without its files.
+#
+# The sign job runs in the release environment, which waits for a required reviewer. The secrets it uses belong to
+# that environment, so no other job can read them. RELEASING.md has the steps, the settings and the secrets.
 name: Release
 
 on:
@@ -31,20 +36,11 @@ jobs:
       - id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
 
-  release:
+  build:
     needs: release-please
     if: needs.release-please.outputs.created == 'true'
     runs-on: ubuntu-latest
-    environment: release
-    timeout-minutes: 30
-    permissions:
-      attestations: write
-      contents: write
-      id-token: write
-    env:
-      GH_REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ github.token }}
-      TAG: ${{ needs.release-please.outputs.tag }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,10 +50,132 @@ jobs:
         with:
           bun-version-file: package.json
       - run: bun install --frozen-lockfile
-      - name: Build the binaries and their notices, and sign the manifest
-        run: bun run release
+      - run: bun run build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: built
+          path: |
+            dist/mx-darwin-arm64
+            dist/mx-darwin-x64
+            dist/mx-linux-x64
+            dist/mx-windows-x64.exe
+            dist/THIRD_PARTY_NOTICES
+          if-no-files-found: error
+
+  sign:
+    needs: [release-please, build]
+    runs-on: macos-latest
+    environment: release
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: built
+          path: dist
+      # codesign finds an identity only in a keychain on the user's search list. The keychain's password lives only in
+      # this step; the job's virtual machine is discarded when the job ends.
+      - name: Import the Developer ID Application certificate into a keychain of its own
+        env:
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/mx-signing.keychain-db"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          password="$(openssl rand -base64 32)"
+          p12="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$APPLE_DEVELOPER_ID_P12" | base64 --decode > "$p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$p12" -k "$keychain" -f pkcs12 -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain"
+          rm "$p12"
+      # The hardened runtime and a secure timestamp are what notarization requires. The entitlements are the ones Bun's
+      # docs give for a Bun executable, whose JavaScriptCore compiles code at run time.
+      - name: Sign the macOS binaries
+        run: >-
+          codesign --force --sign "Developer ID Application" --keychain "$KEYCHAIN"
+          --identifier io.github.pixelhabits.mx --options runtime --timestamp
+          --entitlements release/entitlements.plist
+          dist/mx-darwin-arm64 dist/mx-darwin-x64
+      # The requirement is Apple's for a Developer ID Application signature of this team. spctl --assess is left out: it
+      # rejects an executable outside an app bundle as not an app, and notarization below is what Gatekeeper checks.
+      - name: Check the signatures
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          requirement="=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = \"$APPLE_TEAM_ID\""
+          for binary in dist/mx-darwin-arm64 dist/mx-darwin-x64; do
+            codesign --verify --strict --verbose=2 -R "$requirement" "$binary"
+          done
+      # macos-latest runs on Apple silicon, so the arm64 binary shows that it starts under the hardened runtime. The
+      # artifact kept no file modes; a mode is not part of the bytes the manifest hashes.
+      - name: Run the signed arm64 binary
+        run: |
+          chmod +x dist/mx-darwin-arm64
+          dist/mx-darwin-arm64 --version
+      # The notary service takes a ZIP archive, not a bare executable, and makes a ticket for each binary in it.
+      # Gatekeeper finds the tickets online; Apple's tools cannot staple a ticket to a bare executable.
+      - name: Notarize the macOS binaries
+        env:
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          key="$RUNNER_TEMP/notary-key.p8"
+          (umask 077 && printf '%s\n' "$APPLE_NOTARY_KEY" > "$key")
+          mkdir "$RUNNER_TEMP/notarize"
+          cp dist/mx-darwin-arm64 dist/mx-darwin-x64 "$RUNNER_TEMP/notarize/"
+          ditto -c -k --keepParent "$RUNNER_TEMP/notarize" "$RUNNER_TEMP/mx-darwin.zip"
+          result="$RUNNER_TEMP/notary.json"
+          xcrun notarytool submit "$RUNNER_TEMP/mx-darwin.zip" --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --timeout 45m --output-format json > "$result" || true
+          cat "$result"
+          xcrun notarytool log "$(jq -r .id "$result")" --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID"
+          test "$(jq -r .status "$result")" = Accepted
+      - name: Write the manifest of the signed binaries and sign it
+        run: bun run manifest
         env:
           MX_RELEASE_SIGNING_KEY: ${{ secrets.MX_RELEASE_SIGNING_KEY }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            dist/mx-darwin-arm64
+            dist/mx-darwin-x64
+            dist/mx-linux-x64
+            dist/mx-windows-x64.exe
+            dist/THIRD_PARTY_NOTICES
+            dist/latest.json
+            dist/latest.json.sig
+          if-no-files-found: error
+
+  publish:
+    needs: [release-please, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.release-please.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
       # --clobber lets a rerun of this job replace what an earlier run uploaded.
       - name: Upload the release files to the draft
         run: >-
