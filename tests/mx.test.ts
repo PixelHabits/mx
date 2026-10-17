@@ -73,8 +73,16 @@ const systemSecrets = Bun.secrets;
 const secrets = new FakeSecrets();
 secrets.install();
 
-/** The tests run on Linux and on Windows; a test of what only one of them has runs there alone. */
-const windows = process.platform === "win32";
+/** The systems the tests run on; a test of what only some of them have runs there alone. */
+type OperatingSystem = "darwin" | "linux" | "win32";
+const os: OperatingSystem =
+	process.platform === "darwin" || process.platform === "win32"
+		? process.platform
+		: "linux";
+const windows = os === "win32";
+const mac = os === "darwin";
+/** The value for the system the tests run on. */
+const onThisSystem = <A>(values: Record<OperatingSystem, A>) => values[os];
 
 const machine = ManagedRuntime.make(
 	Layer.effect(
@@ -168,8 +176,8 @@ const server = ManagedRuntime.make(
 afterAll(() => server.dispose().then(() => machine.dispose()));
 
 /**
- * One test, on mx's own runtime. A test of what only one platform has names it in `only`; elsewhere the test is skipped,
- * and its name says why.
+ * One test, on mx's own runtime. A test of what only some systems have names them in `only`; elsewhere the test is
+ * skipped, and its name says why.
  */
 const test = <E>(
 	name: string,
@@ -178,9 +186,12 @@ const test = <E>(
 		E,
 		Layer.Success<typeof platform> | McpClient
 	>,
-	only?: { readonly platform: "linux" | "win32"; readonly because: string }
+	only?: {
+		readonly because: string;
+		readonly systems: readonly OperatingSystem[];
+	}
 ) => {
-	const skipped = only !== undefined && process.platform !== only.platform;
+	const skipped = only !== undefined && !only.systems.includes(os);
 	return it.skipIf(skipped)(
 		skipped ? `${name} (skipped: ${only.because})` : name,
 		() => server.runPromise(body()),
@@ -422,14 +433,30 @@ const graphRequests = (suffix: string) =>
 		request.url.pathname.endsWith(suffix)
 	);
 
-/** Where mx keeps its files: below `%LOCALAPPDATA%\\mx` on Windows, in the XDG folders on Linux. */
+/** Where mx keeps its files: below `%LOCALAPPDATA%\\mx` on Windows, below `~/Library` on macOS, in the XDG folders on Linux. */
 const local = join(home, "AppData", "Local", "mx");
-const configFile = windows
-	? join(local, "config.json")
-	: join(home, "config", "mx", "config.json");
-const dataFolder = windows ? join(local, "data") : join(home, "data", "mx");
-const stateFolder = windows ? join(local, "state") : join(home, "state", "mx");
-const cacheFolder = windows ? join(local, "cache") : join(home, "cache", "mx");
+const library = join(home, "Library");
+const support = join(library, "Application Support", "mx");
+const { cacheFolder, configFile, dataFolder, stateFolder } = onThisSystem({
+	darwin: {
+		cacheFolder: join(library, "Caches", "mx"),
+		configFile: join(support, "config.json"),
+		dataFolder: join(support, "data"),
+		stateFolder: join(library, "Logs", "mx"),
+	},
+	linux: {
+		cacheFolder: join(home, "cache", "mx"),
+		configFile: join(home, "config", "mx", "config.json"),
+		dataFolder: join(home, "data", "mx"),
+		stateFolder: join(home, "state", "mx"),
+	},
+	win32: {
+		cacheFolder: join(local, "cache"),
+		configFile: join(local, "config.json"),
+		dataFolder: join(local, "data"),
+		stateFolder: join(local, "state"),
+	},
+});
 const tokenFile = join(stateFolder, "refresh-token");
 /** The sign-in's entry in the system's secret store. */
 const credential = { name: "refresh-token", service: "mx" };
@@ -580,10 +607,9 @@ const syncCommands = windows
 			restart: ["systemctl --user restart --no-block mx-sync.service"],
 		};
 
-/** The agents mx offers here, as `--agent` names them; Claude Desktop only on Windows. */
-const offeredAgents = windows
-	? "claude-desktop, claude-code, codex"
-	: "claude-code, codex";
+/** The agents mx offers here, as `--agent` names them; Claude Desktop only on Windows and macOS. */
+const offeredAgents =
+	windows || mac ? "claude-desktop, claude-code, codex" : "claude-code, codex";
 
 const claudeCodeConfig = join(home, ".claude.json");
 const claudeCodeSettings = {
@@ -701,7 +727,7 @@ const writeJson = (file: string, value: unknown) =>
 
 /**
  * `platform` on a machine where mx never synced: a store of its own, and Claude Code's config in a folder of its own,
- * since on Windows the store sits below the same folder as the installed program.
+ * since on Windows the store sits below the same folder as the installed program, and on macOS below the home folder.
  */
 const neverSynced = (name: string) =>
 	Effect.gen(function* () {
@@ -714,6 +740,7 @@ const neverSynced = (name: string) =>
 		return platformWith({
 			...environment,
 			CLAUDE_CONFIG_DIR: claude,
+			HOME: root,
 			LOCALAPPDATA: join(root, "Local"),
 			XDG_DATA_HOME: join(root, "data"),
 		});
@@ -941,7 +968,7 @@ describe("mx", () => {
 				};
 				expect(Arr.map(listed, ({ name }) => name).sort()).toEqual(tools);
 			}).pipe(Effect.scoped),
-		{ because: "it runs the Windows exe", platform: "win32" }
+		{ because: "it runs the Windows exe", systems: ["win32"] }
 	);
 
 	test("run from source with no client id saved and no terminal, mx login fails, says how to give the client id, and saves nothing", () =>
@@ -1087,7 +1114,7 @@ describe("mx", () => {
 		{
 			because:
 				"only a Linux machine can lack a secret store, and Windows has no file modes",
-			platform: "linux",
+			systems: ["linux"],
 		}
 	);
 
@@ -1136,7 +1163,7 @@ describe("mx", () => {
 							: systemSecrets.set({ ...credential, value: saved });
 					})
 			),
-		{ because: "it saves to Windows Credential Manager", platform: "win32" }
+		{ because: "it saves to Windows Credential Manager", systems: ["win32"] }
 	);
 
 	test("a draft written before the first sync is stored with its folder and answers its local id", () =>
@@ -2445,7 +2472,7 @@ describe("mx", () => {
 			const drawn = Arr.join(frames, "");
 			expect(drawn).toContain("Claude Code");
 			expect(drawn).toContain("Codex");
-			expect(drawn.includes("Claude Desktop")).toBe(windows);
+			expect(drawn.includes("Claude Desktop")).toBe(windows || mac);
 			expect(yield* readJson(claudeCodeConfig)).toEqual({
 				...claudeCodeSettings,
 				mcpServers: {
@@ -2549,7 +2576,7 @@ describe("mx", () => {
 				expect(unit).toContain(`ExecStart="${installed}" sync`);
 				expect(unit).toContain("SuccessExitStatus=130");
 			}),
-		{ because: "systemd and file modes are Linux's", platform: "linux" }
+		{ because: "systemd and file modes are Linux's", systems: ["linux"] }
 	);
 
 	test(
@@ -2581,7 +2608,7 @@ describe("mx", () => {
 				// mx install copied the Bun that runs the tests, as mx.exe and mxw.exe.
 				expect(version.trim()).toBe(Bun.version);
 			}),
-		{ because: "it runs the installed exe", platform: "win32" }
+		{ because: "it runs the installed exe", systems: ["win32"] }
 	);
 
 	test("with CLAUDE_CONFIG_DIR set, mx install writes Claude Code's .claude.json and settings.json in that folder and leaves ~/.claude.json alone", () =>
@@ -3045,7 +3072,7 @@ describe("mx", () => {
 					`command = "${packaged}"`
 				);
 			}),
-		{ because: "the Arch package is for Arch Linux", platform: "linux" }
+		{ because: "the Arch package is for Arch Linux", systems: ["linux"] }
 	);
 
 	test(
@@ -3063,7 +3090,7 @@ describe("mx", () => {
 					)
 				).toHaveLength(asked);
 			}),
-		{ because: "the Arch package is for Arch Linux", platform: "linux" }
+		{ because: "the Arch package is for Arch Linux", systems: ["linux"] }
 	);
 
 	test(
@@ -3083,7 +3110,7 @@ describe("mx", () => {
 				expect(output).toContain("pacman -R mx");
 				expect(output).not.toContain(`Removed ${packaged}`);
 			}),
-		{ because: "the Arch package is for Arch Linux", platform: "linux" }
+		{ because: "the Arch package is for Arch Linux", systems: ["linux"] }
 	);
 
 	test("mx install on Windows adds the program folder to the user PATH once and keeps every other entry, and mx uninstall takes out only that folder", () =>

@@ -55,20 +55,10 @@ const desktopFile = "claude_desktop_config.json";
  * `~/Library/Application Support/Claude` on macOS. mx does not offer Claude Desktop elsewhere. Claude Desktop keeps
  * tool approvals outside this file, so mx sets none there.
  */
-const desktopConfig = (
-	path: Path.Path,
-	{ config, home }: { readonly config: string; readonly home: string }
-): readonly string[] => {
-	if (process.platform === "win32") {
-		return [path.join(config, "Claude", desktopFile)];
-	}
-	if (process.platform === "darwin") {
-		return [
-			path.join(home, "Library", "Application Support", "Claude", desktopFile),
-		];
-	}
-	return [];
-};
+const desktopConfig = (path: Path.Path, config: string): readonly string[] =>
+	process.platform === "win32" || process.platform === "darwin"
+		? [path.join(config, "Claude", desktopFile)]
+		: [];
 
 /** A JSON file with `mcpServers`, where the agent finds `mx`. */
 const jsonServers = (path: string, entry: McpEntry): ConfigFile => ({
@@ -109,7 +99,7 @@ export const agents = Effect.gen(function* () {
 	const entry: McpEntry = { args: ["mcp"], command: paths.bin };
 	const offered: readonly Agent[] = [
 		...Arr.map(
-			desktopConfig(path, paths),
+			desktopConfig(path, paths.config),
 			(file): Agent => ({
 				app: "Claude Desktop",
 				createConfig:
