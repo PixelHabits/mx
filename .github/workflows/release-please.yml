@@ -1,0 +1,73 @@
+# release-please keeps a release PR open from the conventional commits on main. When that PR merges, it tags the merge
+# commit v<version> and creates the GitHub release as a draft. The release job then builds and signs the release files,
+# uploads them to the draft, attests them and publishes it. mx reads only the newest published release, so it never
+# sees a release without its files.
+#
+# The release job runs in the release environment, which waits for a required reviewer. The secret
+# MX_RELEASE_SIGNING_KEY, the release signing key as an Ed25519 private key in PKCS #8 PEM, belongs to that
+# environment, so no other job can read it. RELEASING.md has the steps and the settings.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      sha: ${{ steps.release.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # Reads release-please-config.json and .release-please-manifest.json.
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+
+  release:
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.release-please.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+      # setup-bun installs the Bun that packageManager in package.json pins.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - name: Build both binaries and their notices, and sign the manifest
+        run: bun run release
+        env:
+          MX_RELEASE_SIGNING_KEY: ${{ secrets.MX_RELEASE_SIGNING_KEY }}
+      # --clobber lets a rerun of this job replace what an earlier run uploaded.
+      - name: Upload the release files to the draft
+        run: >-
+          gh release upload "$TAG" --clobber
+          dist/mx-linux-x64 dist/mx-windows-x64.exe dist/THIRD_PARTY_NOTICES dist/latest.json dist/latest.json.sig
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/mx-linux-x64
+            dist/mx-windows-x64.exe
+            dist/latest.json
+      - name: Publish the draft
+        run: gh release edit "$TAG" --draft=false --latest

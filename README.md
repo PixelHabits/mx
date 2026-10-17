@@ -198,16 +198,7 @@ mx reindex
 
 ## Release
 
-1. Raise `version` in `package.json` above the published one.
-2. Set `MX_RELEASE_SIGNING_KEY` to the release signing key, an Ed25519 private key in PKCS #8 PEM. Its public half is `release/public-key.pem`, and every build compiles that in.
-3. Run:
-
-   ```sh
-   bun run release
-   ```
-
-   It builds both binaries and their third-party notices into `dist/`, writes the manifest `dist/latest.json` with each binary's release URL, size and sha256, and signs it into `dist/latest.json.sig`.
-4. Create the GitHub release `v<version>` as a draft, attach `mx-linux-x64`, `mx-windows-x64.exe`, `THIRD_PARTY_NOTICES`, `latest.json` and `latest.json.sig`, then publish it. mx reads only the newest published release, so it never sees a release without its files.
+[RELEASING.md](RELEASING.md) says how release-please and the Release workflow build, sign and publish a release.
 
 ## Develop
 
