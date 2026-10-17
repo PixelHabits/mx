@@ -11,7 +11,7 @@ export const verificationUri = "https://login.example.test/device";
 export const inlineImage = new Uint8Array([137, 80, 78, 71, 1, 2, 3]);
 export const uploadOrigin = "https://upload.example.test";
 
-const devin = { address: "devin@example.test", name: "Devin Example" };
+const owner = { address: "sam@example.test", name: "Sam Example" };
 const alice = { address: "alice@example.test", name: "Alice Example" };
 const bob = { address: "bob@example.test", name: "Bob Example" };
 const carol = { address: "carol@example.test", name: "Carol Example" };
@@ -218,12 +218,12 @@ export class FakeMicrosoft {
 			parentFolderId: "folder-inbox",
 			received: "2026-10-01T14:00:00Z",
 			subject: "Quarterly budget",
-			to: [devin],
+			to: [owner],
 		});
 		this.add({
 			body: "Looks fine. One question about travel.\r\n\r\nFrom: Alice Example\r\nPlease review the quarterly budget.",
 			conversationId: "conversation-budget",
-			from: devin,
+			from: owner,
 			id: "message-reply",
 			isRead: true,
 			parentFolderId: "folder-sent",
@@ -233,14 +233,14 @@ export class FakeMicrosoft {
 			uniqueBody: "Looks fine. One question about travel.",
 		});
 		this.add({
-			body: "Travel stays under the cap.\r\n\r\nFrom: Devin Example\r\nLooks fine.",
+			body: "Travel stays under the cap.\r\n\r\nFrom: Sam Example\r\nLooks fine.",
 			conversationId: "conversation-budget",
 			from: alice,
 			id: "message-answer",
 			parentFolderId: "folder-inbox",
 			received: "2026-10-01T16:00:00Z",
 			subject: "RE: Quarterly budget",
-			to: [devin],
+			to: [owner],
 			uniqueBody: "Travel stays under the cap.",
 		});
 		this.add({
@@ -251,7 +251,7 @@ export class FakeMicrosoft {
 			parentFolderId: "folder-projects",
 			received: "2026-10-02T09:00:00Z",
 			subject: "Kickoff notes",
-			to: [devin],
+			to: [owner],
 		});
 		this.add({
 			body: "Lunch on Friday?",
@@ -261,7 +261,7 @@ export class FakeMicrosoft {
 			parentFolderId: "folder-inbox",
 			received: "2026-10-03T11:00:00Z",
 			subject: "Lunch plans",
-			to: [devin],
+			to: [owner],
 		});
 	}
 
@@ -414,7 +414,7 @@ export class FakeMicrosoft {
 			parentFolderId: "folder-inbox",
 			received: "2026-10-06T08:00:00Z",
 			subject,
-			to: [devin],
+			to: [owner],
 		});
 		return this.subscriptions.notify("inbox", added.id);
 	}
@@ -426,7 +426,7 @@ export class FakeMicrosoft {
 			"body" | "conversationId" | "parentFolderId" | "received" | "subject"
 		> & { readonly from: Address }
 	) {
-		return this.add({ ...message, id: this.newId("message"), to: [devin] });
+		return this.add({ ...message, id: this.newId("message"), to: [owner] });
 	}
 
 	/** The messages in a folder as Graph holds them now. */
@@ -745,7 +745,7 @@ export class FakeMicrosoft {
 		const sent = folder === "folder-sent";
 		return this.add({
 			...input,
-			from: sent ? devin : null,
+			from: sent ? owner : null,
 			id: this.newId("message"),
 			isDraft: !sent,
 			isRead: true,
@@ -772,7 +772,7 @@ export class FakeMicrosoft {
 		const from = Option.toArray(Option.fromNullishOr(message.from));
 		const others = Arr.filter(
 			message.to,
-			(address) => address.address !== devin.address
+			(address) => address.address !== owner.address
 		);
 		const replyTo = all ? [...from, ...others] : from;
 		const defaultTo = forward ? parseRecipients(body.toRecipients) : replyTo;

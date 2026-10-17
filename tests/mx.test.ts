@@ -1415,7 +1415,7 @@ describe("mx", () => {
 			expect(Arr.every(order, (index) => index >= 0)).toBe(true);
 			expect(order).toEqual([...order].sort((a, b) => a - b));
 			expect(thread).toMatch(ownSentLine);
-			expect(thread).not.toContain("From: Devin Example");
+			expect(thread).not.toContain("From: Sam Example");
 			expect(thread).toContain("[img 1]");
 		}));
 

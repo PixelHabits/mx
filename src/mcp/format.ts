@@ -103,7 +103,7 @@ export const messageText = (stored: Stored, body: string) => {
 	);
 };
 
-/** The conversation oldest first; Devin's own messages say `(me)` in place of a From line. */
+/** The conversation oldest first; the user's own messages say `(me)` in place of a From line. */
 export const threadText = (
 	messages: readonly Stored[],
 	own: ReadonlySet<string>
