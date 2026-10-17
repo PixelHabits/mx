@@ -15,14 +15,25 @@ import {
 import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import packageJson from "../package.json" with { type: "json" };
-import { PushUnavailable } from "./errors.ts";
+import {
+	type CredentialFailed,
+	type LoginRequired,
+	PushUnavailable,
+} from "./errors.ts";
 import type { Subscription } from "./graph/api.ts";
 import { Graph, type GraphError } from "./graph/graph.ts";
 import { policy } from "./http-policy.ts";
 import { Cloudflared } from "./push/cloudflared.ts";
 import { beatInterval, signInExpired } from "./status.ts";
 import { Store, type SyncMode } from "./store.ts";
-import { type Pass, reconcileSummary, Sync, summary } from "./sync.ts";
+import {
+	type Pass,
+	reconcileSummary,
+	type Skipped,
+	Sync,
+	skippedLine,
+	summary,
+} from "./sync.ts";
 
 /** How often every folder is polled while push notifications arrive. */
 const healthyPollInterval = Duration.minutes(5);
@@ -126,17 +137,18 @@ const randomHex = (bytes: number) =>
  * to a local webhook and two Graph subscriptions, on Inbox and Sent Items; each notification runs a delta pass for its
  * folder. Every folder is also polled, every 5 minutes while push is up and every 60 seconds while it is down, and push
  * tries again every 10 minutes. After the first pass and then once a day, it checks the store against Graph and repairs
- * what the deltas missed. The heartbeat row in the store says how it goes: mx sync writes it every minute, and after
- * every pass and check and on every change of mode.
+ * what the deltas missed. A folder or a message Graph refuses is skipped and named in the heartbeat, and Graph's other
+ * failures wait for the next pass or check, so only a failure the user must fix stops mx sync. The heartbeat row in the
+ * store says how it goes: mx sync writes it every minute, and after every pass and check and on every change of mode.
  */
 export class Watch extends Context.Service<
 	Watch,
 	{
 		/**
-		 * Runs until a pass fails with anything but an outage, and records that failure in the heartbeat first; ending it
-		 * deletes this run's subscriptions.
+		 * Runs until the sign-in expires or the secret store fails, and records that failure in the heartbeat first; ending
+		 * it deletes this run's subscriptions.
 		 */
-		readonly run: Effect.Effect<never, GraphError>;
+		readonly run: Effect.Effect<never, LoginRequired | CredentialFailed>;
 	}
 >()("mx/watch") {
 	static readonly layerNoDeps = Layer.effect(
@@ -189,21 +201,26 @@ export class Watch extends Context.Service<
 			const firstPass = yield* Latch.make();
 
 			/**
-			 * Records how a pass or a check went in the heartbeat, and answers whether it succeeded; an outage is logged and
-			 * waits for the next one.
+			 * Records how a pass or a check went in the heartbeat, with what it skipped, and answers whether it succeeded. A
+			 * refusal or an outage that stops it is logged and waits for the next one.
 			 */
-			const recorded = (work: Effect.Effect<void, GraphError>) =>
-				work.pipe(
-					Effect.andThen(currentInstant),
-					Effect.flatMap((at) =>
-						Ref.set(outcome, {
-							error: Option.none(),
-							lastSuccess: Option.some(at),
-						})
-					),
-					Effect.andThen(beat),
-					Effect.as(true),
-					Effect.catchTag("MicrosoftUnavailable", (error) =>
+			const recorded = (work: Effect.Effect<readonly Skipped[], GraphError>) =>
+				Effect.gen(function* () {
+					const skipped = yield* work;
+					const error = Arr.isReadonlyArrayNonEmpty(skipped)
+						? Option.some(skippedLine(skipped))
+						: Option.none<string>();
+					if (Option.isSome(error)) {
+						yield* Effect.logWarning(error.value);
+					}
+					yield* Ref.set(outcome, {
+						error,
+						lastSuccess: Option.some(yield* currentInstant),
+					});
+					yield* beat;
+					return true;
+				}).pipe(
+					Effect.catchTag(["GraphRefused", "MicrosoftUnavailable"], (error) =>
 						Effect.andThen(
 							Effect.logWarning(error.message),
 							recordError(error.message)
@@ -220,7 +237,8 @@ export class Watch extends Context.Service<
 								? Effect.logInfo(summary(done))
 								: Effect.void
 						),
-						Effect.andThen(firstPass.open)
+						Effect.tap(firstPass.open),
+						Effect.map((done) => done.skipped)
 					)
 				);
 
@@ -456,9 +474,9 @@ export class Watch extends Context.Service<
 			const reconcile = firstPass.await.pipe(
 				Effect.andThen(
 					recorded(
-						Effect.flatMap(sync.reconcile, (done) =>
+						Effect.tap(sync.reconcile, (done) =>
 							Effect.logInfo(reconcileSummary(done))
-						)
+						).pipe(Effect.map((done) => done.skipped))
 					).pipe(
 						Effect.flatMap((succeeded) =>
 							Effect.sleep(

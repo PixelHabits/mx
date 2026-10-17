@@ -2170,6 +2170,65 @@ describe("mx", () => {
 			Effect.provide(TestClock.layer())
 		));
 
+	test("a folder deleted while mx sync reads it is skipped and named in mx status, sync goes on, and the next folder listing drops it", () =>
+		Effect.gen(function* () {
+			microsoft.addFolder("folder-seeds", "Seed library", "folder-root");
+			microsoft.addFolder("folder-tools", "Tool shed", "folder-root");
+			yield* cli("sync", "--once");
+			const ended = microsoft.roundsEnded.length;
+			const listed = idListings().length;
+			microsoft.hold("folder-seeds");
+			microsoft.hold("folder-tools", { ids: true });
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"the pass reading the folders it listed",
+				() => microsoft.roundsEnded.length > ended
+			);
+			microsoft.removeFolder("folder-seeds");
+			microsoft.release("folder-seeds");
+			const lastError = (text: string) =>
+				Effect.map(status, ({ output }) =>
+					output.includes(`Last error: ${text}`)
+				);
+			yield* eventually(
+				"the pass that skipped Seed library",
+				lastError(
+					"Skipped folder Seed library: Microsoft Graph refused the request with 404 ErrorItemNotFound"
+				)
+			);
+			yield* eventually(
+				"the check listing the folders",
+				() => idListings().length > listed
+			);
+			microsoft.removeFolder("folder-tools");
+			microsoft.release("folder-tools", { ids: true });
+			yield* eventually(
+				"the check that skipped Tool shed",
+				lastError(
+					"Skipped folder Tool shed: Microsoft Graph refused the request with 404 ErrorItemNotFound"
+				)
+			);
+			yield* eventually(
+				"the next pass",
+				TestClock.adjust("60 seconds").pipe(Effect.andThen(lastError("none")))
+			);
+			yield* Fiber.interrupt(service);
+			for (const folder of ["Seed library", "Tool shed"]) {
+				expect(yield* refusal("search", { folder })).toContain(
+					`No folder named ${folder}.`
+				);
+			}
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release("folder-seeds");
+					microsoft.release("folder-tools", { ids: true });
+				})
+			),
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test, its mx sync and mx status run on.
+			Effect.provide(TestClock.layer())
+		));
+
 	test("a check against Graph that fails runs again an hour later, not a day later", () =>
 		Effect.gen(function* () {
 			const asked = inboxIdListings();

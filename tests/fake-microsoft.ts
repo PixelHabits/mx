@@ -864,6 +864,13 @@ export class FakeMicrosoft {
 			return json({ value: this.foldersUnder("folder-root") });
 		}
 		const folderId = wellKnown[id] ?? id;
+		if (!this.folders.has(folderId)) {
+			return graphError(
+				404,
+				"ErrorItemNotFound",
+				"The specified object was not found in the store."
+			);
+		}
 		if (action === "childFolders") {
 			return json({ value: this.foldersUnder(folderId) });
 		}

@@ -2,12 +2,14 @@ import {
 	Array as Arr,
 	Context,
 	Effect,
+	identity,
 	Layer,
 	Option,
 	Result,
 	Semaphore,
 	SynchronizedRef,
 } from "effect";
+import type { GraphRefused } from "./errors.ts";
 import type { DeltaPage, Message } from "./graph/api.ts";
 import { Graph, type GraphError, isNotFound } from "./graph/graph.ts";
 import { Store } from "./store.ts";
@@ -19,17 +21,35 @@ import { Store } from "./store.ts";
  */
 const folderConcurrency = 3;
 
-/** What one pass changed in the store. */
+/**
+ * A folder or a message that a pass or a check skipped because Graph refused a request about it, as for a folder deleted
+ * after the folder listing named it. The next pass or check tries it again, and the next listing drops a deleted folder.
+ */
+export interface Skipped {
+	/** What it skipped, as the user reads it: `folder Archive` or `a message`. */
+	readonly item: string;
+	readonly refused: GraphRefused;
+}
+
+/** The line mx sync records for what a pass or a check skipped: the first, and how many more. */
+export const skippedLine = ([
+	first,
+	...others
+]: Arr.NonEmptyReadonlyArray<Skipped>) =>
+	`Skipped ${first.item}: ${first.refused.message}${others.length === 0 ? "" : ` (and ${others.length} more)`}`;
+
+/** What one pass changed in the store, and what it skipped. */
 export interface Pass {
 	readonly folders: number;
 	readonly removed: number;
 	readonly saved: number;
+	readonly skipped: readonly Skipped[];
 }
 
 export const summary = ({ folders, removed, saved }: Pass) =>
 	`Synced ${folders} folders: ${saved} messages saved, ${removed} removed.`;
 
-/** What a check of the store against Graph repaired. */
+/** What a check of the store against Graph repaired, and what it skipped. */
 export interface Reconciled {
 	/** Messages Graph holds that the store lacked. */
 	readonly added: number;
@@ -38,6 +58,7 @@ export interface Reconciled {
 	readonly refiled: number;
 	/** Messages the store held that Graph no longer has. */
 	readonly removed: number;
+	readonly skipped: readonly Skipped[];
 }
 
 export const reconcileSummary = ({
@@ -64,6 +85,21 @@ const isRemoved = (entry: Entry): entry is Exclude<Entry, Message> =>
 	"@removed" in entry;
 
 const noProgress = () => Effect.void;
+
+/** `work`, or `item` skipped when Graph refuses it; every other failure still fails. */
+const unlessRefused = <A>(
+	item: string,
+	work: Effect.Effect<A, GraphError>
+): Effect.Effect<
+	Result.Result<A, Skipped>,
+	Exclude<GraphError, GraphRefused>
+> =>
+	work.pipe(
+		Effect.map(Result.succeed),
+		Effect.catchTag("GraphRefused", (refused) =>
+			Effect.succeed(Result.fail({ item, refused }))
+		)
+	);
 
 type Repair = "added" | "refiled" | "removed" | "unchanged";
 
@@ -154,14 +190,19 @@ export class Sync extends Context.Service<
 				return current;
 			});
 
-			/** One delta round for the folder, every page, from its saved link or from the start; `fetched` hears each page. */
+			/**
+			 * One delta round for the folder, every page, from its saved link or from the start; `fetched` hears each page. A
+			 * message whose lookup Graph refuses is skipped, and so is the folder when Graph refuses its delta.
+			 */
 			const round = (
-				folderId: string,
+				folder: { readonly id: string; readonly name: string },
 				link: Option.Option<string>,
 				fetched: (messages: number) => Effect.Effect<void>
-			): Effect.Effect<{ removed: number; saved: number }, GraphError> =>
+			): Effect.Effect<Omit<Pass, "folders">, GraphError> =>
 				Effect.gen(function* () {
+					const folderId = folder.id;
 					const kept: string[] = [];
+					const skipped: Skipped[] = [];
 					let next = link;
 					let deltaLink: string | undefined;
 					let saved = 0;
@@ -184,11 +225,10 @@ export class Sync extends Context.Service<
 							)
 						);
 						// Graph may have read this page before a move that the store already holds, so Graph says where each one is.
-						yield* Effect.forEach(
-							filedElsewhere,
-							(message) => locate(message.id),
-							{ discard: true }
+						const located = yield* Effect.forEach(filedElsewhere, (message) =>
+							unlessRefused("a message", locate(message.id))
 						);
+						skipped.push(...Arr.getFailures(located));
 						yield* fetched(present.length);
 						kept.push(...Arr.map(present, (message) => message.id));
 						saved += present.length;
@@ -209,12 +249,16 @@ export class Sync extends Context.Service<
 							store.setDeltaLink(folderId, deltaLink)
 						)
 					);
-					return { removed, saved };
+					return { removed, saved, skipped };
 				}).pipe(
 					Effect.catchTag("GraphRefused", (refused) =>
 						refused.status === 410 && Option.isSome(link)
-							? round(folderId, Option.none(), fetched)
-							: Effect.fail(refused)
+							? round(folder, Option.none(), fetched)
+							: Effect.succeed({
+									removed: 0,
+									saved: 0,
+									skipped: [{ item: `folder ${folder.name}`, refused }],
+								})
 					)
 				);
 
@@ -266,7 +310,11 @@ export class Sync extends Context.Service<
 				const changes = yield* Effect.forEach(
 					rounds,
 					({ folder, link }) =>
-						round(folder.id, link, Option.isNone(link) ? fetched : noProgress),
+						round(
+							{ id: folder.id, name: folder.displayName },
+							link,
+							Option.isNone(link) ? fetched : noProgress
+						),
 					{ concurrency: folderConcurrency }
 				);
 				return {
@@ -277,39 +325,68 @@ export class Sync extends Context.Service<
 						(total, { removed }) => total + removed
 					),
 					saved: Arr.reduce(changes, 0, (total, { saved }) => total + saved),
+					skipped: Arr.flatMap(changes, ({ skipped }) => skipped),
 				};
 			}, oneAtATime.withPermits(1));
 
 			const reconcile = Effect.gen(function* () {
 				const folders = yield* listFolders;
-				const listed = yield* Effect.forEach(
+				const listings = yield* Effect.forEach(
 					folders,
 					(folder) =>
 						Effect.map(
-							graph.messageIds(folder.id),
-							Arr.map((id) => [id, folder.id] as const)
+							unlessRefused(
+								`folder ${folder.displayName}`,
+								graph.messageIds(folder.id)
+							),
+							Result.mapBoth({
+								onFailure: (skipped) => ({ folderId: folder.id, skipped }),
+								onSuccess: Arr.map((id) => [id, folder.id] as const),
+							})
 						),
 					{ concurrency: folderConcurrency }
 				);
+				const [listed, unlisted] = Arr.partition(listings, identity);
 				const inGraph = new Map(Arr.flatten(listed));
 				const inStore = yield* store.placements;
+				const refusedFolders = new Set(
+					Arr.map(unlisted, ({ folderId }) => folderId)
+				);
+				// A folder Graph refused to list says nothing about the messages the store files in it.
+				const inListedFolders = Arr.filter(
+					[...inStore],
+					([, folderId]) => !refusedFolders.has(folderId)
+				);
 				const differ = Arr.filter(
-					[...new Set([...inGraph.keys(), ...inStore.keys()])],
+					[
+						...new Set([
+							...inGraph.keys(),
+							...Arr.map(inListedFolders, ([id]) => id),
+						]),
+					],
 					(id) => inGraph.get(id) !== inStore.get(id)
 				);
 				const repairs = yield* Effect.forEach(
 					differ,
 					(id) =>
-						Effect.map(locate(id), (now) => repairOf(inStore.get(id), now)),
+						unlessRefused(
+							"a message",
+							Effect.map(locate(id), (now) => repairOf(inStore.get(id), now))
+						),
 					{ concurrency: folderConcurrency }
 				);
 				const count = (wanted: Repair) =>
-					Arr.filter(repairs, (repair) => repair === wanted).length;
+					Arr.filter(Arr.getSuccesses(repairs), (repair) => repair === wanted)
+						.length;
 				return {
 					added: count("added"),
 					folders: folders.length,
 					refiled: count("refiled"),
 					removed: count("removed"),
+					skipped: [
+						...Arr.map(unlisted, ({ skipped }) => skipped),
+						...Arr.getFailures(repairs),
+					],
 				};
 			}).pipe(oneAtATime.withPermits(1), Effect.withSpan("Sync.reconcile"));
 
@@ -331,7 +408,7 @@ export class Sync extends Context.Service<
 					return yield* passWithProgress(noProgress);
 				}
 				const changed = yield* round(
-					folderId,
+					folder.value,
 					folder.value.deltaLink,
 					noProgress
 				).pipe(oneAtATime.withPermits(1));
