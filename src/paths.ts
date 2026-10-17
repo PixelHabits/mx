@@ -1,5 +1,8 @@
 import { Config, Context, Effect, Layer, Option, Path } from "effect";
 
+/** Where the Arch package installs mx; pacman owns the binary there and the sync unit beside it. */
+const packagedBin = "/usr/bin/mx";
+
 /** An XDG base directory, or its default below `$HOME` when the variable is unset or empty. */
 const xdg = (name: string, home: string, fallback: string) =>
 	Config.option(Config.NonEmptyString(name)).pipe(
@@ -20,8 +23,10 @@ export class Paths extends Context.Service<
 		readonly database: string;
 		/** `$XDG_STATE_HOME/mx`, or `%LOCALAPPDATA%\mx\state`, for the sign-in file and the sync log. */
 		readonly state: string;
-		/** The installed binary: `~/.local/bin/mx`, or `%LOCALAPPDATA%\Programs\mx\mx.exe`. */
+		/** The installed binary: `~/.local/bin/mx`, `/usr/bin/mx` from the Arch package, or `%LOCALAPPDATA%\Programs\mx\mx.exe`. */
 		readonly bin: string;
+		/** Whether mx runs from the Arch package, which owns the binary and the sync unit, so pacman installs and updates them. */
+		readonly packaged: boolean;
 		/** `$XDG_CONFIG_HOME`, or `%APPDATA%` on Windows, where other programs keep their settings. */
 		readonly config: string;
 		/** The user's home folder. */
@@ -46,6 +51,7 @@ export class Paths extends Context.Service<
 				data: path.join(root, "data"),
 				database: path.join(root, "data", "mx.sqlite"),
 				home,
+				packaged: false,
 				state: path.join(root, "state"),
 			});
 		}
@@ -56,14 +62,16 @@ export class Paths extends Context.Service<
 			data: xdg("XDG_DATA_HOME", home, ".local/share"),
 			state: xdg("XDG_STATE_HOME", home, ".local/state"),
 		});
+		const packaged = path.resolve(process.execPath) === packagedBin;
 		return Paths.of({
-			bin: path.join(home, ".local", "bin", "mx"),
+			bin: packaged ? packagedBin : path.join(home, ".local", "bin", "mx"),
 			cache: path.join(cache, "mx"),
 			config,
 			configFile: path.join(config, "mx", "config.json"),
 			data: path.join(data, "mx"),
 			database: path.join(data, "mx", "mx.sqlite"),
 			home,
+			packaged,
 			state: path.join(state, "mx"),
 		});
 	});

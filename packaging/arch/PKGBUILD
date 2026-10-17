@@ -1,0 +1,33 @@
+# Builds mx from the committed HEAD of this checkout: cd packaging/arch && makepkg -si
+pkgname=mx
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A local copy of a Microsoft 365 mailbox, served to AI agents over MCP'
+arch=('x86_64')
+license=('LicenseRef-unlicensed')
+# What the binary links, as ldd shows it: Arch's Bun runtime uses the system ICU.
+depends=('glibc' 'icu' 'libgcc' 'libstdc++')
+makedepends=('bun' 'git')
+optdepends=('cloudflared: Graph push notifications; without it, mx downloads its own')
+# Stripping a Bun executable cuts off the program it carries.
+options=('!strip' '!debug')
+source=("mx::git+file://${startdir%/packaging/arch}")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd mx
+	sed -n 's/^\t"version": "\(.*\)",$/\1/p' package.json
+}
+
+build() {
+	cd mx
+	bun install --frozen-lockfile --production --ignore-scripts
+	bun run build linux-x64
+}
+
+package() {
+	cd mx
+	install -Dm755 dist/mx-linux-x64 "$pkgdir/usr/bin/mx"
+	install -dm755 "$pkgdir/usr/lib/systemd/user"
+	bun scripts/unit.ts /usr/bin/mx >"$pkgdir/usr/lib/systemd/user/mx-sync.service"
+}

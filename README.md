@@ -37,6 +37,18 @@ The binary goes to `~/.local/bin/mx`. The sync service is the systemd user unit 
 journalctl --user -u mx-sync -f
 ```
 
+### Arch Linux
+
+`packaging/arch/PKGBUILD` builds mx with Bun from the committed HEAD of this checkout:
+
+```sh
+cd ~/Developer/mx/packaging/arch
+makepkg -si
+mx install
+```
+
+The package owns `/usr/bin/mx` and the systemd user unit `/usr/lib/systemd/user/mx-sync.service`, so pacman installs, updates and removes them. Run from `/usr/bin/mx`, `mx install` registers that binary with each agent and enables the unit, and copies no binary and writes no unit. `mx update` refuses and says to update with pacman, and `mx sync` logs the same instead of updating. `mx uninstall` disables the unit and removes the rest of mx; `pacman -R mx` removes the package.
+
 ### Windows
 
 Download `mx-windows-x64.exe` from the latest GitHub release, then run it from a terminal:

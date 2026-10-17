@@ -1,5 +1,5 @@
 import { BunRuntime } from "@effect/platform-bun";
-import { Console, Effect } from "effect";
+import { Array as Arr, Console, Effect } from "effect";
 import { pemContents } from "../src/update.ts";
 
 /** The release key's public half, committed; its private half never enters the repository. */
@@ -50,10 +50,12 @@ export const targets = [
  * otherwise, and the bundle uses `import.meta`, so the format is ESM. The binary reads no `.env` or `bunfig.toml` from
  * the folder it runs in, and no environment variable is inlined.
  */
-export const build = Effect.gen(function* () {
+const compile = Effect.fnUntraced(function* (
+	chosen: readonly (typeof targets)[number][]
+) {
 	yield* checkPublicKey;
 	yield* Effect.forEach(
-		targets,
+		chosen,
 		({ outfile, target }) =>
 			Effect.promise(() =>
 				Bun.build({
@@ -75,6 +77,28 @@ export const build = Effect.gen(function* () {
 	);
 });
 
+export const build = compile(targets);
+
+/** `bun run build linux-x64` builds only the platforms it names, as the Arch package does. */
+const platformsNamed = Effect.gen(function* () {
+	const named = Bun.argv.slice(2);
+	const unknown = Arr.filter(
+		named,
+		(name) => !Arr.some(targets, ({ platform }) => platform === name)
+	);
+	if (Arr.isArrayNonEmpty(unknown)) {
+		return yield* Effect.die(
+			`Unknown platform ${Arr.join(unknown, ", ")}; mx builds ${Arr.join(
+				Arr.map(targets, ({ platform }) => platform),
+				", "
+			)}.`
+		);
+	}
+	return Arr.isArrayNonEmpty(named)
+		? Arr.filter(targets, ({ platform }) => named.includes(platform))
+		: targets;
+});
+
 if (import.meta.main) {
-	BunRuntime.runMain(build);
+	BunRuntime.runMain(Effect.flatMap(platformsNamed, compile));
 }

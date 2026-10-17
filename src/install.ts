@@ -31,7 +31,8 @@ import {
 /** The systemd user unit that runs `mx sync` from login to logout. */
 const unitName = "mx-sync.service";
 
-const unit = (bin: string) => `[Unit]
+/** Its text, for `mx sync` from `bin`; the Arch package ships it for `/usr/bin/mx`. */
+export const unit = (bin: string) => `[Unit]
 Description=mx: keep the local copy of the mailbox in step with Microsoft Graph
 
 [Service]
@@ -130,7 +131,8 @@ export class Installer extends Context.Service<
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 			const credentials = yield* Credentials;
 			const auth = yield* Auth;
-			const { bin, cache, config, configFile, data, state } = yield* Paths;
+			const { bin, cache, config, configFile, data, packaged, state } =
+				yield* Paths;
 			const offered = yield* agents;
 			const windows = process.platform === "win32";
 			const folder = path.dirname(bin);
@@ -285,12 +287,15 @@ export class Installer extends Context.Service<
 						"/f",
 					])
 				: Effect.gen(function* () {
-						yield* fs
-							.makeDirectory(path.dirname(unitFile), { recursive: true })
-							.pipe(Effect.mapError(failed(`Could not create ${unitFile}`)));
-						yield* fs
-							.writeFileString(unitFile, unit(bin))
-							.pipe(Effect.mapError(failed(`Could not write ${unitFile}`)));
+						// The Arch package ships the unit in /usr/lib/systemd/user.
+						if (!packaged) {
+							yield* fs
+								.makeDirectory(path.dirname(unitFile), { recursive: true })
+								.pipe(Effect.mapError(failed(`Could not create ${unitFile}`)));
+							yield* fs
+								.writeFileString(unitFile, unit(bin))
+								.pipe(Effect.mapError(failed(`Could not write ${unitFile}`)));
+						}
 						yield* run("systemctl", ["--user", "daemon-reload"]);
 						yield* run("systemctl", ["--user", "enable", unitName]);
 					});
@@ -306,9 +311,11 @@ export class Installer extends Context.Service<
 						yield* run("systemctl", ["--user", "disable", "--now", unitName], {
 							allowFailure: true,
 						});
-						yield* fs
-							.remove(unitFile, { force: true })
-							.pipe(Effect.mapError(failed(`Could not delete ${unitFile}`)));
+						if (!packaged) {
+							yield* fs
+								.remove(unitFile, { force: true })
+								.pipe(Effect.mapError(failed(`Could not delete ${unitFile}`)));
+						}
 						yield* run("systemctl", ["--user", "daemon-reload"]);
 					});
 
@@ -600,8 +607,49 @@ export class Installer extends Context.Service<
 				what: `${folder} in your PATH`,
 			};
 
-			/** What mx install wrote of the program. */
+			/** What starts `mx sync` at sign-in, as `mx uninstall` removes it; stopping sync comes with it. */
+			const syncRegistration = Effect.gen(function* () {
+				if (packaged) {
+					return [
+						{
+							remove: Effect.andThen(
+								unregisterSync,
+								Console.log(
+									`Stopped mx sync and disabled ${unitName}. pacman -R mx removes ${bin} and the unit.`
+								)
+							),
+							what: `the start of mx sync at sign-in: systemctl --user disable ${unitName}`,
+						},
+					];
+				}
+				if (windows) {
+					return [
+						{
+							remove: Effect.andThen(
+								unregisterSync,
+								Console.log("Stopped mx sync and removed its registration.")
+							),
+							what: `the mx value under ${runKey}, which starts mx sync at sign-in`,
+						},
+					];
+				}
+				return Arr.map(
+					yield* removeFile("the sync unit", unitFile),
+					(removal): Removal => ({
+						remove: Effect.andThen(
+							unregisterSync,
+							Console.log(`Stopped mx sync and removed ${unitFile}.`)
+						),
+						what: removal.what,
+					})
+				);
+			});
+
+			/** What mx install wrote of the program; none when the package owns the binary. */
 			const programRemovals = Effect.gen(function* () {
+				if (packaged) {
+					return [];
+				}
 				if (windows) {
 					return [removeFromPath, ...(yield* removeWindowsProgram)];
 				}
@@ -641,26 +689,7 @@ export class Installer extends Context.Service<
 			 * on a tunnel that is gone.
 			 */
 			const removals = Effect.gen(function* () {
-				const registration: readonly Removal[] = windows
-					? [
-							{
-								remove: Effect.andThen(
-									unregisterSync,
-									Console.log("Stopped mx sync and removed its registration.")
-								),
-								what: `the mx value under ${runKey}, which starts mx sync at sign-in`,
-							},
-						]
-					: Arr.map(
-							yield* removeFile("the sync unit", unitFile),
-							(removal): Removal => ({
-								remove: Effect.andThen(
-									unregisterSync,
-									Console.log(`Stopped mx sync and removed ${unitFile}.`)
-								),
-								what: removal.what,
-							})
-						);
+				const registration = yield* syncRegistration;
 				const signInRemoval: readonly Removal[] = (yield* signedIn)
 					? [
 							{

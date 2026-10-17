@@ -79,7 +79,7 @@ export class Updater extends Context.Service<
 		Effect.gen(function* () {
 			const installer = yield* Installer;
 			const fs = yield* FileSystem.FileSystem;
-			const { bin } = yield* Paths;
+			const { bin, packaged } = yield* Paths;
 			const http = policy(yield* HttpClient.HttpClient, {
 				deadline: downloadDeadline,
 			});
@@ -107,6 +107,11 @@ export class Updater extends Context.Service<
 				);
 
 			const update = Effect.gen(function* () {
+				if (packaged) {
+					return yield* failed(
+						"mx came from the Arch package; update it with pacman."
+					);
+				}
 				if (!(yield* fs.exists(bin).pipe(Effect.orDie))) {
 					return yield* failed(
 						`mx is not installed at ${bin}; run mx install first.`

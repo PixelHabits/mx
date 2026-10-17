@@ -34,7 +34,11 @@ import {
 	verificationUri,
 } from "./fake-microsoft.ts";
 import { FakeProcesses } from "./fake-processes.ts";
-import { FakeReleases, releasesPath } from "./fake-releases.ts";
+import {
+	FakeReleases,
+	isReleaseRequest,
+	releasesPath,
+} from "./fake-releases.ts";
 import { FakeSecrets } from "./fake-secrets.ts";
 import { connect, McpClient } from "./mcp-client.ts";
 
@@ -263,6 +267,9 @@ const onWindows = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 			})
 	);
 
+/** Where the Arch package installs mx. */
+const packaged = "/usr/bin/mx";
+
 /** Runs `effect` as if mx ran from the binary `exe`; mx reads `process.execPath` as it builds its layers. */
 const runningAs =
 	(exe: string) =>
@@ -279,6 +286,9 @@ const runningAs =
 					Object.defineProperty(process, "execPath", { value: actual });
 				})
 		);
+
+/** Runs `effect` as if mx ran from the Arch package's binary. */
+const fromPackage = runningAs(packaged);
 
 /** `platform` where the process dies 4 bytes into each write into `folder`, as when the machine stops mid-write. */
 const cutOffWrites = (folder: string) =>
@@ -2099,6 +2109,59 @@ describe("mx", () => {
 				expect(yield* fs.exists(path)).toBe(false);
 			}
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
+		}));
+
+	test("mx install from the Arch package copies no binary and writes no unit, enables the package's unit and registers /usr/bin/mx", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* fs.makeDirectory(`${home}/.codex`, { recursive: true });
+			yield* fs.writeFileString(codexConfig, codexSettings);
+			const before = processes.commands.length;
+			yield* fromPackage(cli("install", "--agent", "codex"));
+			expect(
+				Arr.map(processes.commands.slice(before), (command) =>
+					Arr.join(command, " ")
+				)
+			).toEqual([
+				"systemctl --user daemon-reload",
+				"systemctl --user enable mx-sync.service",
+				"systemctl --user restart --no-block mx-sync.service",
+			]);
+			expect(yield* fs.exists(installed)).toBe(false);
+			expect(yield* fs.exists(unitFile)).toBe(false);
+			expect(yield* fs.readFileString(codexConfig)).toContain(
+				`command = "${packaged}"`
+			);
+		}));
+
+	test("mx update from the Arch package refuses, says to update with pacman, and fetches no release", () =>
+		Effect.gen(function* () {
+			const asked = Arr.filter(microsoft.received, (request) =>
+				isReleaseRequest(request.url)
+			).length;
+			const failure = yield* Effect.flip(fromPackage(cli("update")));
+			expect(failure.message).toContain("pacman");
+			expect(
+				Arr.filter(microsoft.received, (request) =>
+					isReleaseRequest(request.url)
+				)
+			).toHaveLength(asked);
+		}));
+
+	test("mx uninstall --yes from the Arch package disables the unit and leaves the binary and the unit to pacman", () =>
+		Effect.gen(function* () {
+			const before = processes.commands.length;
+			const { output } = yield* fromPackage(cli("uninstall", "--yes"));
+			expect(
+				Arr.map(processes.commands.slice(before), (command) =>
+					Arr.join(command, " ")
+				)
+			).toEqual([
+				"systemctl --user disable --now mx-sync.service",
+				"systemctl --user daemon-reload",
+			]);
+			expect(output).toContain("pacman -R mx");
+			expect(output).not.toContain(`Removed ${packaged}`);
 		}));
 
 	test("mx install on Windows adds the program folder to the user PATH once and keeps every other entry, and mx uninstall takes out only that folder", () =>
