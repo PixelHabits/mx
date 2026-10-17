@@ -6,6 +6,7 @@ import {
 	Config,
 	ConfigProvider,
 	Context,
+	Duration,
 	Effect,
 	Exit,
 	Fiber,
@@ -687,6 +688,57 @@ const writeJson = (file: string, value: unknown) =>
 	Effect.flatMap(FileSystem.FileSystem, (fs) =>
 		fs.writeFileString(file, JSON.stringify(value, null, 2))
 	);
+
+/**
+ * `platform` on a machine where mx never synced: a store of its own, and Claude Code's config in a folder of its own,
+ * since on Windows the store sits below the same folder as the installed program.
+ */
+const neverSynced = (name: string) =>
+	Effect.gen(function* () {
+		const root = join(home, name);
+		const claude = join(root, "claude");
+		yield* (yield* FileSystem.FileSystem).makeDirectory(claude, {
+			recursive: true,
+		});
+		yield* writeJson(join(claude, ".claude.json"), { numStartups: 1 });
+		return platformWith({
+			...environment,
+			CLAUDE_CONFIG_DIR: claude,
+			LOCALAPPDATA: join(root, "Local"),
+			XDG_DATA_HOME: join(root, "data"),
+		});
+	});
+
+/** The messages Graph holds in every folder now. */
+const mailboxSize = () =>
+	Arr.reduce(
+		allFolders,
+		0,
+		(total, folder) => total + microsoft.inFolder(folder).length
+	);
+
+/** Runs `effect` on the test clock, which moves on 10 seconds whenever the work has waited a moment of real time. */
+const onTestClock = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+	Effect.raceFirst(
+		effect,
+		Effect.forever(
+			Effect.andThen(settleBriefly, TestClock.adjust("10 seconds"))
+		)
+	).pipe(
+		// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one mx process runs on.
+		Effect.provide(TestClock.layer())
+	);
+
+/** Microsoft accepts refresh tokens again. */
+const acceptRefresh = Effect.sync(() => {
+	microsoft.refuseRefresh = false;
+});
+
+/** Graph answers delta pages at once again, and no program start is watched. */
+const paceAsBefore = Effect.sync(() => {
+	microsoft.deltaDelay = Duration.zero;
+	processes.onSpawn = undefined;
+});
 const secrets_ = /synthetic-(access|refresh)-token|synthetic-device-code/u;
 const ownSentLine = /^#\d+ .* Sent Items \(me\)$/mu;
 const imageLine = /^1 image001\.png .*inline\)$/u;
@@ -706,13 +758,17 @@ const bookClubLine =
 const bookClubReplyLine =
 	/ \| Jonas Example <jonas@example\.com> \| RE: Book club: the next novel \| unread \(\+1 in thread\)$/u;
 const recipeSwapLine = /Recipe swap \| unread \(\+3 in thread\)$/u;
+const rotaInArchiveLine =
+	/ Archive \| Rosa Example <rosa@example\.com> \| Garden plot rota /u;
+const timeLeft = /, (about \d+ min|less than a minute) left/u;
 const lineIn = (id: number, folder: string) =>
 	new RegExp(`^#${id} .* ${folder} \\|`, "u");
 
-/** The people and the notifier of the synthetic mail the search tests add. */
+/** The people and the notifier of the synthetic mail the tests add. */
 const jonas = { address: "jonas@example.com", name: "Jonas Example" };
 const marta = { address: "marta@example.com", name: "Marta Example" };
 const priya = { address: "priya@example.com", name: "Priya Example" };
+const rosa = { address: "rosa@example.com", name: "Rosa Example" };
 const alerts = { address: "alerts@example.com", name: "Backup Notifier" };
 
 /** A nightly backup that failed, by the day of October it failed and the share it backed up. */
@@ -1199,6 +1255,20 @@ describe("mx", () => {
 			expect(refreshes.at(-1)?.get("refresh_token")).toBe(issued(2));
 			expect(yield* savedRefreshToken).toBe(issued(1));
 		}));
+
+	test("a pass syncs up to 3 folders at once and no more", () =>
+		Effect.gen(function* () {
+			microsoft.deltaDelay = Duration.millis(100);
+			microsoft.mostDeltasAtOnce = 0;
+			yield* cli("sync", "--once");
+			expect(microsoft.mostDeltasAtOnce).toBe(3);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.deltaDelay = Duration.zero;
+				})
+			)
+		));
 
 	test("search finds by words in the subject, the sender and the new text, with folder, from and since filters", () =>
 		Effect.gen(function* () {
@@ -1690,6 +1760,90 @@ describe("mx", () => {
 			expect(next).not.toBe(sent);
 		}));
 
+	test("a message that moves while its old folder's delta page is on the way stays in the folder it moved to", () =>
+		Effect.gen(function* () {
+			const rota = microsoft.deliver({
+				body: "Who waters the tomatoes this week?",
+				conversationId: "conversation-garden",
+				from: rosa,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-07T07:00:00Z",
+				subject: "Garden plot rota",
+			});
+			const asked = deltaRequests("folder-inbox");
+			const ended = microsoft.roundsEnded.length;
+			microsoft.hold("folder-inbox", { answered: true });
+			microsoft.hold("folder-archive");
+			const pass = yield* Effect.forkChild(cli("sync", "--once"));
+			yield* eventually(
+				"the Inbox page that still holds the message",
+				() => deltaRequests("folder-inbox") > asked
+			);
+			microsoft.move(rota.id, "folder-archive");
+			microsoft.release("folder-archive");
+			yield* eventually("the Archive round", () =>
+				microsoft.roundsEnded.slice(ended).includes("folder-archive")
+			);
+			microsoft.release("folder-inbox");
+			yield* Fiber.join(pass);
+			yield* cli("sync", "--once");
+			expect(yield* tool("search", { query: "tomatoes" })).toMatch(
+				rotaInArchiveLine
+			);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release("folder-inbox");
+					microsoft.release("folder-archive");
+				})
+			)
+		));
+
+	test("a message mx mcp moves while mx sync looks it up stays where mx mcp moved it", () =>
+		Effect.gen(function* () {
+			const ledger = microsoft.deliver({
+				body: "The water fund stands at forty pounds.",
+				conversationId: "conversation-ledger",
+				from: rosa,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-07T08:00:00Z",
+				subject: "Water fund ledger",
+			});
+			yield* cli("sync", "--once");
+			const id = idOf(yield* tool("search", { query: "ledger" }), "ledger");
+			const reads = () =>
+				Arr.filter(
+					graphRequests(`/me/messages/${ledger.id}`),
+					(request) => request.method === "GET"
+				).length;
+			const before = reads();
+			// The Archive page brings the move while the store still files the message in Inbox, so mx sync looks it up.
+			microsoft.move(ledger.id, "folder-archive");
+			microsoft.hold("folder-inbox");
+			microsoft.holdRead(ledger.id);
+			const pass = yield* Effect.forkChild(cli("sync", "--once"));
+			yield* eventually(
+				"mx sync looking the message up",
+				() => reads() > before
+			);
+			expect(yield* tool("update", { ids: [id], move_to: "Projects" })).toMatch(
+				lineIn(id, "Inbox/Projects")
+			);
+			microsoft.releaseReads();
+			microsoft.release("folder-inbox");
+			yield* Fiber.join(pass);
+			expect(yield* tool("message", { id })).toMatch(
+				lineIn(id, "Inbox/Projects")
+			);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.releaseReads();
+					microsoft.release("folder-inbox");
+				})
+			)
+		));
+
 	test("mx sync deletes stale subscriptions and subscribes Inbox and Sent Items for created, updated and deleted mail through a validated quick tunnel", () =>
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
@@ -1898,7 +2052,7 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			microsoft.throttleEach = 3;
 			microsoft.retryAfter = 50;
-			const before = Arr.map(allFolders, deltaRequests);
+			const ended = microsoft.roundsEnded.length;
 			const asked = microsoft.graphRequests().length;
 			const service = yield* Effect.forkChild(cli("sync"));
 			yield* eventually(
@@ -1911,12 +2065,9 @@ describe("mx", () => {
 				yield* TestClock.adjust("1 minute");
 			}
 			const { output } = yield* status;
-			expect(
-				Arr.every(
-					allFolders,
-					(folder, index) => deltaRequests(folder) > (before[index] ?? 0)
-				)
-			).toBe(false);
+			expect(microsoft.roundsEnded.length - ended).toBeLessThan(
+				allFolders.length
+			);
 			expect(lines(output)[0]).toMatch(runningLine);
 			yield* Fiber.interrupt(service);
 		}).pipe(
@@ -2178,6 +2329,125 @@ describe("mx", () => {
 			expect(yield* fs.readFileString(claudeCodeConfig)).toBe(before);
 		}));
 
+	test("on a machine that never synced, mx install syncs in the foreground before it starts mx sync, on a terminal in one line that counts the messages and the time left", () =>
+		Effect.gen(function* () {
+			const { frames, system } = fakeTerminal(
+				yield* neverSynced("first-sync-terminal"),
+				[]
+			);
+			const total = mailboxSize();
+			const deltasAtEachStart: number[] = [];
+			processes.onSpawn = () => {
+				deltasAtEachStart.push(graphRequests("/messages/delta").length);
+			};
+			microsoft.deltaDelay = Duration.seconds(30);
+			const { output } = yield* cliOn(system)(
+				"install",
+				"--agent",
+				"claude-code"
+			).pipe(onTestClock, withStdoutTerminal(true));
+			expect(frames[0]).toBe(
+				`\rSyncing 6 folders: 0 of ${total} messages\u001b[K`
+			);
+			expect(Arr.some(frames, (frame) => timeLeft.test(frame))).toBe(true);
+			expect(
+				Arr.every(
+					frames.slice(0, -1),
+					(frame) => frame.startsWith("\r") && !frame.includes("\n")
+				)
+			).toBe(true);
+			expect(frames.slice(-2)).toEqual([
+				`\rSynced 6 folders: ${total} messages saved, 0 removed.\u001b[K`,
+				"\n",
+			]);
+			expect(deltasAtEachStart.at(-1)).toBe(
+				graphRequests("/messages/delta").length
+			);
+			expect(lines(output)).toContain("Started mx sync.");
+		}).pipe(Effect.ensuring(paceAsBefore)));
+
+	test("without a terminal, the first sync prints a line when it starts, then one at most every 30 seconds, and the summary", () =>
+		Effect.gen(function* () {
+			const { frames, system } = fakeTerminal(
+				yield* neverSynced("first-sync-plain"),
+				[]
+			);
+			const total = mailboxSize();
+			const before = graphRequests("/messages/delta").length;
+			microsoft.deltaDelay = Duration.seconds(20);
+			const { output } = yield* cliOn(system)(
+				"install",
+				"--agent",
+				"claude-code"
+			).pipe(onTestClock, withStdoutTerminal(false));
+			const pages = graphRequests("/messages/delta").length - before;
+			const progress = Arr.filter(lines(output), (line) =>
+				line.startsWith("Syncing ")
+			);
+			expect(progress[0]).toBe(`Syncing 6 folders: 0 of ${total} messages`);
+			expect(progress.length).toBeGreaterThan(1);
+			expect(progress.length).toBeLessThan(pages);
+			expect(Arr.every(progress.slice(1), (line) => timeLeft.test(line))).toBe(
+				true
+			);
+			expect(lines(output)).toContain(
+				`Synced 6 folders: ${total} messages saved, 0 removed.`
+			);
+			expect(frames).toEqual([]);
+		}).pipe(Effect.ensuring(paceAsBefore)));
+
+	test("mx install stopped during the first sync keeps the folders that finished, and the next mx install resumes them from their delta links and syncs only the rest", () =>
+		Effect.gen(function* () {
+			const system = yield* neverSynced("first-sync-resume");
+			const others = Arr.filter(
+				allFolders,
+				(folder) => folder !== "folder-inbox"
+			);
+			const ended = microsoft.roundsEnded.length;
+			microsoft.hold("folder-inbox");
+			const stopped = yield* Effect.forkChild(
+				withStdoutTerminal(false)(
+					cliOn(system)("install", "--agent", "claude-code")
+				)
+			);
+			yield* eventually("every folder but Inbox synced", () =>
+				Arr.every(others, (folder) =>
+					microsoft.roundsEnded.slice(ended).includes(folder)
+				)
+			);
+			yield* settleBriefly;
+			yield* Fiber.interrupt(stopped);
+			microsoft.release("folder-inbox");
+			const asked = microsoft.graphRequests().length;
+			const { output } = yield* withStdoutTerminal(false)(
+				cliOn(system)("install", "--agent", "claude-code")
+			);
+			const deltas = Arr.filter(
+				microsoft.graphRequests().slice(asked),
+				(request) => request.url.pathname.endsWith("/messages/delta")
+			);
+			const resumed = (folder: string) =>
+				Arr.map(
+					Arr.filter(deltas, (request) =>
+						request.url.pathname.includes(`/${folder}/`)
+					),
+					(request) => request.url.searchParams.has("$deltatoken")
+				);
+			for (const folder of others) {
+				expect(resumed(folder)).toEqual([true]);
+			}
+			expect(resumed("folder-inbox")[0]).toBe(false);
+			expect(lines(output)).toContain(
+				`Syncing 1 folder: 0 of ${microsoft.inFolder("folder-inbox").length} messages`
+			);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release("folder-inbox");
+				})
+			)
+		));
+
 	test("mx install keeps the tool approvals each agent has, presets the recommended ones only where none is set, and writes Claude Code's through a symlink", () =>
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
@@ -2371,7 +2641,7 @@ describe("mx", () => {
 			expect(lines(yield* tool("search", { limit: 1 }))[0]).toBe(
 				"⚠ Sign-in expired. Run mx login."
 			);
-		}));
+		}).pipe(Effect.ensuring(acceptRefresh)));
 
 	test("a refused refresh token fails loudly with run mx login, and no token is ever printed", () =>
 		Effect.gen(function* () {
@@ -2381,7 +2651,7 @@ describe("mx", () => {
 			expect(String(failure)).not.toMatch(secrets_);
 			expect(printed.length).toBeGreaterThan(0);
 			expect(Arr.join(printed, "\n")).not.toMatch(secrets_);
-		}));
+		}).pipe(Effect.ensuring(acceptRefresh)));
 	test("mx uninstall without --yes and without a terminal refuses and removes nothing", () =>
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;

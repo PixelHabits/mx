@@ -28,6 +28,7 @@ import { type InstallFailed, SyncUnhealthy } from "./errors.ts";
 import { Installer, type Removal } from "./install.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
+import { showProgress } from "./progress.ts";
 import { statusReport } from "./status.ts";
 import { Store } from "./store.ts";
 import { Sync, summary } from "./sync.ts";
@@ -151,13 +152,25 @@ const install = Command.make(
 	"install",
 	{ agent: agentFlag, clientId: clientIdFlag, tenant: tenantFlag },
 	({ agent, clientId, tenant }) =>
-		Effect.flatMap(Installer, (installer) =>
-			installer.install({ agents: agent, login: { clientId, tenant } })
-		)
+		Effect.gen(function* () {
+			const { finishedFirstPass, passWithProgress } = yield* Sync;
+			const show = yield* showProgress;
+			yield* (yield* Installer).install({
+				agents: agent,
+				firstSync: Effect.gen(function* () {
+					if (!(yield* finishedFirstPass)) {
+						yield* show(passWithProgress);
+					}
+				}),
+				login: { clientId, tenant },
+			});
+		})
 ).pipe(
-	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
+	Command.provide(
+		Layer.mergeAll(Installer.layer, Sync.layer).pipe(Layer.provide(Paths.layer))
+	),
 	Command.withDescription(
-		"Install this binary for the signed-in user, start mx sync at sign-in, add mx mcp to the MCP config of each agent chosen, and sign in when there is no saved sign-in. Run it again to reinstall."
+		"Install this binary for the signed-in user, start mx sync at sign-in, add mx mcp to the MCP config of each agent chosen, and sign in when there is no saved sign-in. Until mail has synced once, it syncs in the foreground with its progress before it starts mx sync; stopped, it resumes on the next run. Run it again to reinstall."
 	)
 );
 

@@ -28,6 +28,7 @@ import {
 	type FlagStatus,
 	type Folder,
 	FolderPage,
+	folderSelect,
 	GraphApi,
 	GraphErrorBody,
 	type Message,
@@ -43,6 +44,10 @@ export type GraphError =
 	| MicrosoftUnavailable
 	| LoginRequired
 	| CredentialFailed;
+
+/** Graph's 404: the item the request names does not exist (https://learn.microsoft.com/graph/errors). */
+export const isNotFound = (error: GraphError): error is GraphRefused =>
+	error._tag === "GraphRefused" && error.status === 404;
 
 const graphBase = "https://graph.microsoft.com/v1.0";
 
@@ -288,7 +293,7 @@ export class Graph extends Context.Service<
 							: mail
 									.childFolders({
 										params: { id: parent.id },
-										query: { $top: folderPageSize },
+										query: { $select: folderSelect, $top: folderPageSize },
 									})
 									.pipe(
 										settle,
@@ -300,7 +305,7 @@ export class Graph extends Context.Service<
 				});
 
 			const folders = mail
-				.folders({ query: { $top: folderPageSize } })
+				.folders({ query: { $select: folderSelect, $top: folderPageSize } })
 				.pipe(settle, listFolders, Effect.withSpan("Graph.folders"));
 
 			const folder = Effect.fn("Graph.folder")((idOrName: string) =>

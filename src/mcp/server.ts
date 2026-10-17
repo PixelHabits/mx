@@ -25,6 +25,7 @@ import { type Compose, Graph } from "../graph/graph.ts";
 import { Paths } from "../paths.ts";
 import { syncWarning } from "../status.ts";
 import { Store, type Stored, type StoredFolder } from "../store.ts";
+import { Sync } from "../sync.ts";
 import { PlainDateFromString } from "../temporal.ts";
 import {
 	attachmentList,
@@ -379,6 +380,7 @@ export const tools = Layer.effectDiscard(
 	Effect.gen(function* () {
 		const store = yield* Store;
 		const graph = yield* Graph;
+		const sync = yield* Sync;
 		const fs = yield* FileSystem.FileSystem;
 		const path = yield* Path.Path;
 		const { cache } = yield* Paths;
@@ -413,19 +415,16 @@ export const tools = Layer.effectDiscard(
 			return current;
 		});
 
-		/**
-		 * Saves Graph's copy of a message after a write and answers its listing line. A folder the store does not know yet,
-		 * as before the first sync, is added from Graph first.
-		 */
+		/** Looks a message up in Graph after a write, files it and answers its listing line. */
 		const savedLine = Effect.fnUntraced(function* (written: Message) {
-			if (!(yield* store.hasFolder(written.parentFolderId))) {
-				const [folder, sentItems] = yield* Effect.all(
-					[graph.folder(written.parentFolderId), graph.folder("sentitems")],
-					{ concurrency: 2 }
-				);
-				yield* store.saveFolder(folder, folder.id === sentItems.id);
+			yield* sync.locate(written.id);
+			const saved = yield* store.byGraphId(written.id);
+			if (Option.isNone(saved)) {
+				return yield* NotFound.make({
+					message: "The message is no longer in the mailbox.",
+				});
 			}
-			return line(yield* stored(yield* store.save(written)));
+			return line(saved.value);
 		});
 
 		const folderNamed = Effect.fnUntraced(function* (name: string) {
@@ -792,6 +791,6 @@ export const serve = (version: string) =>
 				version,
 			})
 		),
-		Layer.provide(Layer.mergeAll(Graph.layer, Store.layer)),
+		Layer.provide(Layer.mergeAll(Graph.layer, Store.layer, Sync.layer)),
 		Layer.provide(Paths.layer)
 	);

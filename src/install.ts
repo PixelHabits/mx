@@ -19,6 +19,7 @@ import {
 	type MicrosoftUnavailable,
 	type SignInFailed,
 } from "./errors.ts";
+import type { GraphError } from "./graph/graph.ts";
 import { Paths } from "./paths.ts";
 import {
 	deleteAfterExit,
@@ -95,13 +96,18 @@ export interface Removal {
 export class Installer extends Context.Service<
 	Installer,
 	{
-		/** Sets up `agents`, and signs in with `login` when there is no sign-in saved for it. */
+		/**
+		 * Sets up `agents`, signs in with `login` when there is no sign-in saved for it, runs `firstSync` and then starts
+		 * the background `mx sync`.
+		 */
 		readonly install: (options: {
 			readonly agents: readonly AgentId[];
+			/** The sync to run in the foreground once signed in, before mx sync starts in the background. */
+			readonly firstSync: Effect.Effect<void, GraphError>;
 			readonly login: SignInConfig;
 		}) => Effect.Effect<
 			void,
-			InstallFailed | SignInFailed | MicrosoftUnavailable
+			InstallFailed | SignInFailed | MicrosoftUnavailable | GraphError
 		>;
 		/** What `mx uninstall` removes on this machine, in the order it removes them. */
 		readonly removals: Effect.Effect<readonly Removal[], InstallFailed>;
@@ -452,9 +458,11 @@ export class Installer extends Context.Service<
 			const install = Effect.fn("Installer.install")(
 				function* ({
 					agents: chosen,
+					firstSync,
 					login,
 				}: {
 					readonly agents: readonly AgentId[];
+					readonly firstSync: Effect.Effect<void, GraphError>;
 					readonly login: SignInConfig;
 				}) {
 					// Every config is read and edited before anything changes, so a missing or unreadable one changes nothing.
@@ -503,6 +511,7 @@ export class Installer extends Context.Service<
 					if (!(yield* signedIn)) {
 						yield* signIn(auth, login);
 					}
+					yield* firstSync;
 					yield* restartSync;
 					yield* Console.log("Started mx sync.");
 					yield* Console.log(

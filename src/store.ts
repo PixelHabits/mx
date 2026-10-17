@@ -8,6 +8,7 @@ import {
 	Option,
 	Path,
 	Schema,
+	Semaphore,
 } from "effect";
 import type { Folder, Message, Recipient } from "./graph/api.ts";
 import { Paths } from "./paths.ts";
@@ -44,6 +45,13 @@ CREATE TABLE IF NOT EXISTS folders (
 CREATE TABLE IF NOT EXISTS local_ids (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	graph_id TEXT NOT NULL UNIQUE
+);
+-- Each lookup of a message by its Graph id, in either mx process, takes the next number in asked as it begins; filed is
+-- the number of the lookup whose answer the store holds. An answer to an earlier lookup than that changes nothing.
+CREATE TABLE IF NOT EXISTS lookups (
+	graph_id TEXT PRIMARY KEY,
+	asked INTEGER NOT NULL,
+	filed INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS messages (
 	id INTEGER PRIMARY KEY REFERENCES local_ids (id),
@@ -187,6 +195,12 @@ export interface Found {
 	readonly others: number;
 }
 
+/** A lookup of a message by its Graph id, numbered as it began. */
+export interface Lookup {
+	readonly graphId: string;
+	readonly number: number;
+}
+
 export interface StoredFolder {
 	readonly deltaLink: Option.Option<string>;
 	readonly id: string;
@@ -279,10 +293,30 @@ export class Store extends Context.Service<
 			folderId: string,
 			link: string
 		) => Effect.Effect<void>;
-		/** Inserts or updates each message by its Graph id and returns its local id, the one that Graph id always gets. */
-		readonly save: (message: Message) => Effect.Effect<number>;
+		/**
+		 * Inserts or updates the message by its Graph id, filed where `message` says, unless the store files it in another
+		 * folder: a delta page can arrive after a move that a newer page of the other folder already stored, so it may not
+		 * refile the message. Answers its local id, the one that Graph id always gets, or none when it saved nothing.
+		 */
+		readonly saveInPlace: (
+			message: Message
+		) => Effect.Effect<Option.Option<number>>;
 		/** Removes the message only while it is still filed in `folderId`, since a move reports it removed there. */
 		readonly remove: (graphId: string, folderId: string) => Effect.Effect<void>;
+		/**
+		 * Numbers a lookup of the message as it begins. Both mx processes number lookups in this one store, so `file` takes
+		 * their answers in the order the lookups began.
+		 */
+		readonly lookup: (graphId: string) => Effect.Effect<Lookup>;
+		/**
+		 * Files Graph's answer to `lookup`: the message, saved where it names, or none for a message Graph no longer holds,
+		 * which leaves the store. An answer to a lookup that began before the one whose answer the store holds changes
+		 * nothing, so a reading older than the row never moves it.
+		 */
+		readonly file: (
+			lookup: Lookup,
+			answer: Option.Option<Message>
+		) => Effect.Effect<void>;
 		/** Removes the folder's messages whose Graph ids `kept` does not list. */
 		readonly keepOnly: (
 			folderId: string,
@@ -290,6 +324,9 @@ export class Store extends Context.Service<
 		) => Effect.Effect<void>;
 		readonly transaction: <A>(run: Effect.Effect<A>) => Effect.Effect<A>;
 		readonly byId: (id: number) => Effect.Effect<Option.Option<Stored>>;
+		readonly byGraphId: (
+			graphId: string
+		) => Effect.Effect<Option.Option<Stored>>;
 		/**
 		 * Up to `limit` conversations with a message that passes the filter, one per conversation: with `text`, the best
 		 * match of each, best first; without it, the newest of each, newest first.
@@ -376,7 +413,12 @@ export class Store extends Context.Service<
 					Effect.map(Arr.map(stored))
 				);
 
-			/** Runs `effect` in one SQLite transaction; every statement runs synchronously, so nothing interleaves. */
+			const transactions = yield* Semaphore.make(1);
+
+			/**
+			 * Runs `effect` in one SQLite transaction. Fibers share the one connection, and a statement another fiber ran
+			 * between BEGIN and COMMIT would join this transaction, so transactions take turns.
+			 */
 			const transaction = <A>(effect: Effect.Effect<A>) =>
 				Effect.acquireUseRelease(
 					Effect.sync(() => db.run("BEGIN IMMEDIATE")),
@@ -385,7 +427,7 @@ export class Store extends Context.Service<
 						Effect.sync(() =>
 							db.run(exit._tag === "Success" ? "COMMIT" : "ROLLBACK")
 						)
-				);
+				).pipe(transactions.withPermits(1));
 
 			const folders = all(
 				FolderRow,
@@ -483,7 +525,11 @@ export class Store extends Context.Service<
 					link,
 				});
 
-			const save = Effect.fnUntraced(function* (message: Message) {
+			/** Inserts or updates the message; an update with `inPlace` happens only while the row is filed where `message` says. */
+			const upsert = Effect.fnUntraced(function* (
+				message: Message,
+				inPlace: boolean
+			) {
 				const from =
 					message.from === undefined || message.from === null
 						? { address: "", name: "" }
@@ -503,6 +549,7 @@ export class Store extends Context.Service<
 					`INSERT INTO messages (id, graph_id, folder_id, conversation_id, internet_message_id, from_name, from_address, to_list, cc_list, bcc_list, subject, received_at, sent_at, is_read, is_draft, flag, categories, importance, has_attachments, body)
 					VALUES ((SELECT id FROM local_ids WHERE graph_id = $graphId), $graphId, $folderId, $conversationId, $internetMessageId, $fromName, $fromAddress, $to, $cc, $bcc, $subject, $receivedAt, $sentAt, $isRead, $isDraft, $flag, $categories, $importance, $hasAttachments, $body)
 					ON CONFLICT (graph_id) DO UPDATE SET folder_id = excluded.folder_id, conversation_id = excluded.conversation_id, internet_message_id = excluded.internet_message_id, from_name = excluded.from_name, from_address = excluded.from_address, to_list = excluded.to_list, cc_list = excluded.cc_list, bcc_list = excluded.bcc_list, subject = excluded.subject, received_at = excluded.received_at, sent_at = excluded.sent_at, is_read = excluded.is_read, is_draft = excluded.is_draft, flag = excluded.flag, categories = excluded.categories, importance = excluded.importance, has_attachments = excluded.has_attachments, body = excluded.body
+					${inPlace ? "WHERE messages.folder_id = excluded.folder_id" : ""}
 					RETURNING id`,
 					{
 						bcc,
@@ -526,13 +573,56 @@ export class Store extends Context.Service<
 						to,
 					}
 				);
-				return Arr.reduce(saved, 0, (_, row) => row.id);
+				return Option.map(Arr.head(saved), (row) => row.id);
 			});
+
+			const saveInPlace = (message: Message) => upsert(message, true);
 
 			const remove = (graphId: string, folderId: string) =>
 				run(
 					"DELETE FROM messages WHERE graph_id = $graphId AND folder_id = $folderId",
 					{ folderId, graphId }
+				);
+
+			const lookup = (graphId: string) =>
+				all(
+					Schema.Struct({ asked: Schema.Int }),
+					`INSERT INTO lookups (graph_id, asked, filed) VALUES ($graphId, 1, 0)
+					ON CONFLICT (graph_id) DO UPDATE SET asked = asked + 1 RETURNING asked`,
+					{ graphId }
+				).pipe(
+					Effect.flatMap(
+						Arr.match({
+							onEmpty: () =>
+								Effect.die(`SQLite numbered no lookup of message ${graphId}.`),
+							onNonEmpty: ([{ asked }]) =>
+								Effect.succeed({ graphId, number: asked }),
+						})
+					)
+				);
+
+			const file = (
+				{ graphId, number }: Lookup,
+				answer: Option.Option<Message>
+			) =>
+				transaction(
+					Effect.gen(function* () {
+						const newest = yield* all(
+							Schema.Struct({ filed: Schema.Int }),
+							"UPDATE lookups SET filed = $number WHERE graph_id = $graphId AND filed < $number RETURNING filed",
+							{ graphId, number }
+						);
+						if (Arr.isReadonlyArrayEmpty(newest)) {
+							return;
+						}
+						yield* Option.match(answer, {
+							onNone: () =>
+								run("DELETE FROM messages WHERE graph_id = $graphId", {
+									graphId,
+								}),
+							onSome: (message) => upsert(message, false),
+						});
+					})
 				);
 
 			const keepOnly = (folderId: string, kept: readonly string[]) =>
@@ -545,6 +635,12 @@ export class Store extends Context.Service<
 
 			const byId = (id: number) =>
 				Effect.map(messages("WHERE m.id = $id", { id }), Arr.head);
+
+			const byGraphId = (graphId: string) =>
+				Effect.map(
+					messages("WHERE m.graph_id = $graphId", { graphId }),
+					Arr.head
+				);
 
 			const search: Store["Service"]["search"] = (filter) =>
 				all(
@@ -660,18 +756,21 @@ export class Store extends Context.Service<
 
 			return Store.of({
 				beat,
+				byGraphId,
 				byId,
 				conversation,
+				file,
 				folders,
 				hasFolder,
 				heartbeat,
 				keepOnly,
+				lookup,
 				ownAddresses,
 				reindex,
 				remove,
-				save,
 				saveFolder,
 				saveFolders,
+				saveInPlace,
 				search,
 				setDeltaLink,
 				transaction,

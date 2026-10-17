@@ -1,4 +1,4 @@
-import { Array as Arr, Effect, Layer, Option } from "effect";
+import { Array as Arr, Duration, Effect, Layer, Option } from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { FakeSubscriptions, FakeTunnels } from "./fake-push.ts";
@@ -116,6 +116,26 @@ export class FakeMicrosoft {
 	retryAfter = 1;
 	/** The status Graph answers every request with during an outage, such as 503; 0 while Graph is up. */
 	outage = 0;
+	/** How long Graph takes to answer each delta page, on the clock of the mx that asks. */
+	deltaDelay = Duration.zero;
+	/** The most delta requests Graph has had in flight at once. */
+	mostDeltasAtOnce = 0;
+	private deltasInFlight = 0;
+	/** The folders whose delta rounds Graph ended with a delta link, in order. */
+	readonly roundsEnded: string[] = [];
+	/** Folders whose delta requests wait until `release` lets them through, and whether Graph answered them first. */
+	private readonly held = new Map<
+		string,
+		{ readonly answered: boolean; readonly gate: PromiseWithResolvers<void> }
+	>();
+	/**
+	 * The messages whose next read by id waits until `releaseReads` lets it through. Graph reads the message as soon as
+	 * it is asked, so the answer that arrives on release shows the message as it was then.
+	 */
+	private readonly heldReads = new Map<
+		string,
+		{ readonly gate: PromiseWithResolvers<void>; taken: boolean }
+	>();
 	readonly refreshTokens: string[] = [];
 	private issued = 0;
 	private accessToken = "";
@@ -242,9 +262,12 @@ export class FakeMicrosoft {
 		HttpClient.make((request) =>
 			HttpClientRequest.toWeb(request).pipe(
 				Effect.flatMap((web) =>
-					Effect.promise(
-						async (): Promise<Response> =>
-							await this.answer(web, new Uint8Array(await web.arrayBuffer()))
+					this.paced(
+						web,
+						Effect.promise(
+							async (): Promise<Response> =>
+								await this.answer(web, new Uint8Array(await web.arrayBuffer()))
+						)
 					)
 				),
 				Effect.orDie,
@@ -252,6 +275,82 @@ export class FakeMicrosoft {
 			)
 		)
 	);
+
+	/**
+	 * Makes the delta requests of `folderId` wait until `release`. With `answered`, Graph reads the folder as soon as it is
+	 * asked, so the page that arrives on release shows the folder as it was then, as a page still on its way does.
+	 */
+	hold(folderId: string, { answered = false } = {}) {
+		this.held.set(folderId, { answered, gate: Promise.withResolvers<void>() });
+	}
+
+	release(folderId: string) {
+		this.held.get(folderId)?.gate.resolve();
+		this.held.delete(folderId);
+	}
+
+	/** Makes the next read of the message by its id wait until `releaseReads`, answered as Graph held it when asked. */
+	holdRead(id: string) {
+		this.heldReads.set(id, {
+			gate: Promise.withResolvers<void>(),
+			taken: false,
+		});
+	}
+
+	releaseReads() {
+		for (const { gate } of this.heldReads.values()) {
+			gate.resolve();
+		}
+		this.heldReads.clear();
+	}
+
+	/**
+	 * Answers a delta request after `deltaDelay`, and after `release` for a held folder, counting it in flight meanwhile;
+	 * the next read of a message held by `holdRead` waits until `releaseReads`.
+	 */
+	private paced<A>(request: Request, answer: Effect.Effect<A>) {
+		const url = new URL(request.url);
+		const [, , , collection, id = "", messages] = decodeURIComponent(
+			url.pathname
+		).split("/");
+		const read = this.heldReads.get(id);
+		if (
+			collection === "messages" &&
+			messages === undefined &&
+			request.method === "GET" &&
+			read !== undefined &&
+			!read.taken
+		) {
+			read.taken = true;
+			return Effect.tap(answer, () => Effect.promise(() => read.gate.promise));
+		}
+		if (!url.pathname.endsWith("/messages/delta")) {
+			return answer;
+		}
+		const count = (step: number) =>
+			Effect.sync(() => {
+				this.deltasInFlight += step;
+				this.mostDeltasAtOnce = Math.max(
+					this.mostDeltasAtOnce,
+					this.deltasInFlight
+				);
+			});
+		const waited = Effect.sleep(this.deltaDelay).pipe(
+			Effect.andThen(
+				Effect.promise(
+					() => this.held.get(id)?.gate.promise ?? Promise.resolve()
+				)
+			)
+		);
+		return Effect.acquireUseRelease(
+			count(1),
+			() =>
+				this.held.get(id)?.answered === true
+					? Effect.tap(answer, () => waited)
+					: Effect.andThen(waited, answer),
+			() => count(-1)
+		);
+	}
 
 	/** Removes a message the way a permanent delete in Outlook does, so the next delta reports it removed. */
 	purge(id: string) {
@@ -480,6 +579,7 @@ export class FakeMicrosoft {
 			displayName: folder?.displayName,
 			id,
 			parentFolderId: folder?.parentFolderId,
+			totalItemCount: this.inFolder(id).length,
 		};
 	}
 
@@ -531,6 +631,9 @@ export class FakeMicrosoft {
 			);
 			const offset = Number(url.searchParams.get("$skiptoken") ?? "0");
 			const more = offset + 2 < all.length;
+			if (!more) {
+				this.roundsEnded.push(folderId);
+			}
 			return json({
 				value: Arr.map(all.slice(offset, offset + 2), (message) =>
 					this.messageJson(message, asText)
@@ -551,6 +654,7 @@ export class FakeMicrosoft {
 				(change) => change.id
 			)
 		);
+		this.roundsEnded.push(folderId);
 		return json({
 			"@odata.deltaLink": `${self}?$deltatoken=${this.changes.length}`,
 			value: Arr.map(ids, (id) => {

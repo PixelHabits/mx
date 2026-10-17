@@ -74,8 +74,14 @@ export const Folder = Schema.Struct({
 	displayName: Schema.String,
 	id: Schema.String,
 	parentFolderId: Schema.String,
+	/** Every item in the folder, read or not. */
+	totalItemCount: Schema.Int,
 });
 export type Folder = typeof Folder.Type;
+
+/** The `$select` that returns `Folder`. */
+export const folderSelect =
+	"id,displayName,parentFolderId,childFolderCount,totalItemCount";
 
 export const FolderPage = Schema.Struct({
 	"@odata.nextLink": Schema.optionalKey(Schema.String),
@@ -138,14 +144,14 @@ export const GraphErrorBody = Schema.Struct({
 export const mail = HttpApiGroup.make("mail")
 	.add(
 		HttpApiEndpoint.get("folders", "/me/mailFolders", {
-			query: { $top: Schema.FiniteFromString },
+			query: { $select: Schema.String, $top: Schema.FiniteFromString },
 			success: FolderPage,
 		})
 	)
 	.add(
 		HttpApiEndpoint.get("childFolders", "/me/mailFolders/:id/childFolders", {
 			params,
-			query: { $top: Schema.FiniteFromString },
+			query: { $select: Schema.String, $top: Schema.FiniteFromString },
 			success: FolderPage,
 		})
 	)
