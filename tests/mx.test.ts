@@ -2609,6 +2609,29 @@ describe("mx", () => {
 		}));
 
 	test(
+		"mx install says how to put ~/.local/bin on PATH when the shell lacks it, and says nothing once it is there",
+		() =>
+			Effect.gen(function* () {
+				const folder = dirname(installed);
+				const { output: lacking } = yield* cli("install", "--agent", "codex");
+				expect(lines(lacking)).toContain(
+					`${folder} is not on your PATH. Add it with echo 'export PATH="$HOME/.local/bin:$PATH"' >> ${mac ? "~/.zprofile" : "~/.bashrc"}, then open a new terminal to run mx.`
+				);
+				const { output: holding } = yield* cliOn(
+					platformWith({
+						...environment,
+						PATH: `${environment.PATH}:${folder}`,
+					})
+				)("install", "--agent", "codex");
+				expect(holding).not.toContain("is not on your PATH");
+			}),
+		{
+			because: "mx install puts the program folder on PATH itself on Windows",
+			systems: ["darwin", "linux"],
+		}
+	);
+
+	test(
 		"mx install writes the systemd user unit that runs the installed binary and counts a stop as a clean exit, and makes the binary executable",
 		() =>
 			Effect.gen(function* () {

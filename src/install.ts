@@ -1,6 +1,7 @@
 import { userInfo } from "node:os";
 import {
 	Array as Arr,
+	Config,
 	Console,
 	Context,
 	Duration,
@@ -227,6 +228,9 @@ export class Installer extends Context.Service<
 			const { bin, cache, config, configFile, data, home, packaged, state } =
 				yield* Paths;
 			const offered = yield* agents;
+			const searchPath = yield* Config.String("PATH").pipe(
+				Config.withDefault("")
+			);
 			const windows = process.platform === "win32";
 			const folder = path.dirname(bin);
 			const background = path.join(folder, backgroundName);
@@ -625,6 +629,26 @@ export class Installer extends Context.Service<
 			});
 
 			/**
+			 * Says how to put the program folder on PATH when the shell that runs mx install lacks it, in the startup file of
+			 * the shell each system opens by default: zsh on macOS and bash on Linux.
+			 */
+			const pathHint = Effect.gen(function* () {
+				if (
+					Arr.some(
+						searchPath.split(":"),
+						(entry) => entry !== "" && path.resolve(entry) === folder
+					)
+				) {
+					return;
+				}
+				const startup =
+					process.platform === "darwin" ? "~/.zprofile" : "~/.bashrc";
+				yield* Console.log(
+					`${folder} is not on your PATH. Add it with echo 'export PATH="$HOME/.local/bin:$PATH"' >> ${startup}, then open a new terminal to run mx.`
+				);
+			});
+
+			/**
 			 * Writes `text` over the config file by renaming a whole file onto it, so the agent never reads half of one. A
 			 * config that is a symlink, as into a dotfiles repository, stays one, and the file keeps its mode. A config that
 			 * does not exist yet is created.
@@ -745,6 +769,8 @@ export class Installer extends Context.Service<
 					}
 					if (windows) {
 						yield* addToPath;
+					} else if (!packaged) {
+						yield* pathHint;
 					}
 					yield* syncAtSignIn.register;
 					yield* Console.log("Registered mx sync to start at sign-in.");
