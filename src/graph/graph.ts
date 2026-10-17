@@ -1,0 +1,482 @@
+import {
+	Array as Arr,
+	Context,
+	Effect,
+	Layer,
+	Option,
+	type Schema,
+} from "effect";
+import { Base64 } from "effect/encoding";
+import {
+	HttpClient,
+	type HttpClientError,
+	HttpClientRequest,
+	HttpClientResponse,
+} from "effect/http";
+import { HttpApiClient } from "effect/http-api";
+import { Auth } from "../auth/auth.ts";
+import {
+	type CredentialFailed,
+	GraphRefused,
+	type LoginRequired,
+	MicrosoftUnavailable,
+} from "../errors.ts";
+import { isRefusalStatus, policy } from "../http-policy.ts";
+import {
+	type Attachment,
+	DeltaPage,
+	type FlagStatus,
+	type Folder,
+	FolderPage,
+	GraphApi,
+	GraphErrorBody,
+	type Message,
+	messageSelect,
+	type Reaction,
+	type Recipient,
+} from "./api.ts";
+
+export type GraphError =
+	| GraphRefused
+	| MicrosoftUnavailable
+	| LoginRequired
+	| CredentialFailed;
+
+const graphBase = "https://graph.microsoft.com/v1.0";
+
+/** Plain-text bodies, message ids that survive a move within the mailbox, and up to 100 messages per delta page. */
+const prefer =
+	'outlook.body-content-type="text", IdType="ImmutableId", odata.maxpagesize=100';
+
+/** Folders per page of a folder listing. */
+const folderPageSize = 100;
+
+/** Graph takes an attachment of up to 3 MB in one request; a larger one goes through an upload session. */
+const singleRequestAttachmentLimit = 3 * 1024 * 1024;
+
+/** Upload session chunks are multiples of 320 KiB and at most 4 MiB. */
+const uploadChunkSize = 320 * 1024 * 12;
+
+/** A Graph answer with a status other than 2xx: Graph's refusal when it explains one, otherwise unavailable. */
+const checked = Effect.fnUntraced(function* (
+	response: HttpClientResponse.HttpClientResponse
+) {
+	const { status } = response;
+	if (status >= 200 && status < 300) {
+		return response;
+	}
+	const body = yield* HttpClientResponse.schemaBodyJson(GraphErrorBody)(
+		response
+	).pipe(Effect.option);
+	if (Option.isSome(body) && isRefusalStatus(status)) {
+		return yield* GraphRefused.make({
+			code: body.value.error.code,
+			detail: body.value.error.message,
+			status,
+		});
+	}
+	const code = Option.getOrUndefined(
+		Option.map(body, ({ error }) => error.code)
+	);
+	return yield* MicrosoftUnavailable.make({
+		code,
+		message: `Microsoft Graph answered ${status}${code === undefined ? "" : ` ${code}`}.`,
+		reason: "answered",
+		status,
+	});
+});
+
+/**
+ * The failure without its request, which carries the bearer token: the connection failed or ran out of time, or Graph
+ * answered a status or body the endpoint does not declare.
+ */
+const unavailable = ({ reason }: HttpClientError.HttpClientError) => {
+	if (reason._tag !== "TransportError") {
+		const status = "response" in reason ? reason.response.status : undefined;
+		return MicrosoftUnavailable.make({
+			message: `Microsoft Graph answered${status === undefined ? "" : ` ${status}`} in a form mx does not read (${reason._tag}).`,
+			reason: "answered",
+			status,
+		});
+	}
+	const deadline = reason.description === "deadline";
+	return MicrosoftUnavailable.make({
+		cause: reason.cause,
+		message: deadline
+			? "Microsoft Graph did not answer before the deadline."
+			: "Microsoft Graph could not be reached.",
+		reason: deadline ? "deadline" : "transport",
+	});
+};
+
+/** Narrows a request's failures to mx's errors; an answer that does not match its schema is a defect. */
+const settle = <A>(
+	effect: Effect.Effect<
+		A,
+		GraphError | HttpClientError.HttpClientError | Schema.SchemaError
+	>
+): Effect.Effect<A, GraphError> =>
+	Effect.catchTags(effect, {
+		HttpClientError: (error) => Effect.fail(unavailable(error)),
+		SchemaError: (error) => Effect.die(error),
+	});
+
+const recipients = (addresses: readonly string[]): readonly Recipient[] =>
+	Arr.map(addresses, (address) => ({ emailAddress: { address } }));
+
+/** Who a message goes to and what it says. A field left out keeps what Graph fills in: nothing on a new message, the quoted message's on a reply or forward. */
+export interface Fields {
+	readonly bcc?: readonly string[] | undefined;
+	readonly cc?: readonly string[] | undefined;
+	readonly subject?: string | undefined;
+	readonly text?: string | undefined;
+	readonly to?: readonly string[] | undefined;
+}
+
+/** A message to draft or send: a new one, or a reply, reply-all or forward of message `id` that quotes it below `text`. */
+export type Compose = Fields &
+	(
+		| { readonly kind: "new" }
+		| {
+				readonly id: string;
+				readonly kind: "reply" | "reply_all" | "forward";
+		  }
+	);
+
+const newMessage = (fields: Fields) => ({
+	bccRecipients: recipients(fields.bcc ?? []),
+	body: { content: fields.text ?? "", contentType: "text" as const },
+	ccRecipients: recipients(fields.cc ?? []),
+	subject: fields.subject ?? "",
+	toRecipients: recipients(fields.to ?? []),
+});
+
+const reaction = ({ bcc, cc, subject, text, to }: Fields): Reaction => ({
+	comment: text ?? "",
+	...(Arr.every([to, cc, bcc, subject], (field) => field === undefined)
+		? {}
+		: {
+				message: {
+					...(to === undefined ? {} : { toRecipients: recipients(to) }),
+					...(cc === undefined ? {} : { ccRecipients: recipients(cc) }),
+					...(bcc === undefined ? {} : { bccRecipients: recipients(bcc) }),
+					...(subject === undefined ? {} : { subject }),
+				},
+			}),
+});
+
+/**
+ * Microsoft Graph for the signed-in mailbox. Every request asks for text bodies and immutable ids. Reads retry
+ * transient failures and writes retry only Graph's 429, each waiting at least as long as `Retry-After` asks; the
+ * policy in `http-policy.ts` owns both. A write answers the message as Graph holds it afterwards.
+ */
+export class Graph extends Context.Service<
+	Graph,
+	{
+		/** Every mail folder, each parent before its children. */
+		readonly folders: Effect.Effect<readonly Folder[], GraphError>;
+		readonly folder: (idOrName: string) => Effect.Effect<Folder, GraphError>;
+		/** The folder's first delta page, or the page at a next or delta link Graph gave before. */
+		readonly delta: (
+			folderId: string,
+			link: Option.Option<string>
+		) => Effect.Effect<DeltaPage, GraphError>;
+		readonly message: (id: string) => Effect.Effect<Message, GraphError>;
+		/** The whole body as text, quoted history included. */
+		readonly body: (id: string) => Effect.Effect<string, GraphError>;
+		readonly attachments: (
+			id: string
+		) => Effect.Effect<readonly Attachment[], GraphError>;
+		readonly attachmentContent: (
+			id: string,
+			attachmentId: string
+		) => Effect.Effect<Uint8Array, GraphError>;
+		readonly update: (
+			id: string,
+			patch: {
+				readonly bcc?: readonly string[];
+				readonly cc?: readonly string[];
+				readonly categories?: readonly string[];
+				readonly flag?: FlagStatus;
+				readonly isRead?: boolean;
+				readonly subject?: string;
+				readonly text?: string;
+				readonly to?: readonly string[];
+			}
+		) => Effect.Effect<Message, GraphError>;
+		/** Moves the message to a folder id or a well-known folder name such as `deleteditems`. */
+		readonly move: (
+			id: string,
+			destination: string
+		) => Effect.Effect<Message, GraphError>;
+		/** Creates a draft in Drafts; a reply, reply-all or forward quotes the conversation below its text. */
+		readonly draft: (compose: Compose) => Effect.Effect<Message, GraphError>;
+		/** Sends at once through `sendMail`, or the reply, reply-all or forward action, which quotes as a draft does. */
+		readonly send: (compose: Compose) => Effect.Effect<void, GraphError>;
+		readonly sendDraft: (id: string) => Effect.Effect<void, GraphError>;
+		readonly attach: (input: {
+			readonly bytes: Uint8Array;
+			readonly id: string;
+			readonly name: string;
+		}) => Effect.Effect<Message, GraphError>;
+	}
+>()("mx/graph/graph") {
+	static readonly layerNoDeps = Layer.effect(
+		Graph,
+		Effect.gen(function* () {
+			const auth = yield* Auth;
+			const transport = policy(yield* HttpClient.HttpClient);
+			const client = auth
+				.authorize(
+					transport.pipe(
+						HttpClient.mapRequest(HttpClientRequest.setHeader("prefer", prefer))
+					)
+				)
+				.pipe(HttpClient.transformResponse(Effect.flatMap(checked)));
+			/** Upload URLs carry their own authorization and refuse a bearer token. */
+			const uploads = transport.pipe(
+				HttpClient.transformResponse(Effect.flatMap(checked))
+			);
+			const { mail } = yield* HttpApiClient.makeWith(GraphApi, {
+				baseUrl: graphBase,
+				httpClient: client,
+			});
+
+			const getJson = <S extends Schema.Top>(url: string, schema: S) =>
+				client
+					.get(url)
+					.pipe(Effect.flatMap(HttpClientResponse.schemaBodyJson(schema)));
+
+			const message = (id: string) =>
+				settle(
+					mail.message({ params: { id }, query: { $select: messageSelect } })
+				);
+
+			const listFolders = (
+				first: Effect.Effect<typeof FolderPage.Type, GraphError>
+			): Effect.Effect<readonly Folder[], GraphError> =>
+				Effect.gen(function* () {
+					let page = yield* first;
+					const found: Folder[] = [...page.value];
+					while (page["@odata.nextLink"] !== undefined) {
+						page = yield* settle(getJson(page["@odata.nextLink"], FolderPage));
+						found.push(...page.value);
+					}
+					const nested = yield* Effect.forEach(found, (parent) =>
+						parent.childFolderCount === 0
+							? Effect.succeed([parent])
+							: mail
+									.childFolders({
+										params: { id: parent.id },
+										query: { $top: folderPageSize },
+									})
+									.pipe(
+										settle,
+										listFolders,
+										Effect.map((children) => [parent, ...children])
+									)
+					);
+					return Arr.flatten(nested);
+				});
+
+			const folders = mail
+				.folders({ query: { $top: folderPageSize } })
+				.pipe(settle, listFolders, Effect.withSpan("Graph.folders"));
+
+			const folder = Effect.fn("Graph.folder")((idOrName: string) =>
+				settle(mail.folder({ params: { id: idOrName } }))
+			);
+
+			const delta = Effect.fn("Graph.delta")(
+				(folderId: string, link: Option.Option<string>) =>
+					Option.match(link, {
+						onNone: () =>
+							settle(
+								mail.delta({
+									params: { id: folderId },
+									query: { $select: messageSelect },
+								})
+							),
+						onSome: (url) => settle(getJson(url, DeltaPage)),
+					})
+			);
+
+			const body = Effect.fn("Graph.body")(function* (id: string) {
+				const { body: text } = yield* settle(
+					mail.body({ params: { id }, query: { $select: "body" } })
+				);
+				return text.content;
+			});
+
+			const attachments = Effect.fn("Graph.attachments")(function* (
+				id: string
+			) {
+				const { value } = yield* settle(mail.attachments({ params: { id } }));
+				return value;
+			});
+
+			const attachmentContent = Effect.fn("Graph.attachmentContent")(
+				(id: string, attachmentId: string) =>
+					settle(
+						client
+							.get(
+								`${graphBase}/me/messages/${encodeURIComponent(id)}/attachments/${encodeURIComponent(attachmentId)}/$value`
+							)
+							.pipe(
+								Effect.flatMap((response) => response.arrayBuffer),
+								Effect.map((buffer) => new Uint8Array(buffer))
+							)
+					)
+			);
+
+			const update: Graph["Service"]["update"] = Effect.fn("Graph.update")(
+				function* (id, patch) {
+					yield* settle(
+						mail.update({
+							params: { id },
+							payload: {
+								...(patch.isRead === undefined ? {} : { isRead: patch.isRead }),
+								...(patch.flag === undefined
+									? {}
+									: { flag: { flagStatus: patch.flag } }),
+								...(patch.categories === undefined
+									? {}
+									: { categories: patch.categories }),
+								...(patch.subject === undefined
+									? {}
+									: { subject: patch.subject }),
+								...(patch.text === undefined
+									? {}
+									: { body: { content: patch.text, contentType: "text" } }),
+								...(patch.to === undefined
+									? {}
+									: { toRecipients: recipients(patch.to) }),
+								...(patch.cc === undefined
+									? {}
+									: { ccRecipients: recipients(patch.cc) }),
+								...(patch.bcc === undefined
+									? {}
+									: { bccRecipients: recipients(patch.bcc) }),
+							},
+						})
+					);
+					return yield* message(id);
+				}
+			);
+
+			const move = Effect.fn("Graph.move")(function* (
+				id: string,
+				destination: string
+			) {
+				const moved = yield* settle(
+					mail.move({ params: { id }, payload: { destinationId: destination } })
+				);
+				return yield* message(moved.id);
+			});
+
+			const reactions = {
+				forward: { create: mail.createForward, send: mail.forward },
+				reply: { create: mail.createReply, send: mail.reply },
+				reply_all: { create: mail.createReplyAll, send: mail.replyAll },
+			};
+
+			const draft = Effect.fn("Graph.draft")(function* (compose: Compose) {
+				const drafted = yield* settle(
+					compose.kind === "new"
+						? mail.createDraft({ payload: newMessage(compose) })
+						: reactions[compose.kind].create({
+								params: { id: compose.id },
+								payload: reaction(compose),
+							})
+				);
+				return yield* message(drafted.id);
+			});
+
+			const send = Effect.fn("Graph.send")((compose: Compose) =>
+				settle(
+					compose.kind === "new"
+						? mail.sendMail({
+								payload: {
+									message: newMessage(compose),
+									saveToSentItems: true,
+								},
+							})
+						: reactions[compose.kind].send({
+								params: { id: compose.id },
+								payload: reaction(compose),
+							})
+				)
+			);
+
+			const sendDraft = Effect.fn("Graph.sendDraft")((id: string) =>
+				settle(mail.send({ params: { id } }))
+			);
+
+			const attach: Graph["Service"]["attach"] = Effect.fn("Graph.attach")(
+				function* ({ bytes, id, name }) {
+					if (bytes.length <= singleRequestAttachmentLimit) {
+						yield* settle(
+							mail.addAttachment({
+								params: { id },
+								payload: {
+									"@odata.type": "#microsoft.graph.fileAttachment",
+									contentBytes: Base64.encode(bytes),
+									name,
+								},
+							})
+						);
+						return yield* message(id);
+					}
+					const { uploadUrl } = yield* settle(
+						mail.createUploadSession({
+							params: { id },
+							payload: {
+								AttachmentItem: {
+									attachmentType: "file",
+									name,
+									size: bytes.length,
+								},
+							},
+						})
+					);
+					for (let start = 0; start < bytes.length; start += uploadChunkSize) {
+						const chunk = bytes.subarray(start, start + uploadChunkSize);
+						yield* settle(
+							uploads.execute(
+								HttpClientRequest.put(uploadUrl).pipe(
+									HttpClientRequest.setHeader(
+										"content-range",
+										`bytes ${start}-${start + chunk.length - 1}/${bytes.length}`
+									),
+									HttpClientRequest.bodyUint8Array(
+										chunk,
+										"application/octet-stream"
+									)
+								)
+							)
+						);
+					}
+					return yield* message(id);
+				}
+			);
+
+			return Graph.of({
+				attach,
+				attachmentContent,
+				attachments,
+				body,
+				delta,
+				draft,
+				folder,
+				folders,
+				message: Effect.fn("Graph.message")(message),
+				move,
+				send,
+				sendDraft,
+				update,
+			});
+		})
+	);
+
+	static readonly layer = Graph.layerNoDeps.pipe(Layer.provide(Auth.layer));
+}

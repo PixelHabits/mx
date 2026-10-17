@@ -7,11 +7,11 @@
 		"mx": "dist/mx"
 	},
 	"scripts": {
-		"build": "bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --env=disable src/main.ts --outfile dist/mx",
+		"build": "bun scripts/build.ts",
 		"check": "ultracite check",
 		"fix": "ultracite fix",
 		"prepare": "lefthook install && effect-tsgo patch",
-		"test": "bun test --isolate tests --pass-with-no-tests",
+		"test": "bun test --isolate tests",
 		"typecheck": "tsc -p tsconfig.json --noEmit"
 	},
 	"dependencies": {

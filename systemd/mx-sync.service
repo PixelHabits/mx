@@ -1,0 +1,12 @@
+[Unit]
+Description=mx: keep the local copy of the mailbox in step with Microsoft Graph
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/mx sync
+# A refused sign-in stops mx sync with "Run mx login."; it starts again by itself after the next login.
+Restart=on-failure
+RestartSec=5min
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,302 @@
+import { Schema } from "effect";
+import {
+	HttpApi,
+	HttpApiEndpoint,
+	HttpApiGroup,
+	HttpApiSchema,
+} from "effect/http-api";
+import { InstantFromString } from "../temporal.ts";
+
+const EmailAddress = Schema.Struct({
+	address: Schema.optionalKey(Schema.String),
+	name: Schema.optionalKey(Schema.String),
+});
+
+export const Recipient = Schema.Struct({ emailAddress: EmailAddress });
+export type Recipient = typeof Recipient.Type;
+
+export const FlagStatus = Schema.Literals([
+	"notFlagged",
+	"flagged",
+	"complete",
+]);
+export type FlagStatus = typeof FlagStatus.Type;
+
+/** Every body mx reads is plain text: each request asks for it with `Prefer: outlook.body-content-type="text"`. */
+const TextBody = Schema.Struct({
+	content: Schema.String,
+	contentType: Schema.Literal("text"),
+});
+
+/** The properties mx stores for a message, as `messageSelect` asks Graph for them. */
+export const Message = Schema.Struct({
+	bccRecipients: Schema.Array(Recipient),
+	categories: Schema.Array(Schema.String),
+	ccRecipients: Schema.Array(Recipient),
+	conversationId: Schema.String,
+	flag: Schema.Struct({ flagStatus: FlagStatus }),
+	from: Schema.optionalKey(Schema.NullOr(Recipient)),
+	hasAttachments: Schema.Boolean,
+	id: Schema.String,
+	importance: Schema.Literals(["low", "normal", "high"]),
+	internetMessageId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	isDraft: Schema.Boolean,
+	isRead: Schema.Boolean,
+	parentFolderId: Schema.String,
+	receivedDateTime: Schema.NullOr(InstantFromString),
+	sentDateTime: Schema.NullOr(InstantFromString),
+	subject: Schema.NullOr(Schema.String),
+	toRecipients: Schema.Array(Recipient),
+	uniqueBody: TextBody,
+});
+export type Message = typeof Message.Type;
+
+/** The `$select` that returns `Message`. */
+export const messageSelect =
+	"id,parentFolderId,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,sentDateTime,isRead,isDraft,flag,categories,importance,hasAttachments,uniqueBody";
+
+/** A delta entry for a message that left the folder, by deletion or by a move. */
+export const Removed = Schema.Struct({
+	"@removed": Schema.Struct({ reason: Schema.String }),
+	id: Schema.String,
+});
+
+/** One page of a folder's message delta: a next link while pages remain, then the delta link for the next round. */
+export const DeltaPage = Schema.Struct({
+	"@odata.deltaLink": Schema.optionalKey(Schema.String),
+	"@odata.nextLink": Schema.optionalKey(Schema.String),
+	value: Schema.Array(Schema.Union([Removed, Message])),
+});
+export type DeltaPage = typeof DeltaPage.Type;
+
+export const Folder = Schema.Struct({
+	childFolderCount: Schema.Int,
+	displayName: Schema.String,
+	id: Schema.String,
+	parentFolderId: Schema.String,
+});
+export type Folder = typeof Folder.Type;
+
+export const FolderPage = Schema.Struct({
+	"@odata.nextLink": Schema.optionalKey(Schema.String),
+	value: Schema.Array(Folder),
+});
+
+export const Attachment = Schema.Struct({
+	"@odata.type": Schema.String,
+	contentId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	contentType: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	id: Schema.String,
+	isInline: Schema.Boolean,
+	name: Schema.String,
+	size: Schema.Int,
+});
+export type Attachment = typeof Attachment.Type;
+
+/** A write's answer; mx reads the message back with `messageSelect`, since a write answers without `uniqueBody`. */
+const Written = Schema.Struct({ id: Schema.String });
+
+const Body = Schema.Struct({
+	content: Schema.String,
+	contentType: Schema.Literal("text"),
+});
+
+const params = { id: Schema.String };
+
+/** A message mx writes: a draft it creates, or one `sendMail` sends. */
+const NewMessage = Schema.Struct({
+	bccRecipients: Schema.Array(Recipient),
+	body: Body,
+	ccRecipients: Schema.Array(Recipient),
+	subject: Schema.String,
+	toRecipients: Schema.Array(Recipient),
+});
+
+/** The body of a reply, reply-all or forward: the new text above the quoted message, and any properties to change. */
+const Reaction = Schema.Struct({
+	comment: Schema.String,
+	message: Schema.optionalKey(
+		Schema.Struct({
+			bccRecipients: Schema.optionalKey(Schema.Array(Recipient)),
+			ccRecipients: Schema.optionalKey(Schema.Array(Recipient)),
+			subject: Schema.optionalKey(Schema.String),
+			toRecipients: Schema.optionalKey(Schema.Array(Recipient)),
+		})
+	),
+});
+export type Reaction = typeof Reaction.Type;
+
+/** Graph's error body: `{ error: { code, message } }`. */
+export const GraphErrorBody = Schema.Struct({
+	error: Schema.Struct({ code: Schema.String, message: Schema.String }),
+});
+
+/**
+ * The Graph mail endpoints mx calls, under `https://graph.microsoft.com/v1.0`. Each declares only its success: a
+ * refusal is read once, for every endpoint, by the client's response check.
+ */
+export const mail = HttpApiGroup.make("mail")
+	.add(
+		HttpApiEndpoint.get("folders", "/me/mailFolders", {
+			query: { $top: Schema.FiniteFromString },
+			success: FolderPage,
+		})
+	)
+	.add(
+		HttpApiEndpoint.get("childFolders", "/me/mailFolders/:id/childFolders", {
+			params,
+			query: { $top: Schema.FiniteFromString },
+			success: FolderPage,
+		})
+	)
+	.add(
+		HttpApiEndpoint.get("folder", "/me/mailFolders/:id", {
+			params,
+			success: Folder,
+		})
+	)
+	.add(
+		HttpApiEndpoint.get("delta", "/me/mailFolders/:id/messages/delta", {
+			params,
+			query: { $select: Schema.String },
+			success: DeltaPage,
+		})
+	)
+	.add(
+		HttpApiEndpoint.get("message", "/me/messages/:id", {
+			params,
+			query: { $select: Schema.String },
+			success: Message,
+		})
+	)
+	.add(
+		HttpApiEndpoint.get("body", "/me/messages/:id", {
+			params,
+			query: { $select: Schema.Literal("body") },
+			success: Schema.Struct({ body: TextBody }),
+		})
+	)
+	.add(
+		HttpApiEndpoint.patch("update", "/me/messages/:id", {
+			params,
+			payload: Schema.Struct({
+				bccRecipients: Schema.optionalKey(Schema.Array(Recipient)),
+				body: Schema.optionalKey(Body),
+				categories: Schema.optionalKey(Schema.Array(Schema.String)),
+				ccRecipients: Schema.optionalKey(Schema.Array(Recipient)),
+				flag: Schema.optionalKey(Schema.Struct({ flagStatus: FlagStatus })),
+				isRead: Schema.optionalKey(Schema.Boolean),
+				subject: Schema.optionalKey(Schema.String),
+				toRecipients: Schema.optionalKey(Schema.Array(Recipient)),
+			}),
+			success: Written,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("move", "/me/messages/:id/move", {
+			params,
+			payload: Schema.Struct({ destinationId: Schema.String }),
+			success: Written.pipe(HttpApiSchema.status(201)),
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("createReply", "/me/messages/:id/createReply", {
+			params,
+			payload: Reaction,
+			success: Written.pipe(HttpApiSchema.status(201)),
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("createReplyAll", "/me/messages/:id/createReplyAll", {
+			params,
+			payload: Reaction,
+			success: Written.pipe(HttpApiSchema.status(201)),
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("createForward", "/me/messages/:id/createForward", {
+			params,
+			payload: Reaction,
+			success: Written.pipe(HttpApiSchema.status(201)),
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("reply", "/me/messages/:id/reply", {
+			params,
+			payload: Reaction,
+			success: HttpApiSchema.Accepted,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("replyAll", "/me/messages/:id/replyAll", {
+			params,
+			payload: Reaction,
+			success: HttpApiSchema.Accepted,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("forward", "/me/messages/:id/forward", {
+			params,
+			payload: Reaction,
+			success: HttpApiSchema.Accepted,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("send", "/me/messages/:id/send", {
+			params,
+			success: HttpApiSchema.Accepted,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("sendMail", "/me/sendMail", {
+			payload: Schema.Struct({
+				message: NewMessage,
+				saveToSentItems: Schema.Boolean,
+			}),
+			success: HttpApiSchema.Accepted,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("createDraft", "/me/messages", {
+			payload: NewMessage,
+			success: Written.pipe(HttpApiSchema.status(201)),
+		})
+	)
+	.add(
+		HttpApiEndpoint.get("attachments", "/me/messages/:id/attachments", {
+			params,
+			success: Schema.Struct({ value: Schema.Array(Attachment) }),
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("addAttachment", "/me/messages/:id/attachments", {
+			params,
+			payload: Schema.Struct({
+				"@odata.type": Schema.Literal("#microsoft.graph.fileAttachment"),
+				contentBytes: Schema.String,
+				name: Schema.String,
+			}),
+			success: Written.pipe(HttpApiSchema.status(201)),
+		})
+	)
+	.add(
+		HttpApiEndpoint.post(
+			"createUploadSession",
+			"/me/messages/:id/attachments/createUploadSession",
+			{
+				params,
+				payload: Schema.Struct({
+					AttachmentItem: Schema.Struct({
+						attachmentType: Schema.Literal("file"),
+						name: Schema.String,
+						size: Schema.Int,
+					}),
+				}),
+				success: Schema.Struct({ uploadUrl: Schema.String }).pipe(
+					HttpApiSchema.status(201)
+				),
+			}
+		)
+	);
+
+export const GraphApi = HttpApi.make("Graph").add(mail);

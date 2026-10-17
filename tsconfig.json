@@ -48,8 +48,26 @@
 					"@effect/platform-bun/BunRuntime",
 					// Bun file system, path, stdio, terminal and child processes for every command.
 					"@effect/platform-bun/BunServices",
+					// Agent tools, the MCP server and its protocol adapters.
+					"effect/ai",
 					// The mx command line.
-					"effect/cli"
+					"effect/cli",
+					// Base64 for attachment uploads.
+					"effect/encoding",
+					// Saved sign-in, attachment downloads and uploads, and test homes.
+					"effect/FileSystem",
+					// Microsoft's token endpoint and Graph.
+					"effect/http",
+					// The Graph mail endpoints as an HttpApi.
+					"effect/http-api",
+					// XDG paths and file names.
+					"effect/Path",
+					// systemd-creds for the saved sign-in.
+					"effect/process",
+					"effect/Stdio",
+					"effect/Terminal",
+					// Console capture in the tests.
+					"effect/testing/TestConsole"
 				],
 				"allowedExperimentalApis": [],
 				"diagnosticSeverity": {
@@ -187,5 +205,5 @@
 		"incremental": true,
 		"tsBuildInfoFile": "${configDir}/.cache/tsbuildinfo.json"
 	},
-	"include": ["src/**/*.ts", "tests/**/*.ts"]
+	"include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"]
 }
