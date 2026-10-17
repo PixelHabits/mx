@@ -1,6 +1,7 @@
 import { BunRuntime } from "@effect/platform-bun";
-import { Array as Arr, Console, Effect } from "effect";
+import { Array as Arr, Console, Effect, Record as Rec } from "effect";
 import { pemContents } from "../src/update.ts";
+import { notices, noticesFile } from "./notices.ts";
 
 /** The release key's public half, committed; its private half never enters the repository. */
 const publicKeyFile = "release/public-key.pem";
@@ -44,37 +45,46 @@ export const targets = [
 ] as const;
 
 /**
- * Compiles each target minified and with bytecode, and writes its source map next to it, as `dist/mx-linux-x64.map`.
- * The release public key and the version in `package.json` come in through their imports. The build fails before it
- * compiles when a valid public key is missing, and a failed build fails loudly. Bytecode builds CommonJS unless told
- * otherwise, and the bundle uses `import.meta`, so the format is ESM. The binary reads no `.env` or `bunfig.toml` from
- * the folder it runs in, and no environment variable is inlined.
+ * Compiles each target minified and with bytecode, writes its source map next to it, as `dist/mx-linux-x64.map`, and
+ * writes the third-party notices of what the binaries hold next to them. The release public key and the version in
+ * `package.json` come in through their imports. The build fails before it compiles when a valid public key is missing,
+ * and a failed build fails loudly. Bytecode builds CommonJS unless told otherwise, and the bundle uses `import.meta`,
+ * so the format is ESM. The binary reads no `.env` or `bunfig.toml` from the folder it runs in, and no environment
+ * variable is inlined.
  */
 const compile = Effect.fnUntraced(function* (
 	chosen: readonly (typeof targets)[number][]
 ) {
 	yield* checkPublicKey;
-	yield* Effect.forEach(
-		chosen,
-		({ outfile, target }) =>
-			Effect.promise(() =>
-				Bun.build({
-					bytecode: true,
-					compile: {
-						autoloadBunfig: false,
-						autoloadDotenv: false,
-						outfile,
-						target,
-					},
-					entrypoints: ["src/main.ts"],
-					env: "disable",
-					format: "esm",
-					minify: true,
-					sourcemap: "linked",
-				})
-			).pipe(Effect.andThen(Console.log(`Built ${outfile}.`))),
-		{ discard: true }
+	const inputs = yield* Effect.forEach(chosen, ({ outfile, target }) =>
+		Effect.promise(() =>
+			Bun.build({
+				bytecode: true,
+				compile: {
+					autoloadBunfig: false,
+					autoloadDotenv: false,
+					outfile,
+					target,
+				},
+				entrypoints: ["src/main.ts"],
+				env: "disable",
+				format: "esm",
+				metafile: true,
+				minify: true,
+				sourcemap: "linked",
+			})
+		).pipe(
+			Effect.flatMap(({ metafile }) =>
+				metafile === undefined
+					? Effect.die(`Bun.build answered no metafile for ${outfile}.`)
+					: Effect.succeed(Rec.keys(metafile.inputs))
+			),
+			Effect.tap(Console.log(`Built ${outfile}.`))
+		)
 	);
+	const text = yield* notices(Arr.flatten(inputs));
+	yield* Effect.promise(() => Bun.write(noticesFile, text));
+	yield* Console.log(`Wrote ${noticesFile}.`);
 });
 
 export const build = compile(targets);

@@ -206,8 +206,8 @@ mx reindex
    bun run release
    ```
 
-   It builds both binaries into `dist/`, writes the manifest `dist/latest.json` with each binary's release URL, size and sha256, and signs it into `dist/latest.json.sig`.
-4. Create the GitHub release `v<version>` as a draft, attach `mx-linux-x64`, `mx-windows-x64.exe`, `latest.json` and `latest.json.sig`, then publish it. mx reads only the newest published release, so it never sees a release without its files.
+   It builds both binaries and their third-party notices into `dist/`, writes the manifest `dist/latest.json` with each binary's release URL, size and sha256, and signs it into `dist/latest.json.sig`.
+4. Create the GitHub release `v<version>` as a draft, attach `mx-linux-x64`, `mx-windows-x64.exe`, `THIRD_PARTY_NOTICES`, `latest.json` and `latest.json.sig`, then publish it. mx reads only the newest published release, so it never sees a release without its files.
 
 ## Develop
 
