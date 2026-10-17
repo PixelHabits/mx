@@ -15,7 +15,7 @@ import { Store } from "./store.ts";
 /**
  * Graph serves at most four concurrent requests per app and mailbox for Outlook resources
  * (https://learn.microsoft.com/graph/throttling-limits#outlook-service-limits). A pass reads this many folders at once,
- * which leaves a request for the mx mcp an agent runs.
+ * and a check against Graph makes this many requests at once, which leaves a request for the mx mcp an agent runs.
  */
 const folderConcurrency = 3;
 
@@ -28,6 +28,25 @@ export interface Pass {
 
 export const summary = ({ folders, removed, saved }: Pass) =>
 	`Synced ${folders} folders: ${saved} messages saved, ${removed} removed.`;
+
+/** What a check of the store against Graph repaired. */
+export interface Reconciled {
+	/** Messages Graph holds that the store lacked. */
+	readonly added: number;
+	readonly folders: number;
+	/** Messages the store filed in another folder than Graph. */
+	readonly refiled: number;
+	/** Messages the store held that Graph no longer has. */
+	readonly removed: number;
+}
+
+export const reconcileSummary = ({
+	added,
+	folders,
+	refiled,
+	removed,
+}: Reconciled) =>
+	`Reconciled ${folders} folders: ${added} added, ${refiled} refiled, ${removed} removed.`;
 
 /** How far a pass has got through the folders it reads from the start, as on the first sync. */
 export interface Progress {
@@ -45,6 +64,22 @@ const isRemoved = (entry: Entry): entry is Exclude<Entry, Message> =>
 	"@removed" in entry;
 
 const noProgress = () => Effect.void;
+
+type Repair = "added" | "refiled" | "removed" | "unchanged";
+
+/** What locating a message repaired, from the folder the store filed it in before and Graph's copy now. */
+const repairOf = (
+	before: string | undefined,
+	now: Option.Option<Message>
+): Repair => {
+	if (Option.isNone(now)) {
+		return before === undefined ? "unchanged" : "removed";
+	}
+	if (before === undefined) {
+		return "added";
+	}
+	return before === now.value.parentFolderId ? "unchanged" : "refiled";
+};
 
 /**
  * Brings the store up to date with the mailbox: lists every mail folder, then runs each folder's Graph delta from the
@@ -71,6 +106,12 @@ export class Sync extends Context.Service<
 		readonly finishedFirstPass: Effect.Effect<boolean>;
 		/** One folder's delta round, for a change notification about it. */
 		readonly folderPass: (folderId: string) => Effect.Effect<Pass, GraphError>;
+		/**
+		 * Checks the store against Graph and repairs what the deltas missed. It lists every mail folder, saving the list as a
+		 * pass does, and the ids of every folder's messages; each message whose folder in Graph and in the store differ is
+		 * located. It never runs at the same time as a pass, so no delta round changes a folder while it reads it.
+		 */
+		readonly reconcile: Effect.Effect<Reconciled, GraphError>;
 		/**
 		 * Asks Graph for the message by its immutable id, which a move keeps, and files it where Graph holds it. A message
 		 * Graph answers 404 for leaves the store, and the answer is none. A folder the store does not know yet, as before the
@@ -177,12 +218,18 @@ export class Sync extends Context.Service<
 					)
 				);
 
-			const passWithProgress = Effect.fn("Sync.pass")(function* (
-				report: (progress: Progress) => Effect.Effect<void>
-			) {
+			/** Lists every mail folder and saves the list; a folder Graph no longer has leaves with its messages. */
+			const listFolders = Effect.gen(function* () {
 				const folders = yield* graph.folders;
 				const sentItems = yield* graph.folder("sentitems");
 				yield* store.saveFolders(folders, sentItems.id);
+				return folders;
+			});
+
+			const passWithProgress = Effect.fn("Sync.pass")(function* (
+				report: (progress: Progress) => Effect.Effect<void>
+			) {
+				const folders = yield* listFolders;
 				const links = new Map(
 					Arr.getSomes(
 						Arr.map(yield* store.folders, ({ deltaLink, id }) =>
@@ -233,6 +280,39 @@ export class Sync extends Context.Service<
 				};
 			}, oneAtATime.withPermits(1));
 
+			const reconcile = Effect.gen(function* () {
+				const folders = yield* listFolders;
+				const listed = yield* Effect.forEach(
+					folders,
+					(folder) =>
+						Effect.map(
+							graph.messageIds(folder.id),
+							Arr.map((id) => [id, folder.id] as const)
+						),
+					{ concurrency: folderConcurrency }
+				);
+				const inGraph = new Map(Arr.flatten(listed));
+				const inStore = yield* store.placements;
+				const differ = Arr.filter(
+					[...new Set([...inGraph.keys(), ...inStore.keys()])],
+					(id) => inGraph.get(id) !== inStore.get(id)
+				);
+				const repairs = yield* Effect.forEach(
+					differ,
+					(id) =>
+						Effect.map(locate(id), (now) => repairOf(inStore.get(id), now)),
+					{ concurrency: folderConcurrency }
+				);
+				const count = (wanted: Repair) =>
+					Arr.filter(repairs, (repair) => repair === wanted).length;
+				return {
+					added: count("added"),
+					folders: folders.length,
+					refiled: count("refiled"),
+					removed: count("removed"),
+				};
+			}).pipe(oneAtATime.withPermits(1), Effect.withSpan("Sync.reconcile"));
+
 			const finishedFirstPass = Effect.map(
 				store.folders,
 				(stored) =>
@@ -264,6 +344,7 @@ export class Sync extends Context.Service<
 				locate,
 				pass: passWithProgress(noProgress),
 				passWithProgress,
+				reconcile,
 			});
 		})
 	);

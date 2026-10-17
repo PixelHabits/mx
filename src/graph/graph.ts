@@ -31,6 +31,7 @@ import {
 	folderSelect,
 	GraphApi,
 	GraphErrorBody,
+	IdPage,
 	type Message,
 	messageSelect,
 	type Reaction,
@@ -51,12 +52,26 @@ export const isNotFound = (error: GraphError): error is GraphRefused =>
 
 const graphBase = "https://graph.microsoft.com/v1.0";
 
-/** Plain-text bodies, message ids that survive a move within the mailbox, and up to 100 messages per delta page. */
-const prefer =
-	'outlook.body-content-type="text", IdType="ImmutableId", odata.maxpagesize=100';
+/** Plain-text bodies, and message ids that survive a move within the mailbox. */
+const prefer = 'outlook.body-content-type="text", IdType="ImmutableId"';
+
+/**
+ * Up to 100 messages per delta page. Graph documents the preference for delta only
+ * (https://learn.microsoft.com/graph/delta-query-messages#optional-request-header), so no other request sends it.
+ */
+const deltaPrefer = `${prefer}, odata.maxpagesize=100`;
 
 /** Folders per page of a folder listing. */
 const folderPageSize = 100;
+
+/** Message ids per page of a folder's listing: `$top` takes 1 to 1000 (https://learn.microsoft.com/graph/api/user-list-messages). */
+const idPageSize = 1000;
+
+/** One page of a Graph collection. */
+interface Page<A> {
+	readonly "@odata.nextLink"?: string;
+	readonly value: readonly A[];
+}
 
 /** Graph takes an attachment of up to 3 MB in one request; a larger one goes through an upload session. */
 const singleRequestAttachmentLimit = 3 * 1024 * 1024;
@@ -183,6 +198,10 @@ export class Graph extends Context.Service<
 		/** Every mail folder, each parent before its children. */
 		readonly folders: Effect.Effect<readonly Folder[], GraphError>;
 		readonly folder: (idOrName: string) => Effect.Effect<Folder, GraphError>;
+		/** The ids of every message in the folder. */
+		readonly messageIds: (
+			folderId: string
+		) => Effect.Effect<readonly string[], GraphError>;
 		/** The folder's first delta page, or the page at a next or delta link Graph gave before. */
 		readonly delta: (
 			folderId: string,
@@ -250,13 +269,18 @@ export class Graph extends Context.Service<
 		Effect.gen(function* () {
 			const auth = yield* Auth;
 			const transport = policy(yield* HttpClient.HttpClient);
-			const client = auth
-				.authorize(
-					transport.pipe(
-						HttpClient.mapRequest(HttpClientRequest.setHeader("prefer", prefer))
+			const preferring = (preference: string) =>
+				auth
+					.authorize(
+						transport.pipe(
+							HttpClient.mapRequest(
+								HttpClientRequest.setHeader("prefer", preference)
+							)
+						)
 					)
-				)
-				.pipe(HttpClient.transformResponse(Effect.flatMap(checked)));
+					.pipe(HttpClient.transformResponse(Effect.flatMap(checked)));
+			const client = preferring(prefer);
+			const deltaClient = preferring(deltaPrefer);
 			/** Upload URLs carry their own authorization and refuse a bearer token. */
 			const uploads = transport.pipe(
 				HttpClient.transformResponse(Effect.flatMap(checked))
@@ -267,10 +291,41 @@ export class Graph extends Context.Service<
 					httpClient: client,
 				});
 
-			const getJson = <S extends Schema.Top>(url: string, schema: S) =>
-				client
-					.get(url)
-					.pipe(Effect.flatMap(HttpClientResponse.schemaBodyJson(schema)));
+			const firstDelta = yield* HttpApiClient.endpoint(GraphApi, {
+				baseUrl: graphBase,
+				endpoint: "delta",
+				group: "mail",
+				httpClient: deltaClient,
+			});
+
+			const getJsonFrom =
+				(http: typeof client) =>
+				<S extends Schema.Top>(url: string, schema: S) =>
+					http
+						.get(url)
+						.pipe(Effect.flatMap(HttpClientResponse.schemaBodyJson(schema)));
+			const getJson = getJsonFrom(client);
+
+			/** Every item of a collection: its first page, then the page at each `@odata.nextLink`. */
+			const everyPage = <
+				A,
+				S extends Schema.Top & {
+					readonly DecodingServices: never;
+					readonly Type: Page<A>;
+				},
+			>(
+				schema: S,
+				first: Effect.Effect<Page<A>, GraphError>
+			) =>
+				Effect.gen(function* () {
+					let page = yield* first;
+					const found: A[] = [...page.value];
+					while (page["@odata.nextLink"] !== undefined) {
+						page = yield* settle(getJson(page["@odata.nextLink"], schema));
+						found.push(...page.value);
+					}
+					return found;
+				});
 
 			const message = (id: string) =>
 				settle(
@@ -281,12 +336,7 @@ export class Graph extends Context.Service<
 				first: Effect.Effect<typeof FolderPage.Type, GraphError>
 			): Effect.Effect<readonly Folder[], GraphError> =>
 				Effect.gen(function* () {
-					let page = yield* first;
-					const found: Folder[] = [...page.value];
-					while (page["@odata.nextLink"] !== undefined) {
-						page = yield* settle(getJson(page["@odata.nextLink"], FolderPage));
-						found.push(...page.value);
-					}
+					const found = yield* everyPage(FolderPage, first);
 					const nested = yield* Effect.forEach(found, (parent) =>
 						parent.childFolderCount === 0
 							? Effect.succeed([parent])
@@ -312,17 +362,32 @@ export class Graph extends Context.Service<
 				settle(mail.folder({ params: { id: idOrName } }))
 			);
 
+			const messageIds = Effect.fn("Graph.messageIds")(function* (
+				folderId: string
+			) {
+				const found = yield* everyPage(
+					IdPage,
+					settle(
+						mail.messageIds({
+							params: { id: folderId },
+							query: { $select: "id", $top: idPageSize },
+						})
+					)
+				);
+				return Arr.map(found, ({ id }) => id);
+			});
+
 			const delta = Effect.fn("Graph.delta")(
 				(folderId: string, link: Option.Option<string>) =>
 					Option.match(link, {
 						onNone: () =>
 							settle(
-								mail.delta({
+								firstDelta({
 									params: { id: folderId },
 									query: { $select: messageSelect },
 								})
 							),
-						onSome: (url) => settle(getJson(url, DeltaPage)),
+						onSome: (url) => settle(getJsonFrom(deltaClient)(url, DeltaPage)),
 					})
 			);
 
@@ -485,17 +550,10 @@ export class Graph extends Context.Service<
 				}
 			);
 
-			const subscriptions = Effect.gen(function* () {
-				let page = yield* settle(subscriptionApi.list());
-				const found: Subscription[] = [...page.value];
-				while (page["@odata.nextLink"] !== undefined) {
-					page = yield* settle(
-						getJson(page["@odata.nextLink"], SubscriptionPage)
-					);
-					found.push(...page.value);
-				}
-				return found;
-			}).pipe(Effect.withSpan("Graph.subscriptions"));
+			const subscriptions = everyPage(
+				SubscriptionPage,
+				settle(subscriptionApi.list())
+			).pipe(Effect.withSpan("Graph.subscriptions"));
 
 			const subscribe: Graph["Service"]["subscribe"] = Effect.fn(
 				"Graph.subscribe"
@@ -535,6 +593,7 @@ export class Graph extends Context.Service<
 				folder,
 				folders,
 				message: Effect.fn("Graph.message")(message),
+				messageIds,
 				move,
 				reauthorize,
 				renew,

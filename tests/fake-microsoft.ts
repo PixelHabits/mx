@@ -70,6 +70,10 @@ export interface Received {
 
 type Json = Record<string, unknown>;
 
+/** The key of a held request: what it reads, a folder's delta or the ids of its messages, and the folder. */
+const heldKey = (folderId: string, ids: boolean) =>
+	`${ids ? "ids" : "delta"} ${folderId}`;
+
 const json = (
 	body: unknown,
 	status = 200,
@@ -123,7 +127,10 @@ export class FakeMicrosoft {
 	private deltasInFlight = 0;
 	/** The folders whose delta rounds Graph ended with a delta link, in order. */
 	readonly roundsEnded: string[] = [];
-	/** Folders whose delta requests wait until `release` lets them through, and whether Graph answered them first. */
+	/**
+	 * The requests that wait until `release` lets them through, by what they read and the folder, and whether Graph
+	 * answered them first.
+	 */
 	private readonly held = new Map<
 		string,
 		{ readonly answered: boolean; readonly gate: PromiseWithResolvers<void> }
@@ -277,16 +284,21 @@ export class FakeMicrosoft {
 	);
 
 	/**
-	 * Makes the delta requests of `folderId` wait until `release`. With `answered`, Graph reads the folder as soon as it is
-	 * asked, so the page that arrives on release shows the folder as it was then, as a page still on its way does.
+	 * Makes the requests that read `folderId` wait until `release`: its delta pages, or with `ids` the listing of its
+	 * message ids. With `answered`, Graph reads the folder as soon as it is asked, so the page that arrives on release
+	 * shows the folder as it was then, as a page still on its way does.
 	 */
-	hold(folderId: string, { answered = false } = {}) {
-		this.held.set(folderId, { answered, gate: Promise.withResolvers<void>() });
+	hold(folderId: string, { answered = false, ids = false } = {}) {
+		this.held.set(heldKey(folderId, ids), {
+			answered,
+			gate: Promise.withResolvers<void>(),
+		});
 	}
 
-	release(folderId: string) {
-		this.held.get(folderId)?.gate.resolve();
-		this.held.delete(folderId);
+	release(folderId: string, { ids = false } = {}) {
+		const key = heldKey(folderId, ids);
+		this.held.get(key)?.gate.resolve();
+		this.held.delete(key);
 	}
 
 	/** Makes the next read of the message by its id wait until `releaseReads`, answered as Graph held it when asked. */
@@ -305,12 +317,12 @@ export class FakeMicrosoft {
 	}
 
 	/**
-	 * Answers a delta request after `deltaDelay`, and after `release` for a held folder, counting it in flight meanwhile;
-	 * the next read of a message held by `holdRead` waits until `releaseReads`.
+	 * Answers a request that reads a folder's messages after `release` when it is held, and the next read of a message
+	 * held by `holdRead` after `releaseReads`; a delta request also waits `deltaDelay` and counts in flight meanwhile.
 	 */
 	private paced<A>(request: Request, answer: Effect.Effect<A>) {
 		const url = new URL(request.url);
-		const [, , , collection, id = "", messages] = decodeURIComponent(
+		const [, , , collection, id = "", messages, delta] = decodeURIComponent(
 			url.pathname
 		).split("/");
 		const read = this.heldReads.get(id);
@@ -324,8 +336,23 @@ export class FakeMicrosoft {
 			read.taken = true;
 			return Effect.tap(answer, () => Effect.promise(() => read.gate.promise));
 		}
-		if (!url.pathname.endsWith("/messages/delta")) {
+		if (collection !== "mailFolders" || messages !== "messages") {
 			return answer;
+		}
+		const ids = delta === undefined;
+		const key = heldKey(id, ids);
+		const gate = Effect.promise(
+			() => this.held.get(key)?.gate.promise ?? Promise.resolve()
+		);
+		const waited = ids
+			? gate
+			: Effect.andThen(Effect.sleep(this.deltaDelay), gate);
+		const held = () =>
+			this.held.get(key)?.answered === true
+				? Effect.tap(answer, () => waited)
+				: Effect.andThen(waited, answer);
+		if (ids) {
+			return Effect.suspend(held);
 		}
 		const count = (step: number) =>
 			Effect.sync(() => {
@@ -335,21 +362,7 @@ export class FakeMicrosoft {
 					this.deltasInFlight
 				);
 			});
-		const waited = Effect.sleep(this.deltaDelay).pipe(
-			Effect.andThen(
-				Effect.promise(
-					() => this.held.get(id)?.gate.promise ?? Promise.resolve()
-				)
-			)
-		);
-		return Effect.acquireUseRelease(
-			count(1),
-			() =>
-				this.held.get(id)?.answered === true
-					? Effect.tap(answer, () => waited)
-					: Effect.andThen(waited, answer),
-			() => count(-1)
-		);
+		return Effect.acquireUseRelease(count(1), held, () => count(-1));
 	}
 
 	/** Removes a message the way a permanent delete in Outlook does, so the next delta reports it removed. */
@@ -368,6 +381,19 @@ export class FakeMicrosoft {
 			this.changes.push({ folderId: message.parentFolderId, id });
 			message.parentFolderId = folderId;
 			this.changes.push({ folderId, id });
+		}
+	}
+
+	/** Adds a mail folder below `parentFolderId`, as the user makes one in Outlook. */
+	addFolder(id: string, displayName: string, parentFolderId: string) {
+		this.folders.set(id, { displayName, parentFolderId });
+	}
+
+	/** Deletes a mail folder and the messages in it for good. */
+	removeFolder(id: string) {
+		this.folders.delete(id);
+		for (const message of this.inFolder(id)) {
+			this.messages.delete(message.id);
 		}
 	}
 
@@ -440,6 +466,16 @@ export class FakeMicrosoft {
 		this.messages.set(added.id, added);
 		this.changes.push({ folderId: added.parentFolderId, id: added.id });
 		return added;
+	}
+
+	/**
+	 * Makes the changes `change` makes to messages leave no trace in any delta, as changes Graph's delta misses. No delta
+	 * link is issued while it runs, so dropping the changes it logged moves no link.
+	 */
+	missedByDelta(change: () => void) {
+		const logged = this.changes.length;
+		change();
+		this.changes.splice(logged);
 	}
 
 	private newId(prefix: string) {
@@ -670,6 +706,28 @@ export class FakeMicrosoft {
 		});
 	}
 
+	/**
+	 * The ids of the folder's messages, for `$select=id`. Graph serves up to `$top` per page; here a page holds 2, so a
+	 * listing takes several pages, as a large folder does.
+	 */
+	private messageIds(folderId: string, url: URL) {
+		if (url.searchParams.get("$select") !== "id") {
+			return graphError(
+				400,
+				"ErrorInvalidRequest",
+				"The fake lists messages only with $select=id."
+			);
+		}
+		const all = this.inFolder(folderId);
+		const offset = Number(url.searchParams.get("$skip") ?? "0");
+		const next = new URL(url);
+		next.searchParams.set("$skip", String(offset + 2));
+		return json({
+			value: Arr.map(all.slice(offset, offset + 2), ({ id }) => ({ id })),
+			...(offset + 2 < all.length ? { "@odata.nextLink": next.href } : {}),
+		});
+	}
+
 	private draft(
 		input: Pick<
 			FakeMessage,
@@ -804,6 +862,9 @@ export class FakeMicrosoft {
 		}
 		if (action === "messages" && messagesAction === "delta") {
 			return this.delta(folderId, url, asText);
+		}
+		if (action === "messages") {
+			return this.messageIds(folderId, url);
 		}
 		return json(this.folderJson(folderId));
 	}

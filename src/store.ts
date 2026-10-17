@@ -317,6 +317,8 @@ export class Store extends Context.Service<
 			lookup: Lookup,
 			answer: Option.Option<Message>
 		) => Effect.Effect<void>;
+		/** The folder id each stored message is filed in, by its Graph id. */
+		readonly placements: Effect.Effect<ReadonlyMap<string, string>>;
 		/** Removes the folder's messages whose Graph ids `kept` does not list. */
 		readonly keepOnly: (
 			folderId: string,
@@ -625,6 +627,16 @@ export class Store extends Context.Service<
 					})
 				);
 
+			const placements = all(
+				Schema.Struct({ folder_id: Schema.String, graph_id: Schema.String }),
+				"SELECT graph_id, folder_id FROM messages"
+			).pipe(
+				Effect.map(
+					(rows): ReadonlyMap<string, string> =>
+						new Map(Arr.map(rows, (row) => [row.graph_id, row.folder_id]))
+				)
+			);
+
 			const keepOnly = (folderId: string, kept: readonly string[]) =>
 				Effect.flatMap(jsonIds(kept), (ids) =>
 					run(
@@ -766,6 +778,7 @@ export class Store extends Context.Service<
 				keepOnly,
 				lookup,
 				ownAddresses,
+				placements,
 				reindex,
 				remove,
 				saveFolder,

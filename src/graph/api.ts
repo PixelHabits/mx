@@ -69,6 +69,12 @@ export const DeltaPage = Schema.Struct({
 });
 export type DeltaPage = typeof DeltaPage.Type;
 
+/** One page of a folder's message ids, as a listing with `$select=id` answers them. */
+export const IdPage = Schema.Struct({
+	"@odata.nextLink": Schema.optionalKey(Schema.String),
+	value: Schema.Array(Schema.Struct({ id: Schema.String })),
+});
+
 export const Folder = Schema.Struct({
 	childFolderCount: Schema.Int,
 	displayName: Schema.String,
@@ -166,6 +172,13 @@ export const mail = HttpApiGroup.make("mail")
 			params,
 			query: { $select: Schema.String },
 			success: DeltaPage,
+		})
+	)
+	.add(
+		HttpApiEndpoint.get("messageIds", "/me/mailFolders/:id/messages", {
+			params,
+			query: { $select: Schema.Literal("id"), $top: Schema.FiniteFromString },
+			success: IdPage,
 		})
 	)
 	.add(

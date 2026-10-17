@@ -4,6 +4,7 @@ import {
 	Context,
 	Duration,
 	Effect,
+	Latch,
 	Layer,
 	Option,
 	Queue,
@@ -21,13 +22,28 @@ import { policy } from "./http-policy.ts";
 import { Cloudflared } from "./push/cloudflared.ts";
 import { beatInterval, signInExpired } from "./status.ts";
 import { Store, type SyncMode } from "./store.ts";
-import { type Pass, Sync, summary } from "./sync.ts";
+import { type Pass, reconcileSummary, Sync, summary } from "./sync.ts";
 
 /** How often every folder is polled while push notifications arrive. */
 const healthyPollInterval = Duration.minutes(5);
 
 /** How often every folder is polled while push is down. */
 const fallbackPollInterval = Duration.seconds(60);
+
+/**
+ * How often mx sync checks the whole store against Graph, after the check that follows its first pass. Deltas and push
+ * carry every change, so the check only bounds how long a change they miss stays wrong; it costs a listing request per
+ * 1000 messages of each folder, and a read for each message it repairs.
+ */
+const reconcileInterval = Duration.days(1);
+
+/**
+ * How long mx sync waits after a check that failed before it checks again. A check fails once the HTTP policy has spent
+ * its retries of a request, so Graph is out or throttling for longer than those take; an hour lets that pass without
+ * adding load while it lasts, and costs at most 24 checks a day, each failing at its first request, while the passes
+ * keep the store current.
+ */
+const reconcileRetryInterval = Duration.hours(1);
 
 /** How long push waits after it went down before it tries again. */
 const pushRetryInterval = Duration.minutes(10);
@@ -109,8 +125,9 @@ const randomHex = (bytes: number) =>
  * `mx sync` as a service: Graph push notifications first, polling as the fallback. Push runs a cloudflared quick tunnel
  * to a local webhook and two Graph subscriptions, on Inbox and Sent Items; each notification runs a delta pass for its
  * folder. Every folder is also polled, every 5 minutes while push is up and every 60 seconds while it is down, and push
- * tries again every 10 minutes. The heartbeat row in the store says how it goes: mx sync writes it every minute, and
- * after every pass and on every change of mode.
+ * tries again every 10 minutes. After the first pass and then once a day, it checks the store against Graph and repairs
+ * what the deltas missed. The heartbeat row in the store says how it goes: mx sync writes it every minute, and after
+ * every pass and check and on every change of mode.
  */
 export class Watch extends Context.Service<
 	Watch,
@@ -168,14 +185,15 @@ export class Watch extends Context.Service<
 					error: Option.some(message),
 				})).pipe(Effect.andThen(beat));
 
-			/** A pass that logs what it changed and records how it went; an outage waits for the next pass. */
-			const logged = (pass: Effect.Effect<Pass, GraphError>) =>
-				pass.pipe(
-					Effect.tap((done) =>
-						done.saved + done.removed > 0
-							? Effect.logInfo(summary(done))
-							: Effect.void
-					),
+			/** Opens once a pass has succeeded, which the first check against Graph waits for. */
+			const firstPass = yield* Latch.make();
+
+			/**
+			 * Records how a pass or a check went in the heartbeat, and answers whether it succeeded; an outage is logged and
+			 * waits for the next one.
+			 */
+			const recorded = (work: Effect.Effect<void, GraphError>) =>
+				work.pipe(
 					Effect.andThen(currentInstant),
 					Effect.flatMap((at) =>
 						Ref.set(outcome, {
@@ -184,11 +202,25 @@ export class Watch extends Context.Service<
 						})
 					),
 					Effect.andThen(beat),
+					Effect.as(true),
 					Effect.catchTag("MicrosoftUnavailable", (error) =>
 						Effect.andThen(
 							Effect.logWarning(error.message),
 							recordError(error.message)
-						)
+						).pipe(Effect.as(false))
+					)
+				);
+
+			/** A pass that logs what it changed and records how it went. */
+			const logged = (pass: Effect.Effect<Pass, GraphError>) =>
+				recorded(
+					pass.pipe(
+						Effect.tap((done) =>
+							done.saved + done.removed > 0
+								? Effect.logInfo(summary(done))
+								: Effect.void
+						),
+						Effect.andThen(firstPass.open)
 					)
 				);
 
@@ -417,10 +449,31 @@ export class Watch extends Context.Service<
 				yield* logged(sync.pass);
 			}).pipe(Effect.repeat(Schedule.spaced(fallbackPollInterval)));
 
+			/**
+			 * The check against Graph, once the first pass succeeded, then every day, or an hour after a check that failed; it
+			 * logs what it repaired.
+			 */
+			const reconcile = firstPass.await.pipe(
+				Effect.andThen(
+					recorded(
+						Effect.flatMap(sync.reconcile, (done) =>
+							Effect.logInfo(reconcileSummary(done))
+						)
+					).pipe(
+						Effect.flatMap((succeeded) =>
+							Effect.sleep(
+								succeeded ? reconcileInterval : reconcileRetryInterval
+							)
+						),
+						Effect.forever
+					)
+				)
+			);
+
 			/** The heartbeat from start to stop, so mx sync looks alive however long a pass takes. */
 			const heartbeat = beat.pipe(Effect.repeat(Schedule.spaced(beatInterval)));
 
-			const run = Effect.raceAllFirst([heartbeat, push, poll]).pipe(
+			const run = Effect.raceAllFirst([heartbeat, push, poll, reconcile]).pipe(
 				Effect.andThen(Effect.never),
 				Effect.tapError((error) =>
 					recordError(

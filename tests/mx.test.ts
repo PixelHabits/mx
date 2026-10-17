@@ -476,6 +476,16 @@ const deltaRequests = (folderId: string) =>
 		request.url.pathname.includes(`/${folderId}/`)
 	).length;
 
+/** The requests that listed the ids of the messages in a folder. */
+const idListings = () =>
+	Arr.filter(microsoft.graphRequests(), (request) =>
+		idListingPath.test(request.url.pathname)
+	);
+const inboxIdListings = () =>
+	Arr.filter(idListings(), (request) =>
+		request.url.pathname.includes("/folder-inbox/")
+	).length;
+
 const allFolders = [
 	"folder-inbox",
 	"folder-projects",
@@ -758,6 +768,7 @@ const bookClubLine =
 const bookClubReplyLine =
 	/ \| Jonas Example <jonas@example\.com> \| RE: Book club: the next novel \| unread \(\+1 in thread\)$/u;
 const recipeSwapLine = /Recipe swap \| unread \(\+3 in thread\)$/u;
+const idListingPath = /^\/v1\.0\/me\/mailFolders\/[^/]+\/messages$/u;
 const rotaInArchiveLine =
 	/ Archive \| Rosa Example <rosa@example\.com> \| Garden plot rota /u;
 const timeLeft = /, (about \d+ min|less than a minute) left/u;
@@ -1232,6 +1243,7 @@ describe("mx", () => {
 			for (const request of deltas) {
 				expect(request.prefer).toContain('outlook.body-content-type="text"');
 				expect(request.prefer).toContain('IdType="ImmutableId"');
+				expect(request.prefer).toContain("odata.maxpagesize=100");
 			}
 			const answer = yield* call("search", { limit: 50 });
 			expect(answer.structured).toBeUndefined();
@@ -2044,6 +2056,159 @@ describe("mx", () => {
 			);
 			yield* Fiber.interrupt(service);
 		}).pipe(
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test and its mx sync run on.
+			Effect.provide(TestClock.layer())
+		));
+
+	test("after its first pass, mx sync checks the store against Graph: it adds a message the delta never delivered, refiles one stored in the wrong folder, removes one Graph no longer has, and drops a deleted folder with its messages", () =>
+		Effect.gen(function* () {
+			const seeds = microsoft.deliver({
+				body: "Bring spare bean seeds on Saturday.",
+				conversationId: "conversation-seeds",
+				from: rosa,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-08T08:00:00Z",
+				subject: "Seed swap",
+			});
+			const compost = microsoft.deliver({
+				body: "The compost bins are full again.",
+				conversationId: "conversation-compost",
+				from: rosa,
+				parentFolderId: "folder-inbox",
+				received: "2026-10-08T09:00:00Z",
+				subject: "Compost bins",
+			});
+			microsoft.addFolder("folder-allotment", "Allotment", "folder-inbox");
+			microsoft.deliver({
+				body: "Plot seven is free from November.",
+				conversationId: "conversation-plot",
+				from: rosa,
+				parentFolderId: "folder-allotment",
+				received: "2026-10-08T10:00:00Z",
+				subject: "Plot seven",
+			});
+			yield* cli("sync", "--once");
+			const seedsId = idOf(yield* tool("search", { query: "seeds" }), "Seed");
+			const compostId = idOf(
+				yield* tool("search", { query: "compost" }),
+				"Compost"
+			);
+			expect(yield* tool("search", { folder: "Allotment" })).toContain(
+				"Plot seven"
+			);
+			microsoft.missedByDelta(() => {
+				microsoft.deliver({
+					body: "Rain is due on Sunday, so the hedge trimming moves to Monday.",
+					conversationId: "conversation-hedge",
+					from: rosa,
+					parentFolderId: "folder-inbox",
+					received: "2026-10-08T11:00:00Z",
+					subject: "Hedge trimming moved",
+				});
+				microsoft.move(compost.id, "folder-archive");
+				microsoft.purge(seeds.id);
+			});
+			microsoft.removeFolder("folder-allotment");
+			const listed = idListings().length;
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"the store in step with Graph",
+				Effect.gen(function* () {
+					const hedge = yield* call("search", { query: "hedge" });
+					const moved = yield* call("message", { id: compostId });
+					const purged = yield* call("message", { id: seedsId });
+					return (
+						hedge.text.includes("Hedge trimming moved") &&
+						lineIn(compostId, "Archive").test(moved.text) &&
+						purged.isError
+					);
+				})
+			);
+			yield* Fiber.interrupt(service);
+			expect(yield* refusal("search", { folder: "Allotment" })).toContain(
+				"No folder named Allotment."
+			);
+			const listings = idListings().slice(listed);
+			expect(listings.length).toBeGreaterThan(allFolders.length);
+			for (const { prefer, url } of listings) {
+				expect(url.searchParams.get("$select")).toBe("id");
+				expect(url.searchParams.get("$top")).toBe("1000");
+				expect(prefer).toContain('IdType="ImmutableId"');
+				expect(prefer).not.toContain("maxpagesize");
+			}
+		}));
+
+	test("a delta pass waits while the check against Graph lists the ids of the same folder", () =>
+		Effect.gen(function* () {
+			microsoft.hold("folder-inbox", { answered: true, ids: true });
+			const asked = inboxIdListings();
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"the check listing Inbox",
+				() => inboxIdListings() > asked
+			);
+			const before = deltaRequests("folder-inbox");
+			yield* TestClock.adjust("60 seconds");
+			yield* settle;
+			expect(deltaRequests("folder-inbox")).toBe(before);
+			microsoft.release("folder-inbox", { ids: true });
+			yield* eventually(
+				"the delta pass of Inbox after the check",
+				TestClock.adjust("5 seconds").pipe(
+					Effect.andThen(settleBriefly),
+					Effect.map(() => deltaRequests("folder-inbox") > before)
+				)
+			);
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release("folder-inbox", { ids: true });
+				})
+			),
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test and its mx sync run on.
+			Effect.provide(TestClock.layer())
+		));
+
+	test("a check against Graph that fails runs again an hour later, not a day later", () =>
+		Effect.gen(function* () {
+			const asked = inboxIdListings();
+			const listed = idListings().length;
+			microsoft.hold("folder-inbox", { ids: true });
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"the check listing the folders",
+				() => idListings().length > listed
+			);
+			microsoft.outage = 503;
+			microsoft.release("folder-inbox", { ids: true });
+			yield* eventually(
+				"the last try of the listing during the outage",
+				TestClock.adjust("5 seconds").pipe(
+					Effect.andThen(settleBriefly),
+					Effect.map(() => inboxIdListings() > asked + 3)
+				)
+			);
+			microsoft.outage = 0;
+			const failed = inboxIdListings();
+			yield* TestClock.adjust("50 minutes");
+			yield* settle;
+			expect(inboxIdListings()).toBe(failed);
+			yield* eventually(
+				"the check an hour after it failed",
+				TestClock.adjust("5 minutes").pipe(
+					Effect.andThen(settleBriefly),
+					Effect.map(() => inboxIdListings() > failed)
+				)
+			);
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.outage = 0;
+					microsoft.release("folder-inbox", { ids: true });
+				})
+			),
 			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test and its mx sync run on.
 			Effect.provide(TestClock.layer())
 		));
