@@ -94,3 +94,11 @@ export class InstallFailed extends Schema.TaggedError<
 >("mx/errors/InstallFailed")("InstallFailed", {
 	message: Schema.String,
 }) {}
+
+/** `mx update` refused a release, or could not fetch or install it; `message` says which. */
+export class UpdateFailed extends Schema.TaggedError<
+	UpdateFailed,
+	{ readonly brand: unique symbol }
+>("mx/errors/UpdateFailed")("UpdateFailed", {
+	message: Schema.String,
+}) {}

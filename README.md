@@ -29,11 +29,14 @@ journalctl --user -u mx-sync -f
 
 ### Windows
 
-Build on Linux with `bun run build`, copy `dist/mx-windows-x64.exe` to the Windows machine, and run it from a terminal:
+Download `mx-windows-x64.exe` from the latest GitHub release, then run it from a terminal:
 
 ```powershell
+Invoke-WebRequest https://github.com/PixelHabits/mx/releases/latest/download/mx-windows-x64.exe -OutFile mx-windows-x64.exe
 .\mx-windows-x64.exe install
 ```
+
+The exe is not code-signed, so SmartScreen warns before it runs. Choose More info, then Run anyway.
 
 The binary goes to `%LOCALAPPDATA%\Programs\mx\mx.exe`. Next to it, `mxw.exe` is the same program marked as a Windows GUI program, so Windows starts it without a console window. The value `mx` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` starts `mxw.exe sync` at sign-in. Its log is `%LOCALAPPDATA%\mx\state\sync.log`.
 
@@ -52,6 +55,18 @@ It lists what it removes and asks first. `mx uninstall --yes` removes it all wit
 3. Deletes the installed binary, `config.json` with the client id and the tenant, the mail store, the saved sign-in, the attachment cache and the state folder.
 
 Nothing of mx stays. To keep the sign-in, the mail and the settings, run `mx install` again instead.
+
+## Updates
+
+`mx sync` checks for a newer release when it starts and then once a day. `mx update` checks now. Both:
+
+1. Fetch the manifest `latest.json` of the newest published release, `https://github.com/PixelHabits/mx/releases/latest/download/latest.json`, and its signature `latest.json.sig`.
+2. Check the Ed25519 signature against the release key compiled into mx, and refuse a manifest the key did not sign.
+3. Refuse a version that is not higher than the running one.
+4. Download the binary for this platform and refuse it unless its size and sha256 match the manifest.
+5. Replace the installed binary and restart `mx sync`. mx writes the new file next to the old one and renames it into place, so the installed path never holds part of a binary. Windows cannot replace a running exe, so there mx first renames `mx.exe` to `mx.old.exe`, and the next `mx sync` deletes it.
+
+An update needs `mx install` first; it replaces the installed binary.
 
 ## How the sync service follows the mailbox
 
@@ -119,6 +134,19 @@ The tools carry MCP hints: `readOnlyHint` on `search`, `thread`, `message` and `
 mx reindex
 ```
 
+## Release
+
+1. Raise `version` in `package.json` above the published one.
+2. Set `MX_RELEASE_SIGNING_KEY` to the release signing key, an Ed25519 private key in PKCS #8 PEM. Its public half is `release/public-key.pem`, and every build compiles that in.
+3. Run:
+
+   ```sh
+   bun run release
+   ```
+
+   It builds both binaries into `dist/`, writes the manifest `dist/latest.json` with each binary's release URL, size and sha256, and signs it into `dist/latest.json.sig`.
+4. Create the GitHub release `v<version>` as a draft, attach `mx-linux-x64`, `mx-windows-x64.exe`, `latest.json` and `latest.json.sig`, then publish it. mx reads only the newest published release, so it never sees a release without its files.
+
 ## Develop
 
 ```sh
@@ -127,7 +155,7 @@ bun run check
 bun run test
 ```
 
-The tests run every command against an in-memory Microsoft in `tests/fake-microsoft.ts`, and talk to `mx mcp` over its stdio as a client does. `tests/fake-secrets.ts` stands in for `Bun.secrets`, so no test touches the system's secret store. `tests/fake-processes.ts` stands in for every program mx starts: its cloudflared opens quick tunnels on the fake internet in `tests/fake-push.ts`, where Graph validates the webhook and posts notifications to it.
+The tests run every command against an in-memory Microsoft in `tests/fake-microsoft.ts`, and talk to `mx mcp` over its stdio as a client does. `tests/fake-secrets.ts` stands in for `Bun.secrets`, so no test touches the system's secret store. `tests/fake-processes.ts` stands in for every program mx starts: its cloudflared opens quick tunnels on the fake internet in `tests/fake-push.ts`, where Graph validates the webhook and posts notifications to it. `tests/fake-releases.ts` serves releases signed with a throwaway Ed25519 key.
 
 To try the server by hand, pipe MCP 2026-07-28 requests into it. Each request carries its protocol version in `_meta`, and there is no handshake:
 

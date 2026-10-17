@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, mock } from "bun:test";
 import { BunServices } from "@effect/platform-bun";
 import {
 	Array as Arr,
@@ -20,6 +20,7 @@ import {
 import { Command } from "effect/cli";
 import type { ChildProcess } from "effect/process";
 import { TestClock, TestConsole } from "effect/testing";
+import packageJson from "../package.json" with { type: "json" };
 import { savedConfig } from "../src/auth/config.ts";
 import { mx } from "../src/cli.ts";
 import { Paths } from "../src/paths.ts";
@@ -33,13 +34,24 @@ import {
 	verificationUri,
 } from "./fake-microsoft.ts";
 import { FakeProcesses } from "./fake-processes.ts";
+import { FakeReleases, releasesPath } from "./fake-releases.ts";
 import { FakeSecrets } from "./fake-secrets.ts";
 import { connect, McpClient } from "./mcp-client.ts";
 
 /** The temporary home every XDG directory sits in. */
 class Home extends Context.Service<Home, string>()("mx/tests/mx.test/Home") {}
 
-const microsoft = new FakeMicrosoft();
+const releases = await FakeReleases.make();
+// mx trusts only the release key it imports; the tests sign their releases with a throwaway key instead.
+mock.module("../release/public-key.pem", () => ({
+	default: releases.publicKey,
+}));
+
+/** The version this checkout builds, and the releases above it. */
+const running = packageJson.version;
+const [major, minor] = running.split(".");
+const later = (step: number) => `${major}.${Number(minor) + step}.0`;
+const microsoft = new FakeMicrosoft(releases);
 const processes = new FakeProcesses(microsoft.tunnels);
 const secrets = new FakeSecrets();
 secrets.install();
@@ -374,6 +386,17 @@ const background = `${windowsFolder}/mxw.exe`;
 /** A command as `processes.commands` records it, joined by spaces. */
 const commandLine = (command: ChildProcess.StandardCommand) =>
 	Arr.join([command.command, ...command.args], " ");
+
+const newBinary = new TextEncoder().encode(`synthetic mx ${later(1)} binary`);
+const otherBinary = new TextEncoder().encode(
+	"synthetic binary nobody released"
+);
+
+/** How often mx downloaded the binary of `version`. */
+const downloads = (version: string) =>
+	Arr.filter(microsoft.received, (request) =>
+		request.url.pathname.startsWith(`${releasesPath}download/v${version}/`)
+	).length;
 const unitFile = `${home}/config/systemd/user/mx-sync.service`;
 const claudeCli = `${home}/path/claude`;
 const codexConfig = `${home}/.codex/config.toml`;
@@ -1339,6 +1362,71 @@ describe("mx", () => {
 			);
 			expect(Exit.isFailure(exit)).toBe(true);
 			expect([...(yield* fs.readFile(exe))]).toEqual([...before]);
+		}));
+
+	test("mx update installs a newer signed release: it checks the signature, the size and the sha256, replaces the binary and restarts sync", () =>
+		Effect.gen(function* () {
+			yield* Effect.promise(() =>
+				releases.publish({ binary: newBinary, version: later(1) })
+			);
+			const before = processes.commands.length;
+			const { output } = yield* cli("update");
+			expect(output).toContain(`Updated mx to ${later(1)}`);
+			const fs = yield* FileSystem.FileSystem;
+			expect([...(yield* fs.readFile(installed))]).toEqual([...newBinary]);
+			expect((yield* fs.stat(installed)).mode % 0o1000).toBe(0o755);
+			expect(
+				Arr.map(processes.commands.slice(before), (command) =>
+					Arr.join(command, " ")
+				)
+			).toEqual(["systemctl --user restart --no-block mx-sync.service"]);
+		}));
+
+	test("mx update refuses a manifest that another key signed, and installs nothing", () =>
+		Effect.gen(function* () {
+			yield* Effect.promise(() =>
+				releases.publish({
+					binary: otherBinary,
+					signedBy: "other",
+					version: later(2),
+				})
+			);
+			const failure = yield* Effect.flip(cli("update"));
+			expect(failure.message).toContain("signature");
+			expect(downloads(later(2))).toBe(0);
+			expect([
+				...(yield* (yield* FileSystem.FileSystem).readFile(installed)),
+			]).toEqual([...newBinary]);
+		}));
+
+	test("mx update refuses a release that is not newer than the running binary", () =>
+		Effect.gen(function* () {
+			yield* Effect.promise(() =>
+				releases.publish({ binary: otherBinary, version: running })
+			);
+			const { output } = yield* cli("update");
+			expect(output).toContain(`${running} is the newest release`);
+			expect(downloads(running)).toBe(0);
+			expect([
+				...(yield* (yield* FileSystem.FileSystem).readFile(installed)),
+			]).toEqual([...newBinary]);
+		}));
+
+	test("mx update refuses a binary whose sha256 differs from the signed manifest", () =>
+		Effect.gen(function* () {
+			yield* Effect.promise(() =>
+				releases.publish({
+					binary: otherBinary,
+					manifestSha256: "0".repeat(64),
+					version: later(3),
+				})
+			);
+			const failure = yield* Effect.flip(cli("update"));
+			expect(failure.message).toContain("sha256");
+			expect(downloads(later(3))).toBe(1);
+			expect([
+				...(yield* (yield* FileSystem.FileSystem).readFile(installed)),
+			]).toEqual([...newBinary]);
 		}));
 
 	test("a refused refresh token fails loudly with run mx login, and no token is ever printed", () =>

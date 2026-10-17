@@ -1,21 +1,25 @@
 import {
 	Array as Arr,
 	Console,
+	Duration,
 	Effect,
 	FileSystem,
 	Layer,
 	Logger,
+	Option,
 	Path,
 } from "effect";
 import { CliError, Command, Flag, Prompt } from "effect/cli";
 import packageJson from "../package.json" with { type: "json" };
 import { Auth, signIn } from "./auth/auth.ts";
 import { clientIdFlag, tenantFlag } from "./auth/config.ts";
+import type { InstallFailed } from "./errors.ts";
 import { Installer, type Removal } from "./install.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
 import { Store } from "./store.ts";
 import { Sync, summary } from "./sync.ts";
+import { Updater } from "./update.ts";
 import { Watch } from "./watch.ts";
 
 const login = Command.make(
@@ -34,6 +38,9 @@ const login = Command.make(
 		"Sign in to Microsoft with a device code, save the refresh token in the system's secret store, and restart mx sync with the new sign-in. mx login asks for a client id and a tenant once, or takes --client-id and --tenant, and saves them."
 	)
 );
+
+/** How often mx sync checks for a newer release. */
+const updateCheckInterval = Duration.days(1);
 
 /** The background mx sync on Windows has no console, so its log also goes to a file in the state folder. */
 const syncLog =
@@ -67,17 +74,64 @@ const sync = Command.make(
 				yield* Console.log(summary(yield* (yield* Sync).pass));
 				return;
 			}
-			yield* (yield* Installer).removeOldBinaries;
-			return yield* (yield* Watch).run;
+			const installer = yield* Installer;
+			const updater = yield* Updater;
+			yield* installer.removeOldBinaries;
+			/** Ends once a newer release is installed and a fresh mx sync started from it. */
+			const updates: Effect.Effect<void, InstallFailed> = updater.update.pipe(
+				Effect.catchTag("UpdateFailed", (error) =>
+					Effect.as(Effect.logWarning(error.message), Option.none<string>())
+				),
+				Effect.flatMap(
+					Option.match({
+						onNone: () =>
+							Effect.sleep(updateCheckInterval).pipe(
+								Effect.andThen(Effect.suspend(() => updates))
+							),
+						onSome: (version) =>
+							Effect.logInfo(
+								`Installed mx ${version}; restarting mx sync.`
+							).pipe(Effect.andThen(installer.restartSync)),
+					})
+				)
+			);
+			return yield* Effect.raceFirst((yield* Watch).run, updates);
 		})
 ).pipe(
 	Command.provide(
-		Layer.mergeAll(Sync.layer, Watch.layer, Installer.layer, syncLog).pipe(
+		Layer.mergeAll(
+			Sync.layer,
+			Watch.layer,
+			Installer.layer,
+			Updater.layer,
+			syncLog
+		).pipe(Layer.provide(Paths.layer))
+	),
+	Command.withDescription(
+		"Keep the local store in step with the mailbox: Graph push notifications through a cloudflared quick tunnel, and a delta pass of every folder every 5 minutes, or every 60 seconds while push is down."
+	)
+);
+
+const update = Command.make("update", {}, () =>
+	Effect.gen(function* () {
+		const installed = yield* (yield* Updater).update;
+		if (Option.isNone(installed)) {
+			yield* Console.log(`mx ${packageJson.version} is the newest release.`);
+			return;
+		}
+		yield* (yield* Installer).restartSync;
+		yield* Console.log(
+			`Updated mx to ${installed.value} and restarted mx sync.`
+		);
+	})
+).pipe(
+	Command.provide(
+		Layer.mergeAll(Updater.layer, Installer.layer).pipe(
 			Layer.provide(Paths.layer)
 		)
 	),
 	Command.withDescription(
-		"Keep the local store in step with the mailbox: Graph push notifications through a cloudflared quick tunnel, and a delta pass of every folder every 5 minutes, or every 60 seconds while push is down."
+		"Install the newest signed release when it is newer than this one, and restart mx sync."
 	)
 );
 
@@ -163,5 +217,13 @@ export const mx = Command.make("mx").pipe(
 	Command.withDescription(
 		"Read and manage a Microsoft 365 mailbox through Microsoft Graph."
 	),
-	Command.withSubcommands([login, sync, mcp, reindex, install, uninstall])
+	Command.withSubcommands([
+		login,
+		sync,
+		mcp,
+		reindex,
+		install,
+		uninstall,
+		update,
+	])
 );

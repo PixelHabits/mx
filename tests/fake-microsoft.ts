@@ -2,6 +2,7 @@ import { Array as Arr, Effect, Layer, Option } from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { FakeSubscriptions, FakeTunnels } from "./fake-push.ts";
+import { type FakeReleases, isReleaseRequest } from "./fake-releases.ts";
 
 /** Microsoft's sign-in host; its paths start with the tenant, as `/<tenant>/oauth2/v2.0/token`. */
 export const loginHost = "login.microsoftonline.com";
@@ -151,7 +152,10 @@ export class FakeMicrosoft {
 		}
 	>();
 
-	constructor() {
+	private readonly releases: FakeReleases;
+
+	constructor(releases: FakeReleases) {
+		this.releases = releases;
 		this.add({
 			attachments: [
 				{
@@ -358,6 +362,9 @@ export class FakeMicrosoft {
 			prefer: request.headers.get("prefer"),
 			url,
 		});
+		if (isReleaseRequest(url)) {
+			return this.releases.answer(url);
+		}
 		if (url.hostname === loginHost) {
 			return this.login(url, new URLSearchParams(body));
 		}
