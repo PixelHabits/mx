@@ -33,6 +33,16 @@ const checkPublicKey = Effect.gen(function* () {
 /** The binaries `bun run build` writes, one per platform mx supports, named by the manifest's platform keys. */
 export const targets = [
 	{
+		outfile: "dist/mx-darwin-arm64",
+		platform: "darwin-arm64",
+		target: "bun-darwin-arm64",
+	},
+	{
+		outfile: "dist/mx-darwin-x64",
+		platform: "darwin-x64",
+		target: "bun-darwin-x64",
+	},
+	{
 		outfile: "dist/mx-linux-x64",
 		platform: "linux-x64",
 		target: "bun-linux-x64",

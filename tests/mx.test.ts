@@ -51,9 +51,6 @@ import {
 import { FakeSecrets } from "./fake-secrets.ts";
 import { connect, McpClient, spawnClient } from "./mcp-client.ts";
 
-/** The Windows exe `bun run build windows-x64` cross-compiles; CI builds it on Linux. */
-const windowsExe = `${import.meta.dir}/../dist/mx-windows-x64.exe`;
-
 /** The temporary home every XDG directory sits in. */
 class Home extends Context.Service<Home, string>()("mx/tests/mx.test/Home") {}
 
@@ -69,7 +66,7 @@ const [major, minor] = running.split(".");
 const later = (step: number) => `${major}.${Number(minor) + step}.0`;
 const microsoft = new FakeMicrosoft(releases);
 const processes = new FakeProcesses(microsoft.tunnels);
-/** The system's secret store, which the fake below stands in for except in the test of Windows Credential Manager. */
+/** The system's secret store, which the fake below stands in for except in the test of the system's own. */
 const systemSecrets = Bun.secrets;
 const secrets = new FakeSecrets();
 secrets.install();
@@ -82,6 +79,17 @@ const os: OperatingSystem =
 		: "linux";
 const windows = os === "win32";
 const mac = os === "darwin";
+
+/** The binary `bun run build <platform>` cross-compiles for macOS or Windows; CI builds it on Linux. */
+const built = mac
+	? {
+			file: `${import.meta.dir}/../dist/mx-darwin-${process.arch}`,
+			platform: `darwin-${process.arch}`,
+		}
+	: {
+			file: `${import.meta.dir}/../dist/mx-windows-x64.exe`,
+			platform: "windows-x64",
+		};
 /** The value for the system the tests run on. */
 const onThisSystem = <A>(values: Record<OperatingSystem, A>) => values[os];
 
@@ -970,24 +978,25 @@ describe("mx", () => {
 		}));
 
 	test(
-		"the Windows exe that bun run build cross-compiles starts, answers --version and lists the ten tools over MCP",
+		"the binary that bun run build cross-compiles for this system starts, answers --version and lists the ten tools over MCP",
 		() =>
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
-				if (!(yield* fs.exists(windowsExe))) {
+				if (!(yield* fs.exists(built.file))) {
 					return yield* Effect.die(
-						`${windowsExe} is missing. Build it with bun run build windows-x64, as CI does on Linux.`
+						`${built.file} is missing. Build it with bun run build ${built.platform}, as CI does on Linux.`
 					);
 				}
-				// The exe keeps its folders apart from the ones the other tests use.
-				const own = join(home, "exe");
+				// The binary keeps its folders apart from the ones the other tests use.
+				const own = join(home, "built");
 				const env = {
 					APPDATA: join(own, "Roaming"),
+					HOME: own,
 					LOCALAPPDATA: join(own, "Local"),
 					USERPROFILE: own,
 					...Rec.getSomes({ SystemRoot: systemRoot }),
 				};
-				const version = Bun.spawn([windowsExe, "--version"], {
+				const version = Bun.spawn([built.file, "--version"], {
 					env,
 					stderr: "inherit",
 					stdin: "ignore",
@@ -998,13 +1007,16 @@ describe("mx", () => {
 				);
 				expect(code).toBe(0);
 				expect(answer.trim()).toBe(`mx v${running}`);
-				const client = yield* spawnClient(windowsExe, env);
+				const client = yield* spawnClient(built.file, env);
 				const { tools: listed } = (yield* client.request("tools/list")) as {
 					tools: { name: string }[];
 				};
 				expect(Arr.map(listed, ({ name }) => name).sort()).toEqual(tools);
 			}).pipe(Effect.scoped),
-		{ because: "it runs the Windows exe", systems: ["win32"] }
+		{
+			because: "CI builds the binaries of macOS and Windows to run there",
+			systems: ["darwin", "win32"],
+		}
 	);
 
 	test("run from source with no client id saved and no terminal, mx login fails, says how to give the client id, and saves nothing", () =>
@@ -1170,7 +1182,7 @@ describe("mx", () => {
 		}));
 
 	test(
-		"on Windows, mx login saves the refresh token in Credential Manager, where mx status finds it",
+		"mx login saves the refresh token in the system's secret store, Credential Manager on Windows and the Keychain on macOS, where mx status finds it",
 		() =>
 			Effect.acquireUseRelease(
 				// A developer's own mx sign-in on this machine goes back in place after the test.
@@ -1199,7 +1211,10 @@ describe("mx", () => {
 							: systemSecrets.set({ ...credential, value: saved });
 					})
 			),
-		{ because: "it saves to Windows Credential Manager", systems: ["win32"] }
+		{
+			because: "the Linux runners have no Secret Service",
+			systems: ["darwin", "win32"],
+		}
 	);
 
 	test("a draft written before the first sync is stored with its folder and answers its local id", () =>

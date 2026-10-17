@@ -1,4 +1,5 @@
 import { Array as Arr, Record as Rec } from "effect";
+import { targets } from "../scripts/build.ts";
 
 /** mx's releases on GitHub: `releases/download/v<version>/<file>`, and `releases/latest/download/<file>`. */
 export const releasesPath = "/PixelHabits/mx/releases/";
@@ -10,11 +11,13 @@ export const isReleaseRequest = (url: URL) =>
 /** GitHub answers this prefix from the newest published release. */
 const latestDownload = /^latest\/download\//u;
 
-/** The file each platform's binary is published as. */
-const binaries = {
-	"linux-x64": "mx-linux-x64",
-	"windows-x64": "mx-windows-x64.exe",
-};
+/** The file each platform's binary is published as, for every platform `bun run build` makes. */
+const binaries = Rec.fromEntries(
+	Arr.map(targets, ({ outfile, platform }) => [
+		platform,
+		outfile.slice(outfile.lastIndexOf("/") + 1),
+	])
+);
 
 const toPem = (spki: ArrayBuffer) =>
 	`-----BEGIN PUBLIC KEY-----\n${new Uint8Array(spki).toBase64()}\n-----END PUBLIC KEY-----\n`;

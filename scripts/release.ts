@@ -38,9 +38,9 @@ const signingKey = Effect.gen(function* () {
 });
 
 /**
- * Builds both binaries and their third-party notices, writes the manifest of their release URLs, sizes and sha256 sums
+ * Builds the binaries and their third-party notices, writes the manifest of their release URLs, sizes and sha256 sums
  * to `dist/latest.json`, and its Ed25519 signature to `dist/latest.json.sig`. The GitHub release `v<version>` carries
- * all five files.
+ * all seven files.
  */
 const release = Effect.gen(function* () {
 	const { version } = packageJson;

@@ -10,10 +10,10 @@ release-please releases mx from the conventional commits on `main`, and the Rele
 
 The `release` job then:
 
-1. Builds `mx-linux-x64` and `mx-windows-x64.exe` with the Bun that `packageManager` in `package.json` pins, and writes `THIRD_PARTY_NOTICES`.
+1. Builds `mx-darwin-arm64`, `mx-darwin-x64`, `mx-linux-x64` and `mx-windows-x64.exe` with the Bun that `packageManager` in `package.json` pins, and writes `THIRD_PARTY_NOTICES`.
 2. Writes the manifest `latest.json` with each binary's URL, size and sha256, and signs it with `MX_RELEASE_SIGNING_KEY` into `latest.json.sig`.
-3. Uploads the five files to the draft with `gh release upload`.
-4. Attests the build provenance of both binaries and `latest.json`.
+3. Uploads the seven files to the draft with `gh release upload`.
+4. Attests the build provenance of the binaries and `latest.json`.
 5. Publishes the draft.
 
 mx reads `https://github.com/PixelHabits/mx/releases/latest/download/latest.json`. GitHub's `latest` skips drafts, so mx sees a release only after the job uploads its files and publishes it.

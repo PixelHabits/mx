@@ -68,7 +68,7 @@ export const notices = Effect.fnUntraced(function* (inputs: readonly string[]) {
 			),
 			section(
 				"Relinking mx",
-				`mx's source code is public under the MIT license at https://github.com/PixelHabits/mx, and the tag v${version} builds this release. To relink mx with a modified JavaScriptCore, build Bun with your changes as Bun's LICENSE.md above describes. Then build mx from its source with that Bun: run bun install, then bun run build linux-x64 on Linux or bun run build windows-x64 on Windows. A build for the platform its Bun runs on puts that Bun into the binary.`
+				`mx's source code is public under the MIT license at https://github.com/PixelHabits/mx, and the tag v${version} builds this release. To relink mx with a modified JavaScriptCore, build Bun with your changes as Bun's LICENSE.md above describes. Then build mx from its source with that Bun: run bun install, then bun run build linux-x64 on Linux, bun run build windows-x64 on Windows, or bun run build darwin-arm64 or darwin-x64 on macOS. A build for the platform its Bun runs on puts that Bun into the binary.`
 			),
 			section(
 				"GNU Library General Public License, version 2",
