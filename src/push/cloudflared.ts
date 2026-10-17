@@ -20,15 +20,37 @@ import { Paths } from "../paths.ts";
 /** The cloudflared release mx downloads when neither `MX_CLOUDFLARED` nor PATH names one. */
 const version = "2026.10.1";
 
-/** Each pinned asset's sha256, computed from the official GitHub release. */
+/**
+ * Each pinned asset's sha256, computed from the official GitHub release. The release ships the binary itself, or for
+ * macOS a gzipped tarball that holds it.
+ */
 const releases: Partial<
-	Record<string, { readonly sha256: string; readonly url: string }>
+	Record<
+		string,
+		{
+			readonly format: "binary" | "tarball";
+			readonly sha256: string;
+			readonly url: string;
+		}
+	>
 > = {
+	"darwin-arm64": {
+		format: "tarball",
+		sha256: "647615df99d49cd179ea5e13ef760b9bbfb33630f6ae62f87e33dfadda60adcc",
+		url: `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-darwin-arm64.tgz`,
+	},
+	"darwin-x64": {
+		format: "tarball",
+		sha256: "3b0dbaf378337e9d7fb6cd235a76d1d6a7dee434c2d8edf9281164fb6a3837ab",
+		url: `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-darwin-amd64.tgz`,
+	},
 	"linux-x64": {
+		format: "binary",
 		sha256: "3bfc539f45d2620c71debb7a86be0efa737ed5ccbad9eb85c787116900e5c586",
 		url: `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-amd64`,
 	},
 	"win32-x64": {
+		format: "binary",
 		sha256: "4d2490e74082c5d48dbfedaf92576fa5bd1702379ab88eb7faa0cfbe8dc891b6",
 		url: `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-windows-amd64.exe`,
 	},
@@ -45,6 +67,21 @@ const QuickTunnel = Schema.Struct({ hostname: Schema.NonEmptyString });
 
 const executableName =
 	process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+
+/** The cloudflared in a release tarball; the pinned sha256 vouches that it holds one. */
+const fromTarball = (tarball: ArrayBuffer) =>
+	Effect.gen(function* () {
+		const files = yield* Effect.promise(() =>
+			new Bun.Archive(tarball).files(executableName)
+		);
+		const file = files.get(executableName);
+		if (file === undefined) {
+			return yield* Effect.die(
+				`The pinned cloudflared tarball holds no ${executableName}.`
+			);
+		}
+		return new Uint8Array(yield* Effect.promise(() => file.arrayBuffer()));
+	});
 
 /** A loopback port nothing listens on. */
 const freePort = Effect.acquireUseRelease(
@@ -117,11 +154,15 @@ export class Cloudflared extends Context.Service<
 						`The cloudflared download has sha256 ${sha256}, not the pinned ${release.sha256}.`
 					);
 				}
+				const binary =
+					release.format === "binary"
+						? new Uint8Array(bytes)
+						: yield* fromTarball(bytes);
 				yield* fs.makeDirectory(path.dirname(managed), { recursive: true });
 				const staged = yield* fs.makeTempFileScoped({
 					directory: path.dirname(managed),
 				});
-				yield* fs.writeFile(staged, new Uint8Array(bytes));
+				yield* fs.writeFile(staged, binary);
 				yield* fs.chmod(staged, 0o755);
 				yield* fs.rename(staged, managed);
 				return managed;
