@@ -23,6 +23,7 @@ import {
 	tenantFlag,
 } from "./auth/config.ts";
 import { Credentials } from "./auth/credentials.ts";
+import { banner } from "./banner.ts";
 import { type InstallFailed, SyncUnhealthy } from "./errors.ts";
 import { Installer, type Removal } from "./install.ts";
 import { serve } from "./mcp/server.ts";
@@ -276,7 +277,16 @@ const reindex = Command.make("reindex", {}, () =>
 	)
 );
 
-export const mx = Command.make("mx").pipe(
+/**
+ * A bare `mx` shows the help, as Effect's command line does for a command without a handler, after the banner when
+ * stdout is a terminal.
+ */
+export const mx = Command.make("mx", {}, () =>
+	Effect.andThen(
+		process.stdout.isTTY === true ? banner : Effect.void,
+		Effect.fail(CliError.ShowHelp.make({ commandPath: ["mx"], errors: [] }))
+	)
+).pipe(
 	Command.withDescription(
 		"Read and manage a Microsoft 365 mailbox through Microsoft Graph."
 	),

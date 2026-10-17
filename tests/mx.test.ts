@@ -183,14 +183,15 @@ const run = runOn(platform);
 const cli = cliOn(platform);
 const status = run("status");
 
-/** Runs `effect` with stdin a terminal or not; mx asks for what a command needs only on a terminal. */
-const withStdinTerminal =
+/** Runs `effect` with `stream` a terminal or not, as mx reads it from `isTTY`. */
+const withTerminalOn =
+	(stream: NodeJS.ReadStream | NodeJS.WriteStream) =>
 	(isTTY: boolean) =>
 	<A, E, R>(effect: Effect.Effect<A, E, R>) =>
 		Effect.acquireUseRelease(
 			Effect.sync(() => {
-				const before = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
-				Object.defineProperty(process.stdin, "isTTY", {
+				const before = Object.getOwnPropertyDescriptor(stream, "isTTY");
+				Object.defineProperty(stream, "isTTY", {
 					configurable: true,
 					value: isTTY,
 				});
@@ -200,12 +201,17 @@ const withStdinTerminal =
 			(before) =>
 				Effect.sync(() => {
 					if (before === undefined) {
-						Reflect.deleteProperty(process.stdin, "isTTY");
+						Reflect.deleteProperty(stream, "isTTY");
 					} else {
-						Object.defineProperty(process.stdin, "isTTY", before);
+						Object.defineProperty(stream, "isTTY", before);
 					}
 				})
 		);
+
+/** mx asks for what a command needs only when stdin is a terminal. */
+const withStdinTerminal = withTerminalOn(process.stdin);
+/** A bare mx plays its banner only when stdout is a terminal. */
+const withStdoutTerminal = withTerminalOn(process.stdout);
 
 /**
  * `system` on a terminal where the user presses `keys` in turn, across every prompt: a key of one character types it,
@@ -574,6 +580,63 @@ const tools = [
 ];
 
 describe("mx", () => {
+	test("a bare mx without a terminal on stdout prints the help and no banner", () =>
+		Effect.gen(function* () {
+			const { frames, system } = fakeTerminal(platform, []);
+			const { errors, output } = yield* withStdoutTerminal(false)(
+				runOn(system)()
+			);
+			expect(frames).toEqual([]);
+			expect(output).toContain("SUBCOMMANDS");
+			expect(output).not.toContain("inbox");
+			expect(errors).toBe("");
+		}));
+
+	test("a bare mx on a terminal plays the banner, leaves its last frame above the help and shows the cursor again", () =>
+		Effect.gen(function* () {
+			const { frames, system } = fakeTerminal(
+				platformWith({ ...environment, NO_COLOR: "1" }),
+				[]
+			);
+			const { output } = yield* withStdoutTerminal(true)(runOn(system)());
+			expect(frames.length).toBeGreaterThan(10);
+			expect(frames[0]).toStartWith("\u001b[?25l");
+			expect(frames.at(-1)).toBe("\u001b[?25h");
+			expect(frames.at(-2)).toContain(
+				Arr.join(
+					[
+						"  ┌───────┐      ✉ ─ ─ ─ ─ ─ ─►      ┌───────┐",
+						"  │╲     ╱│                          │  ▤▤▤  │",
+						"  │  ╲ ╱  │      ◄─ ─ ─ ─ ─ ─ ✉      │ inbox │",
+						"  └───────┘                          └───────┘",
+						"                      mx",
+					],
+					"\n"
+				)
+			);
+			expect(output).toContain("SUBCOMMANDS");
+		}));
+
+	test("mx mcp on a terminal writes nothing but MCP messages to stdout", () =>
+		Effect.gen(function* () {
+			const { frames, system } = fakeTerminal(platform, []);
+			const listed = yield* withStdoutTerminal(true)(
+				Effect.gen(function* () {
+					const { client, stdio } = yield* connect;
+					yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+						// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+						Effect.provide(stdio),
+						// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+						Effect.provide(system, { local: true }),
+						Effect.forkScoped
+					);
+					return yield* client.request("tools/list");
+				}).pipe(Effect.scoped)
+			);
+			expect(listed).toMatchObject({ tools: expect.any(Array) });
+			expect(frames).toEqual([]);
+		}));
+
 	test("mx mcp speaks MCP 2026-07-28 only and lists the ten tools, marking reads read-only and every write but draft destructive", () =>
 		Effect.gen(function* () {
 			const client = yield* McpClient;
