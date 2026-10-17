@@ -14,6 +14,15 @@
 - **Stopping:** on Windows and macOS, stopping sync also ends its `cloudflared`. A forced stop can't delete the Graph subscriptions, so they expire within 3 days, and the next sync start deletes any that remain.
 - **Health:** `mx sync` records a heartbeat every minute. `mx status` and the read tools use it to tell whether sync is running and how old the mail is.
 
+## Store
+
+The mail store is one SQLite file, `mx.sqlite`, in the data folder. It holds the folders with their delta links, one row per message, the local id each message got, and the full-text index.
+
+- **Migrations:** each change to the store's schema is a numbered migration built into the binary. When it opens the store, mx runs the migrations the store has not recorded, in one transaction, and records each one in the `effect_sql_migrations` table. Migration 1 is the schema of mx 0.1.0, so a store that 0.1.0 created records it and keeps all its mail.
+- **Newer stores:** a store that records a migration this mx does not know was written by a newer mx. mx refuses to open it, changes nothing, and says `This mail store was written by a newer mx. Run mx update.` `mx update` and `mx uninstall` still work.
+- **Local ids:** apart from the `#N` id each message got, the store mirrors the mailbox. No migration changes the local ids. A migration that cannot convert the stored mail may clear every folder's delta link instead, so the next pass reads every folder again.
+- **Transactions:** each mx process opens one connection to the store. A write runs in a transaction that holds the connection until it commits, and SQLite waits up to 5 seconds for a write lock that the other mx process holds.
+
 ## When a message is gone
 
 When a tool's request to Graph, including a draft tool's, answers 404 for a stored message, mx looks the message up by its id. If Graph still has it, mx refiles it where Graph says and returns the error. If Graph no longer has it, mx removes it from the store, and the tool answers, for example, `#12 is no longer in the mailbox.`
