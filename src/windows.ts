@@ -84,7 +84,11 @@ $result = [UIntPtr]::Zero
 /**
  * Stops every `mxw.exe` in this sign-in session but the process `pid`, with the processes each started, as cloudflared,
  * and waits up to 10 seconds for all of them to exit, so the files they held are free. Nothing reaches a process with
- * no window and no console to ask it to stop, so this ends them as `taskkill /F` does.
+ * no window and no console to ask it to stop, so this ends them as `taskkill /F` does. It exits 0 once none of those
+ * `mxw.exe` runs; otherwise it prints the process id of each one that does, one a line, and exits 1.
+ *
+ * PowerShell exits 1 when its last command leaves `$?` false, as Wait-Process does when it ignores an error, so the
+ * script ends on an exit of its own.
  */
 export const stopSync = (pid: number) =>
 	powershell(
@@ -92,8 +96,12 @@ export const stopSync = (pid: number) =>
 $sync = @(Get-CimInstance Win32_Process -Filter "Name = 'mxw.exe' AND SessionId = $session" | Where-Object { $_.ProcessId -ne [int]$env:MX_PID })
 $started = @(Get-CimInstance Win32_Process | Where-Object { $sync.ProcessId -contains $_.ParentProcessId })
 foreach ($process in $sync) { taskkill.exe /F /T /PID $process.ProcessId | Out-Null }
-foreach ($process in $sync + $started) { Wait-Process -Id $process.ProcessId -Timeout 10 -ErrorAction Ignore }`,
-		{ env: { MX_PID: String(pid) } }
+foreach ($process in $sync + $started) { Wait-Process -Id $process.ProcessId -Timeout 10 -ErrorAction Ignore }
+$running = @(Get-CimInstance Win32_Process -Filter "Name = 'mxw.exe' AND SessionId = $session" | Where-Object { $sync.ProcessId -contains $_.ProcessId })
+if ($running.Count -eq 0) { exit 0 }
+$running.ProcessId
+exit 1`,
+		{ env: { MX_PID: String(pid) }, stdout: "pipe" }
 	);
 
 /**

@@ -2,7 +2,7 @@ import { BunServices } from "@effect/platform-bun";
 import { Array as Arr, Deferred, Effect, Layer, Sink, Stream } from "effect";
 import { type ChildProcess, ChildProcessSpawner } from "effect/process";
 import { queryWorker } from "../src/query.ts";
-import { readUserPath, writeUserPath } from "../src/windows.ts";
+import { readUserPath, stopSync, writeUserPath } from "../src/windows.ts";
 import type { FakeTunnels } from "./fake-push.ts";
 
 const { ExitCode, makeHandle, ProcessId } = ChildProcessSpawner;
@@ -36,14 +36,23 @@ const commandLine = (command: ChildProcess.StandardCommand) =>
 const pathRead = commandLine(readUserPath);
 const pathWrite = commandLine(writeUserPath(""));
 
+/** The PowerShell that stops the background `mx sync`; the process id it spares travels in its environment. */
+const syncStop = commandLine(stopSync(0));
+
+/** Whether `command` starts the background `mx sync`, as mxw.exe. */
+const startsBackgroundSync = (command: ChildProcess.StandardCommand) =>
+	command.command.endsWith("mxw.exe") && command.args[0] === "sync";
+
 /** A LaunchAgent's label: its plist's name without `.plist`. */
 const plistLabel = /([^/\\]+)\.plist$/u;
 
 /**
  * Every program mx starts, recorded and faked. `cloudflared tunnel` opens a quick tunnel on the fake internet, named
  * `tunnel-<n>.trycloudflare.com`, that runs until the scope that started it closes or `exit` ends it. The PowerShell
- * that reads the user PATH on Windows prints `userPath` as it does, and the one that writes it sets `userPath`.
- * `launchctl` loads and unloads LaunchAgents and fails as it does on macOS. Any other program exits 0 at once.
+ * that reads the user PATH on Windows prints `userPath` as it does, and the one that writes it sets `userPath`. mxw.exe
+ * starts a background `mx sync` that runs on, and the PowerShell that stops mx sync ends each but the `unstoppable`
+ * ones, prints the process id of each one left, and exits 1 when any is left. `launchctl` loads and unloads
+ * LaunchAgents and fails as it does on macOS. Any other program exits 0 at once.
  */
 export class FakeProcesses {
 	readonly commands: (readonly string[])[] = [];
@@ -58,6 +67,10 @@ export class FakeProcesses {
 	removalLag = 0;
 	/** The service targets of the LaunchAgents loaded, such as `gui/501/io.github.pixelhabits.mx.sync`. */
 	readonly loaded = new Set<string>();
+	/** The process ids of the background `mx sync` processes that run on Windows. */
+	readonly syncs = new Set<number>();
+	/** The background `mx sync` processes that outlive the PowerShell that stops mx sync. */
+	readonly unstoppable = new Set<number>();
 	private opened = 0;
 	/** The agents unloaded that launchd has not removed yet, with how many more `launchctl print` calls find each. */
 	private readonly removing = new Map<string, number>();
@@ -98,6 +111,9 @@ export class FakeProcesses {
 	 * 113, and `print` of one launchd does not hold with 113.
 	 */
 	private exitCode(command: ChildProcess.StandardCommand) {
+		if (commandLine(command) === syncStop) {
+			return this.syncs.size === 0 ? 0 : 1;
+		}
 		if (command.command !== "launchctl") {
 			return 0;
 		}
@@ -145,25 +161,45 @@ export class FakeProcesses {
 		return true;
 	}
 
+	/** What the program run as `line` prints. */
+	private printed(line: string) {
+		const text = (output: string) =>
+			Stream.succeed(new Uint8Array(Buffer.from(output)));
+		if (line === pathRead) {
+			return text(Buffer.from(this.userPath, "utf16le").toString("base64"));
+		}
+		if (line === syncStop) {
+			return text(
+				Arr.join(
+					Arr.map([...this.syncs], (pid) => `${pid}\r\n`),
+					""
+				)
+			);
+		}
+		return Stream.empty;
+	}
+
 	private spawn(command: ChildProcess.Command) {
 		if (command._tag !== "StandardCommand") {
 			return Effect.die("mx pipes no commands.");
 		}
 		this.commands.push([command.command, ...command.args]);
 		this.onSpawn?.();
-		if (commandLine(command) === pathWrite) {
+		const line = commandLine(command);
+		if (line === pathWrite) {
 			this.userPath = command.options.env?.MX_PATH ?? "";
 		}
-		const stdout =
-			commandLine(command) === pathRead
-				? Stream.succeed(
-						new Uint8Array(
-							Buffer.from(
-								Buffer.from(this.userPath, "utf16le").toString("base64")
-							)
-						)
-					)
-				: Stream.empty;
+		if (line === syncStop) {
+			for (const pid of this.syncs) {
+				if (!this.unstoppable.has(pid)) {
+					this.syncs.delete(pid);
+				}
+			}
+		}
+		if (startsBackgroundSync(command)) {
+			this.syncs.add(this.commands.length);
+		}
+		const stdout = this.printed(line);
 		return Effect.flatMap(
 			Deferred.make<ChildProcessSpawner.ExitCode>(),
 			(exit) => {

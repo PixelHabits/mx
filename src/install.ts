@@ -138,6 +138,8 @@ const oldName = (exe: string) => exe.replace(exeSuffix, ".old.exe");
 
 const trailingBackslashes = /\\+$/u;
 
+const whitespace = /\s+/u;
+
 /** Names agents as a sentence does: `Claude Code and Codex`. */
 const listed = new Intl.ListFormat("en", { type: "conjunction" });
 
@@ -292,6 +294,22 @@ export class Installer extends Context.Service<
 						Effect.mapError(failed(`${command} ${Arr.join(args, " ")}`))
 					);
 
+			/** Runs `command` to its end: its exit code and what it printed. */
+			const outputOf = (command: ChildProcess.Command) =>
+				Effect.scoped(
+					Effect.gen(function* () {
+						const started = yield* spawner.spawn(command);
+						const [output, code] = yield* Effect.all(
+							[
+								Stream.mkString(Stream.decodeText(started.stdout)),
+								started.exitCode,
+							],
+							{ concurrency: "unbounded" }
+						);
+						return { code, output };
+					})
+				);
+
 			/** Starts `command`, named `what`, on its own, so it outlives this process. */
 			const startDetached = (what: string, command: ChildProcess.Command) =>
 				Effect.scoped(
@@ -427,10 +445,26 @@ export class Installer extends Context.Service<
 
 			/** The Run key value that starts mxw.exe at sign-in, on Windows. */
 			const runKeyValue = (): SyncAtSignIn => {
-				/** Stops every other background `mx sync`, with the cloudflared each started, and waits for them. */
-				const stopRunningSync = execute(
-					"The PowerShell that stops mx sync",
-					stopSync(process.pid)
+				/**
+				 * Stops every other background `mx sync`, with the cloudflared each started, and waits for them; fails naming
+				 * each mxw.exe that still runs.
+				 */
+				const stopRunningSync = Effect.gen(function* () {
+					const { code, output } = yield* outputOf(stopSync(process.pid));
+					if (code === 0) {
+						return;
+					}
+					const running = output.trim();
+					return yield* InstallFailed.make({
+						message:
+							running === ""
+								? `The PowerShell that stops mx sync exited with code ${code}.`
+								: `Could not stop mx sync: mxw.exe still runs as PID ${Arr.join(running.split(whitespace), ", ")}. End it in Task Manager, then try again.`,
+					});
+				}).pipe(
+					Effect.catchTag("PlatformError", (error) =>
+						Effect.fail(failed("The PowerShell that stops mx sync")(error))
+					)
 				);
 				const restart = Effect.andThen(
 					stopRunningSync,
@@ -581,24 +615,15 @@ export class Installer extends Context.Service<
 			});
 
 			/** The user's own PATH on Windows, as stored. A PATH mx could not read fails, so mx never writes over one. */
-			const userPath = Effect.scoped(
-				Effect.gen(function* () {
-					const reading = yield* spawner.spawn(readUserPath);
-					const [output, code] = yield* Effect.all(
-						[
-							Stream.mkString(Stream.decodeText(reading.stdout)),
-							reading.exitCode,
-						],
-						{ concurrency: "unbounded" }
-					);
-					if (code !== 0) {
-						return yield* InstallFailed.make({
-							message: `Could not read your PATH: PowerShell exited with code ${code}.`,
-						});
-					}
-					return userPathFrom(output);
-				})
-			).pipe(
+			const userPath = Effect.gen(function* () {
+				const { code, output } = yield* outputOf(readUserPath);
+				if (code !== 0) {
+					return yield* InstallFailed.make({
+						message: `Could not read your PATH: PowerShell exited with code ${code}.`,
+					});
+				}
+				return userPathFrom(output);
+			}).pipe(
 				Effect.catchTag("PlatformError", (error) =>
 					Effect.fail(failed("Could not read your PATH")(error))
 				)

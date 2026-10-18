@@ -4045,6 +4045,34 @@ describe("mx", () => {
 			})
 		));
 
+	test("on Windows, mx install stops the mx sync that runs once it is gone and starts the new one", () =>
+		onWindows(
+			Effect.gen(function* () {
+				yield* cli("install", "--agent", "codex");
+				const old = [...processes.syncs];
+				const { output } = yield* cli("install", "--agent", "codex");
+				expect(lines(output)).toContain("Started mx sync.");
+				expect(processes.syncs.size).toBe(1);
+				expect(Arr.some(old, (pid) => processes.syncs.has(pid))).toBe(false);
+			})
+		));
+
+	test("on Windows, mx install fails and names the mxw.exe that still runs after mx stopped it, and starts no second mx sync", () =>
+		onWindows(
+			Effect.gen(function* () {
+				yield* cli("install", "--agent", "codex");
+				const unstopped = [...processes.syncs];
+				for (const pid of unstopped) {
+					processes.unstoppable.add(pid);
+				}
+				const failure = yield* Effect.flip(cli("install", "--agent", "codex"));
+				expect(failure.message).toBe(
+					`Could not stop mx sync: mxw.exe still runs as PID ${Arr.join(Arr.map(unstopped, String), ", ")}. End it in Task Manager, then try again.`
+				);
+				expect([...processes.syncs]).toEqual(unstopped);
+			}).pipe(Effect.ensuring(Effect.sync(() => processes.unstoppable.clear())))
+		));
+
 	test("mx uninstall run from the installed mx.exe deletes mxw.exe and the copies an update moved aside at once, and the program folder once it exits", () =>
 		onWindows(
 			Effect.gen(function* () {
