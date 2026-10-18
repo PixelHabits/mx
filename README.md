@@ -19,6 +19,10 @@ mx runs on macOS, Windows and Linux (x64). It installs for your user account and
 
 ### Windows
 
+Download [mx-windows-x64.exe](https://github.com/PixelHabits/mx/releases/latest/download/mx-windows-x64.exe) and double-click it. mx asks which agents should use it, signs you in to Microsoft and syncs your mail once. When it shows "Press Enter to close.", press Enter.
+
+Or install it from PowerShell:
+
 ```powershell
 Invoke-WebRequest https://github.com/PixelHabits/mx/releases/latest/download/mx-windows-x64.exe -OutFile mx-windows-x64.exe
 .\mx-windows-x64.exe install
