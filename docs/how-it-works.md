@@ -31,6 +31,15 @@ When a tool's request to Graph, including a draft tool's, answers 404 for a stor
 
 `search` uses an SQLite FTS5 index over the subject, sender and new text. The porter stemmer matches word forms, so "approve" also finds "approved" and "approval". With a query, results are ranked by bm25, weighting the subject 10, the sender 2 and the body 1, with newer messages first among equals. Without a query, they are newest first. Each conversation appears once, by its best match, with `(+N in thread)` when it has more messages. `mx reindex` rebuilds the index from the stored messages.
 
+## Query
+
+`query` runs one SQL SELECT that the agent writes, so it can count, group and join mail instead of reading many search lines.
+
+- **Views:** the SQL reads three views. `mail` has one row per message, `folders` has each folder's path with its message and unread counts, and `conversations` has one row per conversation with its newest message. Times are UTC ISO 8601 text. Message bodies aren't in the views; `search` finds words in them.
+- **Read-only:** each query runs in a process of its own, `mx query-worker`, which opens the store read-only, so SQLite refuses every write. mx wraps the SQL in its own `SELECT * FROM (…)`, so SQLite accepts nothing but one SELECT: no `INSERT`, `ATTACH`, `PRAGMA` or second statement. The tool returns SQLite's error as it is.
+- **Limits:** an answer has at most 200 rows and 20,000 characters, and each value is cut at 200 characters. Its last line says when a limit cut it short. mx stops a query that runs longer than 10 seconds.
+- **Schema:** the query process creates the views each time it starts, so the store's tables can change while the views stay the same.
+
 ## Sign-in
 
 The saved sign-in is one record in the system's secret store, or in a file only the user can read where no secret store exists. It holds the refresh token with the client id and tenant it belongs to, and an id that each `mx login` renews. Every Graph request reads the record, so a running `mx mcp` or `mx sync` switches to a new sign-in on its next request and never uses an old one. `mx login` also restarts `mx sync`.

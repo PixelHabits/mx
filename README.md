@@ -101,6 +101,7 @@ Your agent uses these tools:
 | Tool | What it does |
 | --- | --- |
 | `search` | Finds conversations by words, sender, folder and date, best match first. Each conversation shows once. |
+| `query` | Counts, groups and filters mail with one read-only SQL query. |
 | `thread` | Shows a whole conversation, oldest first. |
 | `message` | Shows one message. |
 | `attachment` | Lists a message's attachments, or saves one. |
