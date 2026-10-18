@@ -64,8 +64,8 @@ const frames = ({
 			[
 				`  ┌───────┐${" ".repeat(laneWidth)}┌───────┐`,
 				`  │${glyphs.fall}     ${glyphs.rise}│${top}│  ${glyphs.tray.repeat(3)}  │`,
-				`  │  ${glyphs.fall} ${glyphs.rise}  │${" ".repeat(laneWidth)}│ inbox │`,
-				`  └───────┘${bottom}└───────┘`,
+				`  │  ${glyphs.fall} ${glyphs.rise}  │${bottom}│ inbox │`,
+				`  └───────┘${" ".repeat(laneWidth)}└───────┘`,
 				`${" ".repeat(22)}${color ? "\u001b[1mmx\u001b[22m" : "mx"}`,
 			],
 			"\n"
