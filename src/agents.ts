@@ -216,7 +216,9 @@ const ask = Effect.gen(function* () {
 	);
 	return Prompt.MultiSelect({
 		choices,
-		message: "Which agents should use mx?",
+		// Effect's picker starts on its Select All/None row, so the second line says what Space and Enter do.
+		message:
+			"Which agents should use mx?\n  Space checks or unchecks one. Enter continues with the checked ones.",
 		min: 1,
 	});
 }).pipe(
