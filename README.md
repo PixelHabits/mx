@@ -40,7 +40,13 @@ chmod +x mx-darwin-arm64
 
 On a Mac with an Intel processor, use `mx-darwin-x64` instead.
 
-The macOS binaries aren't signed or notarized yet (coming soon). A file downloaded with `curl` as above opens normally. If you download it in a browser, macOS blocks it; run `xattr -d com.apple.quarantine mx-darwin-arm64`, or right-click the file in Finder and choose **Open**.
+The macOS binaries aren't signed or notarized yet (coming soon). A file downloaded with `curl` as above runs normally. If you download it in a browser instead, don't open it from Finder: the browser drops the file's executable permission, so Finder opens it in TextEdit. Run these in Terminal from the folder you saved it to:
+
+```sh
+chmod +x mx-darwin-arm64
+xattr -d com.apple.quarantine mx-darwin-arm64
+./mx-darwin-arm64 install
+```
 
 mx installs itself to `~/.local/bin/mx`. If that folder is not on your PATH, `mx install` prints the line to add to `~/.zprofile`. Open a new terminal to run `mx`.
 

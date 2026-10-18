@@ -212,8 +212,9 @@ jobs:
         if: vars.MACOS_SIGNING == 'off'
         env:
           NOTE: >-
-            The macOS binaries are not signed or notarized. If macOS blocks one you downloaded in a browser, run
-            `xattr -d com.apple.quarantine mx-darwin-arm64`, or `mx-darwin-x64` on a Mac with an Intel processor.
+            The macOS binaries are not signed or notarized. If you downloaded one in a browser, run
+            `chmod +x mx-darwin-arm64 && xattr -d com.apple.quarantine mx-darwin-arm64` in Terminal, or the same with
+            `mx-darwin-x64` on a Mac with an Intel processor, instead of opening it from Finder.
         run: |
           notes="$(gh release view "$TAG" --json body --jq .body)"
           case "$notes" in
