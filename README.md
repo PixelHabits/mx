@@ -24,7 +24,7 @@ Invoke-WebRequest https://github.com/PixelHabits/mx/releases/latest/download/mx-
 .\mx-windows-x64.exe install
 ```
 
-The exe is not code-signed, so Windows SmartScreen warns you the first time. Choose **More info**, then **Run anyway**.
+The exe isn't code-signed yet (coming soon), so Windows SmartScreen warns you the first time. Choose **More info**, then **Run anyway**.
 
 mx installs itself to `%LOCALAPPDATA%\Programs\mx` and adds that folder to your PATH. Open a new terminal to run `mx`.
 
@@ -40,7 +40,7 @@ chmod +x mx-darwin-arm64
 
 On a Mac with an Intel processor, use `mx-darwin-x64` instead.
 
-The binaries are signed with the project's Developer ID and notarized by Apple, so macOS opens them without a warning.
+The macOS binaries aren't signed or notarized yet (coming soon). A file downloaded with `curl` as above opens normally. If you download it in a browser, macOS blocks it; run `xattr -d com.apple.quarantine mx-darwin-arm64`, or right-click the file in Finder and choose **Open**.
 
 mx installs itself to `~/.local/bin/mx`. If that folder is not on your PATH, `mx install` prints the line to add to `~/.zprofile`. Open a new terminal to run `mx`.
 
@@ -157,7 +157,7 @@ mx updates itself from this repository's GitHub releases. It checks once a day a
 - **Your mail stays on your machine.** mx keeps a copy of your mailbox in a local database and sends your mail nowhere but Microsoft. It also contacts GitHub to check for updates and Cloudflare for new-mail alerts.
 - **Your sign-in is stored in your system's secret store:** the Keychain on macOS, Windows Credential Manager, or the Secret Service on Linux. On a Linux machine with no secret store, mx keeps it in a file only your user can read.
 - **New-mail alerts** come from Microsoft through a temporary Cloudflare tunnel to your machine. They carry only message ids, and mx checks a secret on each one. If the tunnel is unavailable, mx checks for mail every minute instead.
-- **Releases are signed and attested.** Check a download with `gh attestation verify mx-linux-x64 --repo PixelHabits/mx`. The macOS binaries are also signed with a Developer ID and notarized by Apple.
+- **Releases are attested, and updates are signed.** Check a download with `gh attestation verify mx-linux-x64 --repo PixelHabits/mx`. mx installs only updates signed with the project's release key. Code signing for the Windows and macOS binaries is coming soon.
 
 To report a security problem, see [SECURITY.md](SECURITY.md).
 
