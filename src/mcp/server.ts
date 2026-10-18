@@ -867,6 +867,16 @@ export const tools = Layer.effectDiscard(
 	})
 );
 
+const instructions = `mx is a local copy of the user's Microsoft 365 mailbox, kept current by mx sync. Messages have short local ids such as #12. delete moves mail to Deleted Items; nothing deletes mail for good.
+
+Reading mail costs context:
+- To survey mail, call search with a folder and since and no query. Each line is one conversation, with its sender, subject and markers. Decide from the lines what to open.
+- Open a conversation with thread. It includes the user's own replies, marked (me), so you don't need Sent Items to see whether the user answered.
+- Use message for a single message. Use full only when the new text isn't enough, such as for quoted history or a forwarded original.
+- update and delete take many ids at once.
+
+If the user has saved mail preferences in your memory or instructions, follow them. If they have none and ask you to triage, offer once to interview them first about how they handle mail.`;
+
 /**
  * `mx mcp`: the tools and prompts over stdio, on MCP 2026-07-28, where every request carries its own protocol version.
  * The server reads requests as soon as it starts, so the store and Graph open before it, and the tools and prompts
@@ -877,8 +887,7 @@ export const serve = (version: string) =>
 	tools.pipe(
 		Layer.provide(
 			McpServer.layerStdio({
-				instructions:
-					"mx is a local copy of the user's Microsoft 365 mailbox, kept current by mx sync, with tools to search and read it and to draft, send, file, flag and delete mail. Messages are named by short local ids such as #12. delete moves messages to Deleted Items; nothing deletes mail for good.",
+				instructions,
 				name: "mx",
 				protocols: [McpProtocol.v2026_07_28],
 				version,
