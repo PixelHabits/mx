@@ -411,14 +411,14 @@ const triageText = (
 ) => `Triage the user's mail received since ${since}.
 
 1. Look for the user's mail preferences in your memory or instructions: who matters, what is noise, how they file mail. If there are none, say once that the interview prompt can set them up, then carry on.
-2. Survey with search: folder Inbox, since ${since}, no query, limit 200. If 200 lines come back, tell the user how far back the survey reached. Judge each conversation from its line. Don't open automated mail unless a preference says it matters, or its subject shows a failure or a deadline.
+2. Count first with query: unread Inbox mail since ${since} by sender, and the Inbox conversations whose newest message isn't the user's. Then survey with search: folder Inbox, since ${since}, no query, limit 200. If 200 lines come back, tell the user how far back the survey reached. Judge each conversation from its line. Don't open automated mail unless a preference says it matters, or its subject shows a failure or a deadline.
 3. Open the conversations from people with thread. Note what each one asks of the user, and whether the user already replied.
-4. Report in this order: what needs the user's reply, with the ask and the date; what needs other action; failing systems and alerts; then a count of the rest, grouped by sender.
+4. Report in this order: what needs the user's reply, with the ask and the date; what needs other action; failing systems and alerts; then a count of the rest, grouped by sender, which query can count.
 5. Change nothing in the mailbox. Offer the moves, flags and deletes you would make, and make them only after the user agrees.`;
 
 const interviewText = `Learn how the user handles mail, so later triage follows their way of working.
 
-1. Survey first, before you ask anything: search the Inbox and Sent Items for the last 30 days, with no query and limit 200. Note who writes to the user most, which senders are automated, what the user flags, and which conversations the user answered.
+1. Survey first, before you ask anything. Use query for the last 30 days: who writes to the user most, whom the user writes to, the folders and how full they are, what the user flags, and which conversations the user answered. Then read a sample of each kind of mail with search to tell people from automated senders.
 2. Then interview the user, a few questions at a time: their role and what they are responsible for; whose mail always matters; which automated mail they want to see and which is noise; how they want mail filed (folders, categories, flags); how fast they reply and what counts as urgent; what triage should leave alone.
 3. Write a short summary of their preferences, and show it to them for corrections.
 4. If you can save memories, or edit an instruction file such as CLAUDE.md or AGENTS.md, save the agreed summary there under the heading "Mail preferences". If you can't, give the user the summary to paste into their agent's custom instructions.
@@ -896,6 +896,7 @@ export const tools = Layer.effectDiscard(
 const instructions = `mx is a local copy of the user's Microsoft 365 mailbox, kept current by mx sync. Messages have short local ids such as #12. delete moves mail to Deleted Items; nothing deletes mail for good.
 
 Reading mail costs context:
+- To count, group or compare mail, such as senders over a month or conversations still waiting on the user, call query with one SELECT instead of reading many search lines.
 - To survey mail, call search with a folder and since and no query. Each line is one conversation, with its sender, subject and markers. Decide from the lines what to open.
 - Open a conversation with thread. It includes the user's own replies, marked (me), so you don't need Sent Items to see whether the user answered.
 - Use message for a single message. Use full only when the new text isn't enough, such as for quoted history or a forwarded original.
