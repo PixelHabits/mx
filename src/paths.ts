@@ -1,7 +1,7 @@
 import { Config, Context, Effect, Layer, Option, Path } from "effect";
 
-/** Where the Arch package installs mx; pacman owns the binary there and the sync unit beside it. */
-const packagedBin = "/usr/bin/mx";
+/** Where the Arch packages install mx; pacman owns the binary there and the sync unit beside it. */
+export const packagedBin = "/usr/bin/mx";
 
 /** An XDG base directory, or its default below `$HOME` when the variable is unset or empty. */
 const xdg = (name: string, home: string, fallback: string) =>

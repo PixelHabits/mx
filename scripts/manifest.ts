@@ -40,8 +40,8 @@ export const signingKey = Effect.gen(function* () {
 /**
  * Writes the manifest of the binaries in `dist/`, their release URLs, sizes and sha256 sums, to `dist/latest.json`, and
  * its Ed25519 signature by `key` to `dist/latest.json.sig`. The sums are of the bytes in `dist/` now, so the macOS
- * binaries are signed before it runs. The GitHub release `v<version>` carries the binaries, `THIRD_PARTY_NOTICES` and
- * these two files.
+ * binaries are signed before it runs. The GitHub release `v<version>` carries the binaries, `THIRD_PARTY_NOTICES`,
+ * `LICENSE`, `mx-sync.service` and these two files.
  */
 export const writeManifest = Effect.fnUntraced(function* (key: CryptoKey) {
 	const { version } = packageJson;

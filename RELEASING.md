@@ -10,15 +10,15 @@ release-please releases mx from the conventional commits on `main`, and the Rele
 
 The workflow then runs three jobs in turn:
 
-1. `build`, on Linux, builds `mx-darwin-arm64`, `mx-darwin-x64`, `mx-linux-x64` and `mx-windows-x64.exe` with the Bun that `packageManager` in `package.json` pins, and writes `THIRD_PARTY_NOTICES`.
+1. `build`, on Linux, builds `mx-darwin-arm64`, `mx-darwin-x64`, `mx-linux-x64` and `mx-windows-x64.exe` with the Bun that `packageManager` in `package.json` pins. It writes `THIRD_PARTY_NOTICES`, and for the Arch packages the sync unit `mx-sync.service` for `/usr/bin/mx` and a copy of `LICENSE`.
 2. `sign`, on macOS:
    1. Signs `mx-darwin-arm64` and `mx-darwin-x64` with the Developer ID Application certificate, with the hardened runtime, a secure timestamp and the entitlements in `release/entitlements.plist`.
    2. Checks each signature against Apple's requirement for a Developer ID Application signature of `APPLE_TEAM_ID`, and runs the signed arm64 binary.
    3. Sends both binaries to Apple's notary service in one ZIP archive and waits until Apple accepts them. Apple can't staple a ticket to a bare executable, so Gatekeeper looks the tickets up online.
    4. Writes the manifest `latest.json` with each binary's URL, size and sha256, of the signed bytes, and signs it with `MX_RELEASE_SIGNING_KEY` into `latest.json.sig`.
 3. `publish`, on Linux:
-   1. Uploads the seven files to the draft with `gh release upload`.
-   2. Attests the build provenance of the binaries and `latest.json`.
+   1. Uploads the nine files to the draft with `gh release upload`.
+   2. Attests the build provenance of the binaries, `mx-sync.service` and `latest.json`.
    3. Publishes the draft.
 
 mx reads `https://github.com/PixelHabits/mx/releases/latest/download/latest.json`. GitHub's `latest` skips drafts, so mx sees a release only after the workflow uploads its files and publishes it.

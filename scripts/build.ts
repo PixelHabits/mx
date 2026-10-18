@@ -1,10 +1,18 @@
 import { BunRuntime } from "@effect/platform-bun";
 import { Array as Arr, Console, Effect, Record as Rec } from "effect";
+import { unit, unitName } from "../src/install.ts";
+import { packagedBin } from "../src/paths.ts";
 import { pemContents } from "../src/update.ts";
 import { notices, noticesFile } from "./notices.ts";
 
 /** The release key's public half, committed; its private half never enters the repository. */
 const publicKeyFile = "release/public-key.pem";
+
+/** The sync unit for the binary where the Arch packages install mx; each release carries it for them. */
+const unitFile = `dist/${unitName}`;
+
+/** A copy of the license, which each release carries for the Arch packages. */
+const licenseFile = "dist/LICENSE";
 
 /**
  * Checks that the release key's public half, which the binary imports, is an Ed25519 SPKI key, so a build never ships a
@@ -56,11 +64,11 @@ export const targets = [
 
 /**
  * Compiles each target minified and with bytecode, writes its source map next to it, as `dist/mx-linux-x64.map`, and
- * writes the third-party notices of what the binaries hold next to them. The release public key and the version in
- * `package.json` come in through their imports. The build fails before it compiles when a valid public key is missing,
- * and a failed build fails loudly. Bytecode builds CommonJS unless told otherwise, and the bundle uses `import.meta`,
- * so the format is ESM. The binary reads no `.env` or `bunfig.toml` from the folder it runs in, and no environment
- * variable is inlined.
+ * writes the third-party notices of what the binaries hold next to them, with the sync unit for `/usr/bin/mx` and a copy
+ * of `LICENSE`. The release public key and the version in `package.json` come in through their imports. The build fails
+ * before it compiles when a valid public key is missing, and a failed build fails loudly. Bytecode builds CommonJS
+ * unless told otherwise, and the bundle uses `import.meta`, so the format is ESM. The binary reads no `.env` or
+ * `bunfig.toml` from the folder it runs in, and no environment variable is inlined.
  */
 const compile = Effect.fnUntraced(function* (
 	chosen: readonly (typeof targets)[number][]
@@ -94,7 +102,9 @@ const compile = Effect.fnUntraced(function* (
 	);
 	const text = yield* notices(Arr.flatten(inputs));
 	yield* Effect.promise(() => Bun.write(noticesFile, text));
-	yield* Console.log(`Wrote ${noticesFile}.`);
+	yield* Effect.promise(() => Bun.write(unitFile, unit(packagedBin)));
+	yield* Effect.promise(() => Bun.write(licenseFile, Bun.file("LICENSE")));
+	yield* Console.log(`Wrote ${noticesFile}, ${unitFile} and ${licenseFile}.`);
 });
 
 export const build = compile(targets);

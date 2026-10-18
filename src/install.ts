@@ -34,9 +34,9 @@ import {
 } from "./windows.ts";
 
 /** The systemd user unit that runs `mx sync` from login to logout. */
-const unitName = "mx-sync.service";
+export const unitName = "mx-sync.service";
 
-/** Its text, for `mx sync` from `bin`; the Arch package ships it for `/usr/bin/mx`. */
+/** Its text, for `mx sync` from `bin`; each release carries it for `/usr/bin/mx`, where the Arch packages install mx. */
 export const unit = (bin: string) => `[Unit]
 Description=mx: keep the local copy of the mailbox in step with Microsoft Graph
 
