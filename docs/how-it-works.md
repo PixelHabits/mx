@@ -71,13 +71,24 @@ On macOS it is the LaunchAgent `io.github.pixelhabits.mx.sync`, in `~/Library/La
 
 ## Trying the MCP server by hand
 
-mx speaks MCP 2026-07-28 over stdio. Each request carries its protocol version in `_meta`, and there is no handshake:
+mx speaks MCP 2026-07-28 over stdio. It also speaks the `initialize` handshakes of MCP 2025-11-25, which Claude Desktop uses, and 2025-06-18, which Codex uses. On 2026-07-28 each request carries its protocol version in `_meta`, and there is no handshake:
 
 ```sh
 meta='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}'
 {
   echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{$meta}}"
   echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{$meta}}"
+  sleep 1
+} | mx mcp
+```
+
+On a handshake version, open with `initialize`, then send requests without `_meta`:
+
+```sh
+{
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"me","version":"1"}}}'
+  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
   sleep 1
 } | mx mcp
 ```
