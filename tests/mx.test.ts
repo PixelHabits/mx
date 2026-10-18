@@ -1820,7 +1820,10 @@ describe("mx", () => {
 				'near "=": syntax error',
 				'near ";": syntax error',
 				'near "INTO": syntax error',
-				"not authorized",
+				// Apple's system SQLite is built without load_extension at all.
+				process.platform === "darwin"
+					? "no such function: load_extension"
+					: "not authorized",
 				"SQLite ended the statement before the end of the SQL; query runs one SELECT with nothing after it.",
 				"query binds no parameters; write each value into the SQL.",
 			]);
