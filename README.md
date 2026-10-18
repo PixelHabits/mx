@@ -56,6 +56,17 @@ mx installs itself to `~/.local/bin/mx`. If that folder is not on your PATH, `mx
 
 ### Arch Linux
 
+mx is in the AUR as `mx-mail-bin`. Install it with an AUR helper such as yay, then set it up:
+
+```sh
+yay -S mx-mail-bin
+mx install
+```
+
+Your AUR helper then updates mx, as with `yay -Syu`. To remove it, run `mx uninstall` first, then `pacman -R mx-mail-bin`.
+
+To build the package from source instead:
+
 ```sh
 git clone https://github.com/PixelHabits/mx.git
 cd mx/packaging/arch
@@ -63,7 +74,7 @@ makepkg -si
 mx install
 ```
 
-pacman then updates mx. To remove it, run `mx uninstall` first, then `pacman -R mx`.
+This installs the package `mx-mail`. To update it, pull and run `makepkg -si` again. To remove it, run `mx uninstall` first, then `pacman -R mx-mail`.
 
 ### What `mx install` does
 
@@ -129,7 +140,7 @@ When your mail may be out of date, your agent sees a warning line before its ans
 
 ## Updates
 
-mx updates itself from this repository's GitHub releases. It checks once a day and installs only releases signed with the project's release key. To check now, run `mx update`. If you installed with pacman, update with pacman instead.
+mx updates itself from this repository's GitHub releases. It checks once a day and installs only releases signed with the project's release key. To check now, run `mx update`. If you installed mx from the AUR or built the Arch package, update it that way instead.
 
 ## Privacy and security
 
