@@ -111,6 +111,15 @@ Your agent uses these tools:
 | `update` | Marks, flags, categorizes or moves messages. |
 | `delete` | Moves messages to Deleted Items. |
 
+### Triage and interview
+
+mx also offers two ready-made requests:
+
+- **triage** reviews your new mail and reports what needs your reply, other actions, and failing systems, then counts the rest. It changes nothing until you agree.
+- **interview** looks over your last 30 days of mail, then asks you how you work: whose mail matters, what is noise, how you file mail. It saves your answers to your agent's memory when it can, so later triage follows them.
+
+In Claude Code, type `/mx:triage` or `/mx:interview`. You can give triage a start date, as in `/mcp__mx__triage 2026-10-01`. In Claude Desktop, choose **+**, then **Add from mx**. Codex has no ready-made requests, so ask it in plain words, such as "triage my mail".
+
 ## Approvals
 
 `mx install` sets these defaults in Claude Code and Codex:
