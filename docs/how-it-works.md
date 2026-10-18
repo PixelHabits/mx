@@ -63,6 +63,8 @@ The saved sign-in is one record in the system's secret store, or in a file only 
 | `$XDG_STATE_HOME/mx/` | `~/Library/Logs/mx/` | `%LOCALAPPDATA%\mx\state\` | The sign-in file on machines without a secret store; the sync log on macOS and Windows |
 | `$XDG_CACHE_HOME/mx/` | `~/Library/Caches/mx/` | `%LOCALAPPDATA%\mx\cache\` | Saved attachments |
 
+On Windows, Claude Desktop from the Microsoft Store keeps its config inside its app package, in `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`. `mx install` and `mx uninstall` change that file, and also `%APPDATA%\Claude\claude_desktop_config.json` when it exists.
+
 On Linux the background service is the systemd user unit `mx-sync`. Its log is in the journal: `journalctl --user -u mx-sync -f`.
 
 On macOS it is the LaunchAgent `io.github.pixelhabits.mx.sync`, in `~/Library/LaunchAgents/io.github.pixelhabits.mx.sync.plist`. launchd starts it at sign-in, and again after it fails, at most once every 5 minutes. Its log is `~/Library/Logs/mx/sync.log`: `tail -f ~/Library/Logs/mx/sync.log`.
