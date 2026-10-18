@@ -16,6 +16,8 @@ The workflow then runs four jobs in turn:
    2. Checks each signature against Apple's requirement for a Developer ID Application signature of `APPLE_TEAM_ID`, and runs the signed arm64 binary.
    3. Sends both binaries to Apple's notary service in one ZIP archive and waits until Apple accepts them. Apple can't staple a ticket to a bare executable, so Gatekeeper looks the tickets up online.
    4. Writes the manifest `latest.json` with each binary's URL, size and sha256, of the signed bytes, and signs it with `MX_RELEASE_SIGNING_KEY` into `latest.json.sig`.
+
+   While `MACOS_SIGNING` is `off`, `sign` skips the Apple steps and ships the macOS binaries unsigned, as [Unsigned macOS binaries](#unsigned-macos-binaries) says.
 3. `publish`, on Linux:
    1. Uploads the nine files to the draft with `gh release upload`.
    2. Attests the build provenance of the binaries, `mx-sync.service` and `latest.json`.
@@ -29,6 +31,27 @@ mx reads `https://github.com/PixelHabits/mx/releases/latest/download/latest.json
 
 Pull requests that release-please opens with the workflow's token start no other workflow, so the Check workflow does not run on the release PR.
 
+## Unsigned macOS binaries
+
+Until the Apple secrets are in the `release` environment, set the repository variable `MACOS_SIGNING` to `off`:
+
+```sh
+gh variable set MACOS_SIGNING --body off -R PixelHabits/mx
+```
+
+While the variable is `off`:
+
+- `sign` skips the keychain import, `codesign`, the signature check and notarization. It still waits for approval, runs the arm64 binary, and writes and signs the manifest of the unsigned binaries, so the manifest's sums match the files that `publish` uploads. It needs `MX_RELEASE_SIGNING_KEY` only.
+- `publish` adds a line to the GitHub release notes that says the macOS binaries are not signed or notarized, with the `xattr -d com.apple.quarantine` command. `CHANGELOG.md` does not get the line.
+
+Actions compares the value without regard to case, so `OFF` also counts as `off`. With any other value, or with no variable, `sign` signs and notarizes the binaries, and fails if an Apple secret is missing.
+
+When the Apple secrets are in the `release` environment, delete the variable:
+
+```sh
+gh variable delete MACOS_SIGNING -R PixelHabits/mx
+```
+
 ## Settings
 
 The repository needs these settings:
@@ -37,7 +60,7 @@ The repository needs these settings:
 - The environment `aur`, with its deployment branches set to `main` only, so no workflow on another branch can read its secret. It has no required reviewer, so a release asks for one approval only. The `aur` job in the Release workflow passes `AUR_SSH_PRIVATE_KEY` to `publish-aur.yml` by name, as GitHub passes no environment secret to a reusable workflow on its own.
 - In Settings › Actions › General, "Allow GitHub Actions to create and approve pull requests", so that release-please can open its release PR.
 
-The `release` environment needs these secrets:
+The `release` environment needs these secrets. While `MACOS_SIGNING` is `off`, it needs only `MX_RELEASE_SIGNING_KEY`.
 
 | Secret | Value |
 | --- | --- |
