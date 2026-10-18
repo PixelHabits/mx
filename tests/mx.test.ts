@@ -707,6 +707,7 @@ const codexApprovals = (approvals: readonly (readonly [string, string])[]) =>
 /** The recommended approvals: every tool runs without asking, except send and delete, which always ask. */
 const recommended = [
 	["search", "approve"],
+	["query", "approve"],
 	["thread", "approve"],
 	["message", "approve"],
 	["attachment", "approve"],
@@ -974,6 +975,8 @@ const seedOrderLine = /^#2 .* \| Garden supplies order \| unread$/mu;
 const rotaInArchiveLine =
 	/ Archive \| Rosa Example <rosa@example\.com> \| Garden plot rota /u;
 const timeLeft = /, (about \d+ min|less than a minute) left/u;
+const cutAtCharacters =
+	/^\(first \d+ rows, cut at 20000 characters; refine the query\)$/u;
 const lineIn = (id: number, folder: string) =>
 	new RegExp(`^#${id} .* ${folder} \\|`, "u");
 
@@ -997,6 +1000,7 @@ const tools = [
 	"delete_draft",
 	"draft",
 	"message",
+	"query",
 	"search",
 	"send",
 	"thread",
@@ -1070,7 +1074,7 @@ describe("mx", () => {
 			expect(frames).toEqual([]);
 		}));
 
-	test("mx mcp speaks MCP 2026-07-28 only and lists the ten tools, marking reads read-only and every write but draft destructive", () =>
+	test("mx mcp speaks MCP 2026-07-28 only and lists the eleven tools, marking reads read-only and every write but draft destructive", () =>
 		Effect.gen(function* () {
 			const client = yield* McpClient;
 			expect(yield* client.request("server/discover")).toMatchObject({
@@ -1096,6 +1100,7 @@ describe("mx", () => {
 				delete_draft: "write destructive",
 				draft: "write safe",
 				message: "read safe",
+				query: "read safe",
 				search: "read safe",
 				send: "write destructive",
 				thread: "read safe",
@@ -1173,7 +1178,7 @@ describe("mx", () => {
 		));
 
 	test(
-		"the binary that bun run build cross-compiles for this system starts, answers --version and lists the ten tools over MCP",
+		"the binary that bun run build cross-compiles for this system starts, answers --version, lists the eleven tools over MCP and answers a query",
 		() =>
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
@@ -1207,6 +1212,11 @@ describe("mx", () => {
 					tools: { name: string }[];
 				};
 				expect(Arr.map(listed, ({ name }) => name).sort()).toEqual(tools);
+				const counted = yield* client.call("query", {
+					sql: "SELECT count(*) AS folders FROM folders",
+				});
+				expect(counted.isError).toBe(false);
+				expect(lines(counted.text).slice(-2)).toEqual(["folders", "0"]);
 			}).pipe(Effect.scoped),
 		{
 			because: "CI builds the binaries of macOS and Windows to run there",
@@ -1697,6 +1707,182 @@ describe("mx", () => {
 			expect(thread).not.toContain("From: Sam Example");
 			expect(thread).toContain("[img 1]");
 		}));
+
+	test("query answers a GROUP BY over mail as a tab-separated table with a header: messages per sender", () =>
+		Effect.gen(function* () {
+			microsoft.addFolder("folder-clubs", "Clubs", "folder-root");
+			for (const [day, from, conversationId, subject] of [
+				["20", priya, "conversation-chess", "Chess club: spring fixtures"],
+				["21", jonas, "conversation-chess", "RE: Chess club: spring fixtures"],
+				["22", priya, "conversation-boards", "Chess club: the new boards"],
+			] as const) {
+				microsoft.deliver({
+					body: `${subject}.`,
+					conversationId,
+					from,
+					parentFolderId: "folder-clubs",
+					received: `2026-09-${day}T18:00:00Z`,
+					subject,
+				});
+			}
+			yield* cli("sync", "--once");
+			expect(
+				yield* tool("query", {
+					sql: "SELECT from_address, count(*) AS messages FROM mail WHERE folder = 'Clubs' GROUP BY from_address ORDER BY messages DESC",
+				})
+			).toBe(
+				"from_address\tmessages\npriya@example.com\t2\njonas@example.com\t1"
+			);
+		}));
+
+	test("query joins mail and folders, where each folder counts its stored and unread messages", () =>
+		Effect.gen(function* () {
+			yield* tool("update", {
+				ids: [
+					idOf(
+						yield* tool("search", { folder: "Clubs", query: "boards" }),
+						"boards"
+					),
+				],
+				read: true,
+			});
+			expect(
+				yield* tool("query", {
+					sql: "SELECT f.path, f.total, f.unread, count(*) AS from_priya FROM folders f JOIN mail m ON m.folder = f.path WHERE f.path = 'Clubs' AND m.from_address = 'priya@example.com' GROUP BY f.path",
+				})
+			).toBe("path\ttotal\tunread\tfrom_priya\nClubs\t3\t2\t2");
+		}));
+
+	test("query runs a CTE with a window function, with times in UTC ISO 8601", () =>
+		Effect.gen(function* () {
+			expect(
+				yield* tool("query", {
+					sql: "WITH ranked AS (SELECT subject, received_at, row_number() OVER (PARTITION BY conversation_id ORDER BY received_at DESC) AS place FROM mail WHERE folder = 'Clubs') SELECT subject, received_at FROM ranked WHERE place = 1 ORDER BY received_at DESC",
+				})
+			).toBe(
+				"subject\treceived_at\nChess club: the new boards\t2026-09-22T18:00:00Z\nRE: Chess club: spring fixtures\t2026-09-21T18:00:00Z"
+			);
+		}).pipe(
+			// The folder the query tests read leaves the mailbox and the store with this last of them.
+			Effect.ensuring(
+				Effect.suspend(() => {
+					microsoft.removeFolder("folder-clubs");
+					return Effect.orDie(cli("sync", "--once"));
+				})
+			)
+		));
+
+	test("query marks the user's own messages from_me as thread marks them (me), and conversations names each conversation's newest message", () =>
+		Effect.gen(function* () {
+			expect(
+				yield* tool("query", {
+					sql: "SELECT folder, from_address, to_addresses, from_me FROM mail WHERE conversation_id = 'conversation-budget' ORDER BY sent_at",
+				})
+			).toBe(
+				'folder\tfrom_address\tto_addresses\tfrom_me\nInbox\talice@example.test\t["sam@example.test"]\t0\nSent Items\tsam@example.test\t["alice@example.test"]\t1\nInbox\talice@example.test\t["sam@example.test"]\t0'
+			);
+			expect(
+				yield* tool("query", {
+					sql: "SELECT c.messages, c.unread, c.mine, m.subject, m.from_me FROM conversations c JOIN mail m ON m.id = c.last_id WHERE c.conversation_id = 'conversation-budget'",
+				})
+			).toBe(
+				"messages\tunread\tmine\tsubject\tfrom_me\n3\t2\t1\tRE: Quarterly budget\t0"
+			);
+		}));
+
+	test("query refuses anything but one SELECT with SQLite's own error, and changes nothing", () =>
+		Effect.gen(function* () {
+			const copy = join(home, "query-copy.sqlite");
+			const counts =
+				"SELECT (SELECT count(*) FROM mail) AS messages, (SELECT count(*) FROM folders) AS folders";
+			const before = yield* tool("query", { sql: counts });
+			expect(
+				yield* Effect.forEach(
+					[
+						"INSERT INTO folders (id, parent_id, name, path, sent) VALUES ('invented', 'folder-root', 'Invented', 'Invented', 0)",
+						"ATTACH 'other.sqlite' AS other",
+						"PRAGMA journal_mode = DELETE",
+						"SELECT 1; DELETE FROM messages",
+						`VACUUM INTO '${copy}'`,
+						"SELECT load_extension('extension')",
+						"SELECT 1) ; DELETE FROM messages; SELECT * FROM (SELECT 1",
+						"SELECT * FROM mail WHERE id = ?",
+					],
+					(sql) => refusal("query", { sql })
+				)
+			).toEqual([
+				'near "INSERT": syntax error',
+				'near "AS": syntax error',
+				'near "=": syntax error',
+				'near ";": syntax error',
+				'near "INTO": syntax error',
+				"not authorized",
+				"SQLite ended the statement before the end of the SQL; query runs one SELECT with nothing after it.",
+				"query binds no parameters; write each value into the SQL.",
+			]);
+			expect(yield* tool("query", { sql: counts })).toBe(before);
+			expect(yield* (yield* FileSystem.FileSystem).exists(copy)).toBe(false);
+		}));
+
+	test("query answers at most 200 rows and 20000 characters, cuts each value at 200 characters, and says when it stopped", () =>
+		Effect.gen(function* () {
+			const counting =
+				"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n LIMIT 300) SELECT i FROM n";
+			const firstRows = [
+				"i",
+				...Arr.makeBy(200, (i) => String(i + 1)),
+				"(first 200 rows; refine the query)",
+			];
+			expect(lines(yield* tool("query", { sql: counting }))).toEqual(firstRows);
+			// A comment left open after a closing parenthesis hides mx's own LIMIT; the cap still holds.
+			expect(
+				lines(yield* tool("query", { sql: `${counting}) LIMIT 1000 /*` }))
+			).toEqual(firstRows);
+			const wide = lines(
+				yield* tool("query", {
+					sql: "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n LIMIT 150) SELECT i, printf('%.*c', 1000, 'x') AS filler FROM n",
+				})
+			);
+			expect(wide[1]).toBe(`1\t${"x".repeat(199)}…`);
+			expect(wide.at(-1)).toMatch(cutAtCharacters);
+			expect(Arr.join(wide.slice(0, -1), "\n").length).toBeLessThanOrEqual(
+				20_000
+			);
+		}));
+
+	test("query stops a query that runs past 10 seconds and says so, while mx mcp answers other calls", () =>
+		Effect.gen(function* () {
+			const { client, stdio } = yield* connect;
+			yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+				// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+				Effect.provide(stdio),
+				// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+				Effect.provide(platform, { local: true }),
+				Effect.forkScoped
+			);
+			const runaway = yield* Effect.forkChild(
+				client.call("query", {
+					sql: "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) AS forever FROM n",
+				})
+			);
+			const listed = yield* client.call("search", { query: "lunch" });
+			expect(listed.text).toContain("Lunch plans");
+			expect(runaway.pollUnsafe()).toBeUndefined();
+			const stopped = yield* Effect.raceFirst(
+				Fiber.join(runaway),
+				Effect.forever(
+					Effect.andThen(settleBriefly, TestClock.adjust("1 second"))
+				)
+			);
+			expect(stopped.isError).toBe(true);
+			expect(lines(stopped.text).at(-1)).toBe(
+				"The query ran past 10 seconds, so mx stopped it. Narrow it down and run it again."
+			);
+		}).pipe(
+			Effect.scoped,
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one mx mcp process runs on.
+			Effect.provide(TestClock.layer())
+		));
 
 	test("message shows the headers and the new text, and the whole body from Graph with full", () =>
 		Effect.gen(function* () {

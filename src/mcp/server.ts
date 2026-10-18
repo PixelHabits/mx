@@ -23,6 +23,7 @@ import {
 import { FlagStatus, type Message, type Recipient } from "../graph/api.ts";
 import { type Compose, Graph, isNotFound } from "../graph/graph.ts";
 import { Paths } from "../paths.ts";
+import { Query } from "../query.ts";
 import { syncWarning } from "../status.ts";
 import { Store, type Stored, type StoredFolder } from "../store.ts";
 import { Sync } from "../sync.ts";
@@ -174,6 +175,27 @@ const search = Tool.make("search", {
 	.annotate(Tool.Destructive, false)
 	.annotate(Tool.OpenWorld, false);
 
+const sqlQuery = Tool.make("query", {
+	description: `Runs one read-only SQLite SELECT over the local copy of the mailbox, to count, group, join and filter mail instead of reading many search lines. Answers a tab-separated table with a header row: at most 200 rows and 20000 characters, each value cut at 200 characters. Times are UTC ISO 8601 text, such as 2026-10-01T14:00:00Z; is_ and has_ columns and from_me are 1 or 0.
+Views:
+- mail, one row per message: id (the #id), folder (a path such as Inbox/Projects), conversation_id, received_at, sent_at, from_name, from_address, to_addresses, cc_addresses, bcc_addresses, subject, is_read, flag (notFlagged, flagged or complete), categories, importance (low, normal or high), has_attachments, is_draft, from_me (the user sent it). to_addresses, cc_addresses, bcc_addresses and categories are JSON arrays; split them with json_each.
+- folders: path, total (messages), unread.
+- conversations, one row per conversation: conversation_id, messages, unread, mine (messages the user sent), last_id (the id of its newest message).
+Message bodies are not here: search finds words in them, and message reads one.
+Examples:
+SELECT from_address, count(*) AS n FROM mail WHERE folder = 'Inbox' AND received_at >= '2026-10-01' GROUP BY from_address ORDER BY n DESC
+SELECT m.id, m.from_name, m.subject FROM conversations c JOIN mail m ON m.id = c.last_id WHERE m.folder = 'Inbox' AND NOT m.from_me`,
+	parameters: Schema.Struct({
+		sql: Schema.String.annotate({
+			description:
+				"One SELECT, or WITH and a SELECT, with no semicolon and no parameters.",
+		}),
+	}),
+})
+	.annotate(Tool.Readonly, true)
+	.annotate(Tool.Destructive, false)
+	.annotate(Tool.OpenWorld, false);
+
 const thread = Tool.make("thread", {
 	description:
 		"The whole conversation a message belongs to, across every folder, oldest first: headers and each message's new text. The signed-in user's own messages say (me).",
@@ -287,6 +309,7 @@ export const recommendedApprovals: readonly {
 	readonly tool: string;
 }[] = [
 	{ approval: "allow", tool: search.name },
+	{ approval: "allow", tool: sqlQuery.name },
 	{ approval: "allow", tool: thread.name },
 	{ approval: "allow", tool: message.name },
 	{ approval: "allow", tool: attachment.name },
@@ -435,6 +458,7 @@ export const tools = Layer.effectDiscard(
 		const store = yield* Store;
 		const graph = yield* Graph;
 		const sync = yield* Sync;
+		const queries = yield* Query;
 		const fs = yield* FileSystem.FileSystem;
 		const path = yield* Path.Path;
 		const { cache } = yield* Paths;
@@ -711,6 +735,8 @@ export const tools = Layer.effectDiscard(
 			})
 		);
 
+		yield* registerRead(sqlQuery, ({ sql }) => queries.run(sql));
+
 		yield* registerRead(thread, ({ id }) =>
 			Effect.gen(function* () {
 				const found = yield* stored(id);
@@ -893,6 +919,8 @@ export const serve = (version: string) =>
 				version,
 			})
 		),
-		Layer.provide(Layer.mergeAll(Graph.layer, Store.layer, Sync.layer)),
+		Layer.provide(
+			Layer.mergeAll(Graph.layer, Store.layer, Sync.layer, Query.layer)
+		),
 		Layer.provide(Paths.layer)
 	);

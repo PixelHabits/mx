@@ -14,6 +14,9 @@ const table = "effect_sql_migrations";
  * The store mirrors the mailbox, so Graph can refill all of it except `local_ids`, the `#N` id each message got, and
  * every migration keeps `local_ids`. A migration that cannot convert the stored mail in place may clear every folder's
  * `delta_link` instead, so that the next pass reads each folder from the start.
+ *
+ * The `query` tool reads the tables through the views in `views.ts`, so a migration that changes a table they read
+ * changes them too.
  */
 export const migrations = { "0001_initial": initial };
 

@@ -1,5 +1,7 @@
+import { BunServices } from "@effect/platform-bun";
 import { Array as Arr, Deferred, Effect, Layer, Sink, Stream } from "effect";
 import { type ChildProcess, ChildProcessSpawner } from "effect/process";
+import { queryWorker } from "../src/query.ts";
 import { readUserPath, writeUserPath } from "../src/windows.ts";
 import type { FakeTunnels } from "./fake-push.ts";
 
@@ -69,12 +71,18 @@ export class FakeProcesses {
 		this.tunnels = tunnels;
 	}
 
-	readonly layer = Layer.succeed(
+	/** The programs mx starts, faked, except mx's own query worker, which runs for real and goes unrecorded. */
+	readonly layer = Layer.effect(
 		ChildProcessSpawner.ChildProcessSpawner,
-		ChildProcessSpawner.make((command) =>
-			Effect.suspend(() => this.spawn(command))
+		Effect.map(ChildProcessSpawner.ChildProcessSpawner, (system) =>
+			ChildProcessSpawner.make((command) =>
+				command._tag === "StandardCommand" &&
+				command.args.at(-1) === queryWorker
+					? system.spawn(command)
+					: Effect.suspend(() => this.spawn(command))
+			)
 		)
-	);
+	).pipe(Layer.provide(BunServices.layer));
 
 	/** Ends the quick tunnel at `host` as if cloudflared exited with code 1. */
 	exit(host: string) {

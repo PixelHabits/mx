@@ -17,6 +17,7 @@ import {
 	UpdateFailed,
 } from "./errors.ts";
 import { Paths } from "./paths.ts";
+import { answerQuery, queryWorker } from "./query.ts";
 
 /** Logs go to stderr: stdout carries command output, and MCP messages under `mx mcp`. */
 const platform = Layer.mergeAll(
@@ -52,9 +53,15 @@ const report = (cause: Cause.Cause<unknown>) => {
 	return CliError.isCliError(error) ? Effect.void : Effect.logError(cause);
 };
 
-Command.run(mx, { version: packageJson.version }).pipe(
-	Effect.tapCause(report),
-	// @effect-diagnostics-next-line strictEffectProvide:off - the process entry point.
-	Effect.provide(platform),
-	BunRuntime.runMain({ disableErrorReporting: true })
-);
+// `mx query-worker` is the child process of the query tool, so the command line neither lists nor parses it, and it
+// reads no config.
+if (Bun.argv[2] === queryWorker) {
+	BunRuntime.runMain(answerQuery);
+} else {
+	Command.run(mx, { version: packageJson.version }).pipe(
+		Effect.tapCause(report),
+		// @effect-diagnostics-next-line strictEffectProvide:off - the process entry point.
+		Effect.provide(platform),
+		BunRuntime.runMain({ disableErrorReporting: true })
+	);
+}
