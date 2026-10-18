@@ -1,0 +1,66 @@
+# Builds the AUR package mx-mail-bin from the files of a published release and pushes it to the AUR. The Release
+# workflow calls it after it publishes a release. To run it by hand for a tag:
+#
+#   gh workflow run publish-aur.yml -f release_tag=v1.2.3
+#
+# AUR_SSH_PRIVATE_KEY is a secret of the aur environment, which only main can use, so no workflow on another branch can
+# read it. A caller must still pass it by name, or it reaches this workflow empty. Only the push step sees it, and the
+# job fails without it. packaging/aur/README.md and RELEASING.md have the details.
+name: Publish AUR package
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      pkgrel:
+        required: false
+        default: "1"
+        type: string
+    secrets:
+      AUR_SSH_PRIVATE_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish, as v1.2.3
+        required: true
+        type: string
+      pkgrel:
+        description: Arch package release; raise it to publish the same version again
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-aur
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: aur
+    timeout-minutes: 20
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install the Arch packaging tools
+        run: pacman -Syu --noconfirm --needed git github-cli jq namcap openssh
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # makepkg refuses to run as root.
+      - name: Create the build user
+        run: useradd --create-home builder
+      - name: Build and check the package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PKGREL: ${{ inputs.pkgrel }}
+        run: packaging/aur/scripts/build.sh
+      - name: Push the package to the AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: packaging/aur/scripts/push.sh

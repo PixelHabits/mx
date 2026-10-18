@@ -1,5 +1,6 @@
 # Builds mx from the committed HEAD of this checkout: cd packaging/arch && makepkg -si
-pkgname=mx
+# The AUR package mx-mail-bin installs the same files from a release and conflicts with this one.
+pkgname=mx-mail
 pkgver=0.1.0
 pkgrel=1
 pkgdesc='A local copy of a Microsoft 365 mailbox, served to AI agents over MCP'
@@ -28,7 +29,7 @@ build() {
 package() {
 	cd mx
 	install -Dm755 dist/mx-linux-x64 "$pkgdir/usr/bin/mx"
-	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/mx/LICENSE"
-	install -Dm644 dist/THIRD_PARTY_NOTICES "$pkgdir/usr/share/licenses/mx/THIRD_PARTY_NOTICES"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 dist/THIRD_PARTY_NOTICES "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES"
 	install -Dm644 dist/mx-sync.service "$pkgdir/usr/lib/systemd/user/mx-sync.service"
 }

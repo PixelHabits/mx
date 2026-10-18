@@ -1,5 +1,5 @@
 # release-please keeps a release PR open from the conventional commits on main. When that PR merges, it tags the merge
-# commit v<version> and creates the GitHub release as a draft. Three jobs then finish the release, in this order:
+# commit v<version> and creates the GitHub release as a draft. Four jobs then finish the release, in this order:
 #
 # 1. build, on Linux, compiles every binary and writes the third-party notices, the sync unit for the Arch packages and
 #    a copy of LICENSE.
@@ -7,11 +7,14 @@
 #    writes the manifest of every binary's size and sha256, of the bytes as they ship, and signs it with the release
 #    key.
 # 3. publish, on Linux, uploads the files to the draft, attests them and publishes it.
+# 4. aur, in an Arch Linux container, builds the AUR package mx-mail-bin from the published files and pushes it to the
+#    AUR, with .github/workflows/publish-aur.yml.
 #
 # mx reads only the newest published release, so it never sees a release without its files.
 #
 # The sign job runs in the release environment, which waits for a required reviewer. The secrets it uses belong to
-# that environment, so no other job can read them. RELEASING.md has the steps, the settings and the secrets.
+# that environment, so no other job can read them. The aur job's key belongs to the aur environment, which only main
+# can use and no reviewer gates. RELEASING.md has the steps, the settings and the secrets.
 name: Release
 
 on:
@@ -199,3 +202,11 @@ jobs:
             dist/latest.json
       - name: Publish the draft
         run: gh release edit "$TAG" --draft=false --latest
+
+  aur:
+    needs: [release-please, publish]
+    uses: ./.github/workflows/publish-aur.yml
+    with:
+      release_tag: ${{ needs.release-please.outputs.tag }}
+    secrets:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}

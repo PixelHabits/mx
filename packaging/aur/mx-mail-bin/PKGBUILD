@@ -1,0 +1,38 @@
+# Maintainer: PixelHabits
+
+pkgname=mx-mail-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A local copy of a Microsoft 365 mailbox, served to AI agents over MCP'
+arch=('x86_64')
+url='https://github.com/PixelHabits/mx'
+license=('MIT')
+# What the release binary links, as ldd shows it: the official Bun runtime links only glibc.
+depends=('glibc')
+optdepends=('cloudflared: Graph push notifications; without it, mx downloads its own')
+provides=('mx-mail')
+conflicts=('mx-mail')
+# Stripping a Bun executable cuts off the program it carries.
+options=('!strip' '!debug')
+
+_release="$url/releases/download/v$pkgver"
+source=(
+	"$pkgname-$pkgver-mx-linux-x64::$_release/mx-linux-x64"
+	"$pkgname-$pkgver-mx-sync.service::$_release/mx-sync.service"
+	"$pkgname-$pkgver-LICENSE::$_release/LICENSE"
+	"$pkgname-$pkgver-THIRD_PARTY_NOTICES::$_release/THIRD_PARTY_NOTICES"
+)
+# scripts/build.sh sets each sum from the digest GitHub records for the release file named beside it.
+sha256sums=(
+	'0000000000000000000000000000000000000000000000000000000000000000' # mx-linux-x64
+	'0000000000000000000000000000000000000000000000000000000000000000' # mx-sync.service
+	'0000000000000000000000000000000000000000000000000000000000000000' # LICENSE
+	'0000000000000000000000000000000000000000000000000000000000000000' # THIRD_PARTY_NOTICES
+)
+
+package() {
+	install -Dm755 "$pkgname-$pkgver-mx-linux-x64" "$pkgdir/usr/bin/mx"
+	install -Dm644 "$pkgname-$pkgver-mx-sync.service" "$pkgdir/usr/lib/systemd/user/mx-sync.service"
+	install -Dm644 "$pkgname-$pkgver-LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 "$pkgname-$pkgver-THIRD_PARTY_NOTICES" "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES"
+}
