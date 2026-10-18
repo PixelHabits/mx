@@ -497,6 +497,16 @@ const refusal = (name: string, args: Record<string, unknown>) =>
 
 const lines = (text: string) => text.split("\n");
 
+/** The sha256 of `bytes` in hex. Tests compare binaries by it, so a mismatch prints one line instead of every byte. */
+const sha256 = (bytes: Uint8Array) =>
+	new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+
+/** The sha256 of the bytes in `file`. */
+const fileSha256 = (file: string) =>
+	Effect.flatMap(FileSystem.FileSystem, (fs) =>
+		Effect.map(fs.readFile(file), sha256)
+	);
+
 const listedId = /^#(\d+) /u;
 
 /** The local id of the one listed message whose line contains `needle`. */
@@ -2062,8 +2072,7 @@ describe("mx", () => {
 			expect(listing[1]).toMatch(sheetLine);
 			const saved = yield* tool("attachment", { id, n: 1 });
 			expect(saved.startsWith(cacheFolder)).toBe(true);
-			const fs = yield* FileSystem.FileSystem;
-			expect([...(yield* fs.readFile(saved))]).toEqual([...inlineImage]);
+			expect(yield* fileSha256(saved)).toBe(sha256(inlineImage));
 		}));
 
 	test("draft replies, replies to all and forwards with the quoted chain, and builds a new message with files", () =>
@@ -3693,7 +3702,7 @@ describe("mx", () => {
 				)
 			);
 			expect(Exit.isFailure(exit)).toBe(true);
-			expect([...(yield* fs.readFile(exe))]).toEqual([...before]);
+			expect(yield* fileSha256(exe)).toBe(sha256(before));
 		}));
 
 	test("double-clicked on Windows, mx plays the banner, runs mx install, and waits for Enter before its console closes", () =>
@@ -3780,8 +3789,7 @@ describe("mx", () => {
 			const before = processes.commands.length;
 			const { output } = yield* cli("update");
 			expect(output).toContain(`Updated mx to ${later(1)}`);
-			const fs = yield* FileSystem.FileSystem;
-			expect([...(yield* fs.readFile(installed))]).toEqual([...newBinary]);
+			expect(yield* fileSha256(installed)).toBe(sha256(newBinary));
 			expect(
 				Arr.map(processes.commands.slice(before), (command) =>
 					Arr.join(command, " ")
@@ -3801,9 +3809,7 @@ describe("mx", () => {
 			const failure = yield* Effect.flip(cli("update"));
 			expect(failure.message).toContain("signature");
 			expect(downloads(later(2))).toBe(0);
-			expect([
-				...(yield* (yield* FileSystem.FileSystem).readFile(installed)),
-			]).toEqual([...newBinary]);
+			expect(yield* fileSha256(installed)).toBe(sha256(newBinary));
 		}));
 
 	test("mx update refuses a release that is not newer than the running binary", () =>
@@ -3814,9 +3820,7 @@ describe("mx", () => {
 			const { output } = yield* cli("update");
 			expect(output).toContain(`${running} is the newest release`);
 			expect(downloads(running)).toBe(0);
-			expect([
-				...(yield* (yield* FileSystem.FileSystem).readFile(installed)),
-			]).toEqual([...newBinary]);
+			expect(yield* fileSha256(installed)).toBe(sha256(newBinary));
 		}));
 
 	test("mx update refuses a binary whose sha256 differs from the signed manifest", () =>
@@ -3831,9 +3835,7 @@ describe("mx", () => {
 			const failure = yield* Effect.flip(cli("update"));
 			expect(failure.message).toContain("sha256");
 			expect(downloads(later(3))).toBe(1);
-			expect([
-				...(yield* (yield* FileSystem.FileSystem).readFile(installed)),
-			]).toEqual([...newBinary]);
+			expect(yield* fileSha256(installed)).toBe(sha256(newBinary));
 		}));
 
 	test("after mx sync stops, read tools say when mail last synced, and mx status exits non-zero", () =>
