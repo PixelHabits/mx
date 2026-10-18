@@ -62,10 +62,10 @@ const frames = ({
 	const frame = (top: string, bottom: string) =>
 		Arr.join(
 			[
-				`  ┌───────┐${top}┌───────┐`,
-				`  │${glyphs.fall}     ${glyphs.rise}│${" ".repeat(laneWidth)}│  ${glyphs.tray.repeat(3)}  │`,
-				`  │  ${glyphs.fall} ${glyphs.rise}  │${bottom}│ inbox │`,
-				`  └───────┘${" ".repeat(laneWidth)}└───────┘`,
+				`  ┌───────┐${" ".repeat(laneWidth)}┌───────┐`,
+				`  │${glyphs.fall}     ${glyphs.rise}│${top}│  ${glyphs.tray.repeat(3)}  │`,
+				`  │  ${glyphs.fall} ${glyphs.rise}  │${" ".repeat(laneWidth)}│ inbox │`,
+				`  └───────┘${bottom}└───────┘`,
 				`${" ".repeat(22)}${color ? "\u001b[1mmx\u001b[22m" : "mx"}`,
 			],
 			"\n"
