@@ -29,7 +29,7 @@ import { SqlClient } from "effect/sql";
 import { TestClock, TestConsole } from "effect/testing";
 import packageJson from "../package.json" with { type: "json" };
 import { savedConfig } from "../src/auth/config.ts";
-import { mx } from "../src/cli.ts";
+import { mx, run as runMx } from "../src/cli.ts";
 import { Paths } from "../src/paths.ts";
 import { migrate, migrations } from "../src/store/migrations.ts";
 import {
@@ -62,6 +62,15 @@ const releases = await FakeReleases.make();
 // mx trusts only the release key it imports; the tests sign their releases with a throwaway key instead.
 mock.module("../release/public-key.pem", () => ({
 	default: releases.publicKey,
+}));
+
+/** Whether mx is the only process attached to its console, as when Explorer starts it on a double-click. */
+let consoleOwned = false;
+// mx asks Windows through bun:ffi; the tests answer for it.
+const windowsModule = await import("../src/windows.ts");
+mock.module("../src/windows.ts", () => ({
+	...windowsModule,
+	ownsConsole: Effect.sync(() => consoleOwned),
 }));
 
 /** The version this checkout builds, and the releases above it. */
@@ -219,7 +228,7 @@ const printed: string[] = [];
 const runOn =
 	(system: typeof platform) =>
 	(...args: string[]) =>
-		Effect.exit(Command.runWith(mx, { version: "0.0.0-test" })(args)).pipe(
+		Effect.exit(runMx(args)).pipe(
 			Effect.flatMap((exit) =>
 				Effect.map(
 					Effect.all({
@@ -282,9 +291,15 @@ const withStdinTerminal = withTerminalOn(process.stdin);
 /** A bare mx plays its banner only when stdout is a terminal. */
 const withStdoutTerminal = withTerminalOn(process.stdout);
 
+/** A key of one character types it, and a longer one, such as `return`, presses the key of that name. */
+const keyPress = (name: string): Terminal.UserInput => ({
+	input: name.length === 1 ? Option.some(name) : Option.none(),
+	key: { ctrl: false, meta: false, name, shift: false },
+});
+
 /**
- * `system` on a terminal where the user presses `keys` in turn, across every prompt: a key of one character types it,
- * and a longer one, such as `return`, presses the key of that name. `frames` keeps everything mx drew on it.
+ * `system` on a terminal where the user presses `keys` in turn, across every prompt, `press` presses one more once mx
+ * reads the terminal, and `close` ends its input, as when stdin closes. `frames` keeps everything mx drew on it.
  */
 const fakeTerminal = (system: typeof platform, keys: readonly string[]) => {
 	const frames: string[] = [];
@@ -300,13 +315,7 @@ const fakeTerminal = (system: typeof platform, keys: readonly string[]) => {
 			readInput: Effect.gen(function* () {
 				if (input === undefined) {
 					input = yield* Queue.make<Terminal.UserInput, Cause.Done>();
-					yield* Queue.offerAll(
-						input,
-						Arr.map(keys, (name) => ({
-							input: name.length === 1 ? Option.some(name) : Option.none(),
-							key: { ctrl: false, meta: false, name, shift: false },
-						}))
-					);
+					yield* Queue.offerAll(input, Arr.map(keys, keyPress));
 				}
 				return input;
 			}),
@@ -314,7 +323,18 @@ const fakeTerminal = (system: typeof platform, keys: readonly string[]) => {
 			rows: Effect.succeed(24),
 		})
 	);
-	return { frames, system: Layer.merge(system, terminal) };
+	const read = Effect.suspend(() =>
+		input === undefined
+			? Effect.die("mx has not read the terminal.")
+			: Effect.succeed(input)
+	);
+	return {
+		close: Effect.flatMap(read, Queue.end),
+		frames,
+		press: (name: string) =>
+			Effect.flatMap(read, (queue) => Queue.offer(queue, keyPress(name))),
+		system: Layer.merge(system, terminal),
+	};
 };
 
 /** Runs `effect` as if on `system`; mx reads `process.platform` as it builds its layers. */
@@ -335,6 +355,19 @@ const asIfOn =
 		);
 const onWindows = asIfOn("win32");
 const onMac = asIfOn("darwin");
+
+/** Runs `effect` as if Explorer started mx on a double-click: on Windows, alone on a console of its own. */
+const doubleClicked = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+	Effect.acquireUseRelease(
+		Effect.sync(() => {
+			consoleOwned = true;
+		}),
+		() => effect,
+		() =>
+			Effect.sync(() => {
+				consoleOwned = false;
+			})
+	).pipe(withStdoutTerminal(true), withStdinTerminal(true), onWindows);
 
 /** Where the Arch package installs mx. */
 const packaged = "/usr/bin/mx";
@@ -1056,6 +1089,19 @@ describe("mx", () => {
 					: banner
 			);
 			expect(output).toContain("SUBCOMMANDS");
+		}));
+
+	test("on Windows, a bare mx run in a terminal plays the banner, prints the help and installs nothing", () =>
+		Effect.gen(function* () {
+			const { frames, system } = fakeTerminal(platform, []);
+			const before = processes.commands.length;
+			const { output } = yield* runOn(system)().pipe(
+				withStdoutTerminal(true),
+				onWindows
+			);
+			expect(frames[0]).toStartWith("\u001b[?25l");
+			expect(output).toContain("SUBCOMMANDS");
+			expect(processes.commands).toHaveLength(before);
 		}));
 
 	test("mx mcp on a terminal writes nothing but MCP messages to stdout", () =>
@@ -3544,6 +3590,82 @@ describe("mx", () => {
 			expect(Exit.isFailure(exit)).toBe(true);
 			expect([...(yield* fs.readFile(exe))]).toEqual([...before]);
 		}));
+
+	test("double-clicked on Windows, mx plays the banner, runs mx install, and waits for Enter before its console closes", () =>
+		doubleClicked(
+			Effect.gen(function* () {
+				yield* writeJson(claudeCodeConfig, claudeCodeSettings);
+				const { frames, press, system } = fakeTerminal(platform, ["return"]);
+				const started = yield* Effect.forkChild(runOn(system)());
+				yield* eventually(
+					"mx to ask for Enter",
+					() => frames.at(-1) === "Press Enter to close."
+				);
+				yield* settleBriefly;
+				expect(started.pollUnsafe()).toBeUndefined();
+				yield* press("return");
+				const { exit, output } = yield* Fiber.join(started);
+				expect(Exit.isSuccess(exit)).toBe(true);
+				expect(frames[0]).toStartWith("\u001b[?25l");
+				expect(Arr.join(frames, "")).toContain("Which agents should use mx?");
+				expect(lines(output)).toContain(
+					`Registered mx with Claude Code in ${claudeCodeConfig}.`
+				);
+				expect(lines(output)).toContain("Started mx sync.");
+			})
+		));
+
+	test("double-clicked on Windows, mx stopped while it installs waits for Enter before its console closes", () =>
+		doubleClicked(
+			Effect.gen(function* () {
+				const { frames, press, system } = fakeTerminal(platform, []);
+				const started = yield* Effect.forkChild(runOn(system)());
+				yield* eventually("mx to ask which agents to set up", () =>
+					Arr.join(frames, "").includes("Which agents should use mx?")
+				);
+				// Ctrl+C makes Bun's runtime interrupt mx as this does.
+				const stopping = yield* Effect.forkChild(Fiber.interrupt(started));
+				yield* eventually(
+					"mx to ask for Enter",
+					() => frames.at(-1) === "Press Enter to close."
+				);
+				yield* settleBriefly;
+				expect(stopping.pollUnsafe()).toBeUndefined();
+				yield* press("return");
+				yield* Fiber.join(stopping);
+			})
+		));
+
+	test("double-clicked on Windows, a failed mx install says why and waits until the input ends before its console closes", () =>
+		doubleClicked(
+			Effect.gen(function* () {
+				// A machine of its own, where no agent has a config yet.
+				const root = join(home, "double-clicked");
+				const { close, frames, system } = fakeTerminal(
+					platformWith({
+						...environment,
+						APPDATA: join(root, "Roaming"),
+						HOME: root,
+						LOCALAPPDATA: join(root, "Local"),
+						USERPROFILE: root,
+					}),
+					["space", "return"]
+				);
+				const started = yield* Effect.forkChild(runOn(system)());
+				yield* eventually(
+					"mx to ask for Enter",
+					() => frames.at(-1) === "Press Enter to close."
+				);
+				yield* settleBriefly;
+				expect(started.pollUnsafe()).toBeUndefined();
+				yield* close;
+				const { errors, exit } = yield* Fiber.join(started);
+				expect(Exit.isFailure(exit)).toBe(true);
+				expect(errors).toBe(
+					`mx: ${join(root, "Roaming", "Claude", "claude_desktop_config.json")} does not exist. In Claude Desktop, open Settings › Developer › Edit Config, then run mx install again.`
+				);
+			})
+		));
 
 	test("mx update installs a newer signed release: it checks the signature, the size and the sha256, replaces the binary and restarts sync", () =>
 		Effect.gen(function* () {

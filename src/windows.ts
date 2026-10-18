@@ -1,4 +1,24 @@
+import { dlopen, FFIType } from "bun:ffi";
+import { Effect } from "effect";
 import { ChildProcess } from "effect/process";
+
+/**
+ * Whether this process is the only one attached to its console, as when Explorer starts mx.exe on a double-click in a
+ * console of its own, which Windows closes as soon as mx exits. In cmd, PowerShell or Windows Terminal, the shell is
+ * attached too.
+ */
+export const ownsConsole = Effect.sync(() => {
+	const { close, symbols } = dlopen("kernel32.dll", {
+		GetConsoleProcessList: {
+			args: [FFIType.ptr, FFIType.u32],
+			returns: FFIType.u32,
+		},
+	});
+	// With more processes attached than the list holds, Windows fills in none of them and answers how many there are.
+	const attached = symbols.GetConsoleProcessList(new Uint32Array(1), 1);
+	close();
+	return attached === 1;
+});
 
 /**
  * `script` in Windows PowerShell 5.1, which every Windows 10 and 11 has, with `env` added to its environment. The

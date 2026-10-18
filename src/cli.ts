@@ -1,5 +1,6 @@
 import {
 	Array as Arr,
+	Cause,
 	Clock,
 	Config,
 	Console,
@@ -10,6 +11,9 @@ import {
 	Logger,
 	Option,
 	Path,
+	Schema,
+	Stream,
+	Terminal,
 } from "effect";
 import { CliError, Command, Flag, Prompt } from "effect/cli";
 import packageJson from "../package.json" with { type: "json" };
@@ -24,7 +28,17 @@ import {
 } from "./auth/config.ts";
 import { Credentials } from "./auth/credentials.ts";
 import { banner } from "./banner.ts";
-import { type InstallFailed, SyncUnhealthy } from "./errors.ts";
+import {
+	CredentialFailed,
+	GraphRefused,
+	InstallFailed,
+	LoginRequired,
+	MicrosoftUnavailable,
+	NewerStore,
+	SignInFailed,
+	SyncUnhealthy,
+	UpdateFailed,
+} from "./errors.ts";
 import { Installer, type Removal } from "./install.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
@@ -34,6 +48,7 @@ import { Store } from "./store.ts";
 import { Sync, summary } from "./sync.ts";
 import { Updater } from "./update.ts";
 import { Watch } from "./watch.ts";
+import { ownsConsole } from "./windows.ts";
 
 const login = Command.make(
 	"login",
@@ -314,3 +329,61 @@ export const mx = Command.make("mx", {}, () =>
 		update,
 	])
 );
+
+/** A failure whose message tells the user everything, such as "Run mx login.", so it prints without a stack. */
+const isExplained = Schema.is(
+	Schema.Union([
+		CredentialFailed,
+		GraphRefused,
+		InstallFailed,
+		LoginRequired,
+		MicrosoftUnavailable,
+		NewerStore,
+		SignInFailed,
+		SyncUnhealthy,
+		UpdateFailed,
+	])
+);
+
+/** The command line renders its own usage errors; anything unexplained prints its whole cause. */
+const report = (cause: Cause.Cause<unknown>) => {
+	if (Cause.hasInterruptsOnly(cause)) {
+		return Effect.void;
+	}
+	const error = Cause.squash(cause);
+	if (isExplained(error)) {
+		return Console.error(`mx: ${error.message}`);
+	}
+	return CliError.isCliError(error) ? Effect.void : Effect.logError(cause);
+};
+
+/** Asks for Enter, and waits for it or for the input to end, as Esc and Ctrl+C end it. */
+const pressEnterToClose = Effect.gen(function* () {
+	const terminal = yield* Terminal.Terminal;
+	yield* terminal.display("Press Enter to close.");
+	yield* Stream.fromQueue(yield* terminal.readInput).pipe(
+		Stream.takeUntil(
+			({ key }) => key.name === "return" || key.name === "enter"
+		),
+		Stream.runDrain
+	);
+}).pipe(Effect.scoped, Effect.orDie);
+
+/**
+ * Runs mx on `args` as its process does, and reports a failure. On a double-click, Explorer starts mx.exe with no
+ * arguments in a console of its own, which Windows closes as soon as mx exits. There mx plays the banner, runs
+ * `mx install`, and waits for Enter however that ends, so the user can read how it went.
+ */
+export const run = Effect.fnUntraced(function* (args: readonly string[]) {
+	const command = Command.runWith(mx, { version: packageJson.version });
+	if (
+		!(args.length === 0 && process.platform === "win32" && (yield* ownsConsole))
+	) {
+		return yield* command(args).pipe(Effect.tapCause(report));
+	}
+	yield* banner;
+	return yield* command(["install"]).pipe(
+		Effect.tapCause(report),
+		Effect.ensuring(pressEnterToClose)
+	);
+});
