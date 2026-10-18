@@ -51,14 +51,54 @@ interface McpEntry {
 const desktopFile = "claude_desktop_config.json";
 
 /**
- * Claude Desktop's config file where Anthropic documents one: in `%APPDATA%\Claude` on Windows and in
- * `~/Library/Application Support/Claude` on macOS. mx does not offer Claude Desktop elsewhere. Claude Desktop keeps
- * tool approvals outside this file, so mx sets none there.
+ * Claude Desktop's config files, on Windows and macOS only. Anthropic documents one, in `%APPDATA%\Claude` on Windows
+ * and in `~/Library/Application Support/Claude` on macOS. Claude Desktop from the Microsoft Store is a packaged app, so
+ * Windows keeps a file it creates below `%APPDATA%` in `LocalCache\Roaming` of its package, `Claude_<publisher id>`,
+ * and the app opens the file there before the one in `%APPDATA%`. These are each config that exists, the packaged ones
+ * first, or the documented one when none does. Claude Desktop keeps tool approvals outside them, so mx sets none there.
  */
-const desktopConfig = (path: Path.Path, config: string): readonly string[] =>
-	process.platform === "win32" || process.platform === "darwin"
-		? [path.join(config, "Claude", desktopFile)]
-		: [];
+const desktopConfigs = Effect.gen(function* () {
+	if (process.platform !== "win32" && process.platform !== "darwin") {
+		return Option.none<Arr.NonEmptyReadonlyArray<string>>();
+	}
+	const fs = yield* FileSystem.FileSystem;
+	const path = yield* Path.Path;
+	const { appPackages, config } = yield* Paths;
+	const packaged = yield* Option.match(appPackages, {
+		onNone: () => Effect.succeed([]),
+		onSome: (folder) =>
+			Effect.gen(function* () {
+				if (!(yield* fs.exists(folder))) {
+					return [];
+				}
+				return Arr.map(
+					Arr.filter(yield* fs.readDirectory(folder), (name) =>
+						name.startsWith("Claude_")
+					),
+					(name) =>
+						path.join(
+							folder,
+							name,
+							"LocalCache",
+							"Roaming",
+							"Claude",
+							desktopFile
+						)
+				);
+			}),
+	});
+	const documented = path.join(config, "Claude", desktopFile);
+	const found = yield* Effect.filter([...packaged, documented], (file) =>
+		fs.exists(file)
+	);
+	return Option.some(Arr.isArrayNonEmpty(found) ? found : Arr.of(documented));
+}).pipe(
+	Effect.mapError((error) =>
+		InstallFailed.make({
+			message: `Could not look for Claude Desktop's config: ${error.message}`,
+		})
+	)
+);
 
 /** A JSON file with `mcpServers`, where the agent finds `mx`. */
 const jsonServers = (path: string, entry: McpEntry): ConfigFile => ({
@@ -87,7 +127,7 @@ const claudeCodePermissions = (path: string): ConfigFile => ({
 	takeOut: (text) => removePermissions({ file: path, text }),
 });
 
-/** The agents mx can set up here, each with the files its vendor documents. */
+/** The agents mx can set up here, each with the config files it reads. */
 export const agents = Effect.gen(function* () {
 	const path = yield* Path.Path;
 	const paths = yield* Paths;
@@ -98,15 +138,17 @@ export const agents = Effect.gen(function* () {
 	);
 	const entry: McpEntry = { args: ["mcp"], command: paths.bin };
 	const offered: readonly Agent[] = [
-		...Arr.map(
-			desktopConfig(path, paths.config),
-			(file): Agent => ({
-				app: "Claude Desktop",
-				createConfig:
-					"In Claude Desktop, open Settings › Developer › Edit Config, then run mx install again.",
-				files: [jsonServers(file, entry)],
-				id: "claude-desktop",
-			})
+		...Option.toArray(
+			Option.map(
+				yield* desktopConfigs,
+				(files): Agent => ({
+					app: "Claude Desktop",
+					createConfig:
+						"In Claude Desktop, open Settings › Developer › Edit Config, then run mx install again.",
+					files: Arr.map(files, (file) => jsonServers(file, entry)),
+					id: "claude-desktop",
+				})
+			)
 		),
 		{
 			app: "Claude Code",
@@ -181,6 +223,8 @@ const ask = Effect.gen(function* () {
 	Effect.provideServiceEffect(Paths, Paths.make),
 	Effect.catchTags({
 		ConfigError: (error) =>
+			Effect.fail(CliError.UserError.make({ cause: error })),
+		InstallFailed: (error) =>
 			Effect.fail(CliError.UserError.make({ cause: error })),
 		PlatformError: (error) =>
 			Effect.fail(CliError.UserError.make({ cause: error })),

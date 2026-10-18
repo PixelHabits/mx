@@ -32,6 +32,8 @@ export class Paths extends Context.Service<
 		readonly packaged: boolean;
 		/** `$XDG_CONFIG_HOME`, `~/Library/Application Support` on macOS, or `%APPDATA%` on Windows, where other programs keep their settings. */
 		readonly config: string;
+		/** `%LOCALAPPDATA%\Packages` on Windows, with a folder of files for each packaged app, as one from the Microsoft Store; none elsewhere. */
+		readonly appPackages: Option.Option<string>;
 		/** The user's home folder. */
 		readonly home: string;
 	}
@@ -47,6 +49,7 @@ export class Paths extends Context.Service<
 			});
 			const root = path.join(localAppData, "mx");
 			return Paths.of({
+				appPackages: Option.some(path.join(localAppData, "Packages")),
 				bin: path.join(localAppData, "Programs", "mx", "mx.exe"),
 				cache: path.join(root, "cache"),
 				config: appData,
@@ -64,6 +67,7 @@ export class Paths extends Context.Service<
 			const support = path.join(library, "Application Support");
 			const root = path.join(support, "mx");
 			return Paths.of({
+				appPackages: Option.none(),
 				bin: path.join(home, ".local", "bin", "mx"),
 				cache: path.join(library, "Caches", "mx"),
 				config: support,
@@ -83,6 +87,7 @@ export class Paths extends Context.Service<
 		});
 		const packaged = path.resolve(process.execPath) === packagedBin;
 		return Paths.of({
+			appPackages: Option.none(),
 			bin: packaged ? packagedBin : path.join(home, ".local", "bin", "mx"),
 			cache: path.join(cache, "mx"),
 			config,

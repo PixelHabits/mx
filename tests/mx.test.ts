@@ -4020,6 +4020,53 @@ describe("mx", () => {
 			})
 		));
 
+	test("on Windows, mx install selects Claude Desktop from the Microsoft Store when its package holds its config, and sets up mx there, and mx uninstall takes mx out", () =>
+		onWindows(
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				// A machine of its own, where the packaged Claude Desktop wrote its config and the documented one is absent.
+				const root = join(home, "store-desktop");
+				const storeConfig = join(
+					root,
+					"Local",
+					"Packages",
+					"Claude_0test0publisher",
+					"LocalCache",
+					"Roaming",
+					"Claude",
+					"claude_desktop_config.json"
+				);
+				const settings = { preferences: { sidebarMode: "chat" } };
+				yield* fs.makeDirectory(dirname(storeConfig), { recursive: true });
+				yield* writeJson(storeConfig, settings);
+				yield* writeJson(join(root, ".claude.json"), { numStartups: 1 });
+				const system = platformWith({
+					...environment,
+					APPDATA: join(root, "Roaming"),
+					HOME: root,
+					LOCALAPPDATA: join(root, "Local"),
+					USERPROFILE: root,
+				});
+				const { system: onTerminal } = fakeTerminal(system, ["return"]);
+				yield* withStdinTerminal(true)(cliOn(onTerminal)("install"));
+				expect(yield* readJson(storeConfig)).toEqual({
+					...settings,
+					mcpServers: {
+						mx: {
+							args: ["mcp"],
+							command: join(root, "Local", "Programs", "mx", "mx.exe"),
+						},
+					},
+				});
+				expect(yield* fs.exists(join(root, "Roaming", "Claude"))).toBe(false);
+				yield* cliOn(system)("uninstall", "--yes");
+				expect(yield* readJson(storeConfig)).toEqual({
+					...settings,
+					mcpServers: {},
+				});
+			})
+		));
+
 	test(
 		"on macOS, mx install loads the LaunchAgent with launchctl bootstrap once it unloads the one loaded before, mx login restarts it with kickstart, and mx uninstall unloads it and deletes it with the log folder",
 		() =>
