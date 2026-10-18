@@ -2,6 +2,7 @@ import {
 	Array as Arr,
 	type Cause,
 	Context,
+	Deferred,
 	Effect,
 	type Layer,
 	Queue,
@@ -86,22 +87,37 @@ export class McpClient extends Context.Service<
 	}
 >()("mx/tests/mcp-client/McpClient") {}
 
-/** A client that sends each request as one line through `send` and reads the server's lines from `lines`. */
-const makeClient = (
+/**
+ * A client that sends each request as one line through `send`, and hands each line the server writes to `lines` to the
+ * request it answers, in a fiber of the scope, so several requests can be in flight. Notifications are dropped, and a
+ * line that is no JSON-RPC frame fails every request in flight.
+ */
+const makeClient = Effect.fnUntraced(function* (
 	lines: Queue.Queue<string>,
 	send: (line: string) => Effect.Effect<void>
-) => {
+) {
 	let nextId = 0;
+	const waiting = new Map<number, Deferred.Deferred<typeof Frame.Type>>();
 
-	/** The next frame that answers request `id`, skipping notifications and other answers. */
-	const answer = (id: number): Effect.Effect<typeof Frame.Type> =>
-		Effect.flatMap(Queue.take(lines), decodeFrame).pipe(
-			Effect.orDie,
-			Effect.filterOrElse(
-				(frame) => frame.id === id,
-				() => answer(id)
+	yield* Effect.flatMap(Queue.take(lines), decodeFrame).pipe(
+		Effect.orDie,
+		Effect.flatMap((frame) => {
+			const answered =
+				typeof frame.id === "number" ? waiting.get(frame.id) : undefined;
+			return answered === undefined
+				? Effect.void
+				: Effect.asVoid(Deferred.succeed(answered, frame));
+		}),
+		Effect.forever,
+		Effect.tapCause((cause) =>
+			Effect.forEach(
+				waiting.values(),
+				(answered) => Deferred.failCause(answered, cause),
+				{ discard: true }
 			)
-		);
+		),
+		Effect.forkScoped
+	);
 
 	const request = Effect.fnUntraced(function* (
 		method: string,
@@ -109,6 +125,8 @@ const makeClient = (
 	) {
 		nextId += 1;
 		const id = nextId;
+		const answered = yield* Deferred.make<typeof Frame.Type>();
+		waiting.set(id, answered);
 		const line = yield* encodeJson({
 			id,
 			jsonrpc: "2.0",
@@ -116,7 +134,9 @@ const makeClient = (
 			params: { ...params, _meta: meta },
 		});
 		yield* send(`${line}\n`);
-		const frame = yield* answer(id);
+		const frame = yield* Deferred.await(answered).pipe(
+			Effect.ensuring(Effect.sync(() => waiting.delete(id)))
+		);
 		if (frame.error !== undefined) {
 			return yield* Effect.die(
 				`${method} answered ${yield* encodeJson(frame.error)}`
@@ -157,7 +177,7 @@ const makeClient = (
 	});
 
 	return McpClient.of({ call, prompt, request });
-};
+});
 
 /** Offers each line of `stream` to `lines`, in a fiber of the scope. */
 const readLines = <E>(stream: Stream.Stream<Uint8Array, E>) =>
@@ -189,7 +209,7 @@ export const connect = Effect.gen(function* () {
 		stdout: () => Sink.fromQueue(stdout),
 	});
 	return {
-		client: makeClient(lines, (line) =>
+		client: yield* makeClient(lines, (line) =>
 			Effect.asVoid(Queue.offer(stdin, encoder.encode(line)))
 		),
 		stdio: stdio satisfies Layer.Layer<Stdio.Stdio>,
@@ -220,7 +240,7 @@ export const spawnClient = (exe: string, env: Record<string, string>) =>
 				onError: (error) => error,
 			})
 		);
-		return makeClient(lines, (line) =>
+		return yield* makeClient(lines, (line) =>
 			Effect.sync(() => {
 				server.stdin.write(line);
 				server.stdin.flush();
