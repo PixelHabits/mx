@@ -18,6 +18,7 @@ import {
 	ManagedRuntime,
 	Option,
 	Path,
+	PlatformError,
 	Queue,
 	Record as Rec,
 	Schema,
@@ -407,6 +408,42 @@ const cutOffWrites = (folder: string) =>
 									.writeFile(file, data.subarray(0, 4), options)
 									.pipe(Effect.andThen(Effect.die("The machine stopped.")))
 							: fs.writeFile(file, data, options),
+				})
+			)
+		).pipe(Layer.provide(BunServices.layer))
+	);
+
+/**
+ * `platform` where the exes in `inUse` run, as the mx mcp an agent started runs mx.exe. Windows renames a running exe,
+ * which runs on under its new name, but deletes none; Effect reads its refusal as Unknown.
+ */
+const whileRunning = (inUse: Set<string>) =>
+	Layer.merge(
+		platform,
+		Layer.effect(
+			FileSystem.FileSystem,
+			Effect.map(FileSystem.FileSystem, (fs) =>
+				FileSystem.FileSystem.of({
+					...fs,
+					remove: (path, options) =>
+						inUse.has(path)
+							? Effect.fail(
+									PlatformError.systemError({
+										_tag: "Unknown",
+										method: "remove",
+										module: "FileSystem",
+										pathOrDescriptor: path,
+									})
+								)
+							: fs.remove(path, options),
+					rename: (from, to) =>
+						Effect.tap(fs.rename(from, to), () =>
+							Effect.sync(() => {
+								if (inUse.delete(from)) {
+									inUse.add(to);
+								}
+							})
+						),
 				})
 			)
 		).pipe(Layer.provide(BunServices.layer))
@@ -4073,14 +4110,47 @@ describe("mx", () => {
 			}).pipe(Effect.ensuring(Effect.sync(() => processes.unstoppable.clear())))
 		));
 
-	test("mx uninstall run from the installed mx.exe deletes mxw.exe and the copies an update moved aside at once, and the program folder once it exits", () =>
+	test("on Windows, mx install while an agent's mx mcp runs the mx.exe an earlier install moved aside installs, and the next install once the agent quit deletes that copy", () =>
+		onWindows(
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const inUse = new Set<string>();
+				const install = cliOn(whileRunning(inUse));
+				const movedAside = Effect.map(
+					fs.readDirectory(windowsFolder),
+					(names) =>
+						Arr.map(
+							Arr.filter(names, (name) => name.includes(".old")),
+							(name) => join(windowsFolder, name)
+						)
+				);
+				yield* install("install", "--agent", "codex");
+				// Claude Desktop starts mx mcp from the installed mx.exe.
+				inUse.add(join(windowsFolder, "mx.exe"));
+				yield* install("install", "--agent", "codex");
+				yield* install("install", "--agent", "codex");
+				expect(yield* movedAside).toEqual([...inUse]);
+				inUse.clear();
+				yield* install("install", "--agent", "codex");
+				expect(yield* movedAside).toEqual([]);
+			})
+		));
+
+	test("mx uninstall run from the installed mx.exe deletes mxw.exe and the copies a reinstall or an update moved aside at once, and the program folder once it exits", () =>
 		onWindows(
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
 				const exe = join(windowsFolder, "mx.exe");
 				const movedAside = [
 					join(windowsFolder, "mx.old.exe"),
-					join(windowsFolder, "mxw.old.exe"),
+					join(
+						windowsFolder,
+						"mx.old-6f1c2a1e-0d7b-4c4e-9a59-2f0c1b9d7e31.exe"
+					),
+					join(
+						windowsFolder,
+						"mxw.old-7d1e9a3b-2c4f-4e8a-b6d0-1f3e5a7c9b24.exe"
+					),
 				];
 				yield* cli("install", "--agent", "codex");
 				yield* Effect.forEach(movedAside, (file) =>

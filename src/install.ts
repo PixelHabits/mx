@@ -4,6 +4,7 @@ import {
 	Config,
 	Console,
 	Context,
+	Crypto,
 	Duration,
 	Effect,
 	FileSystem,
@@ -133,8 +134,15 @@ const windowsGui = (exe: Uint8Array) => {
 
 const exeSuffix = /\.exe$/u;
 
-/** Where Windows moves a running exe aside, as mx.old.exe. */
-const oldName = (exe: string) => exe.replace(exeSuffix, ".old.exe");
+/** The exes of mx in its program folder on Windows: mx.exe, mxw.exe and the copies moved aside. */
+const programExe = /^mx.*\.exe$/u;
+
+/**
+ * A copy of mx.exe or mxw.exe that a reinstall or an update moved aside, as mx.old-<uuid>.exe. Windows deletes no exe
+ * that runs, and a copy moved aside before can still run, as the mx mcp an agent started, so each takes a name of its
+ * own.
+ */
+const movedAsideExe = /^mxw?\.old.*\.exe$/u;
 
 const trailingBackslashes = /\\+$/u;
 
@@ -213,8 +221,8 @@ export class Installer extends Context.Service<
 		 */
 		readonly resumeSync: Effect.Effect<void, InstallFailed>;
 		/**
-		 * Deletes the binaries an update on Windows moved aside. One still runs until its process ends, as an MCP server
-		 * that Claude started; the next start tries again.
+		 * Deletes the copies of mx.exe and mxw.exe that a reinstall or an update on Windows moved aside. A copy that still
+		 * runs, as the mx mcp an agent started, stays; the next install, update or start of mx sync tries again.
 		 */
 		readonly removeOldBinaries: Effect.Effect<void>;
 	}
@@ -225,6 +233,7 @@ export class Installer extends Context.Service<
 			const fs = yield* FileSystem.FileSystem;
 			const path = yield* Path.Path;
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+			const { randomUUIDv4 } = yield* Crypto.Crypto;
 			const credentials = yield* Credentials;
 			const auth = yield* Auth;
 			const { bin, cache, config, configFile, data, home, packaged, state } =
@@ -319,7 +328,7 @@ export class Installer extends Context.Service<
 			/**
 			 * Writes the whole binary next to `target` and renames it into place, so `target` never holds part of one. Windows
 			 * lets a running exe be renamed but not replaced, so there the old one moves aside first, and back when the new one
-			 * cannot take its place; the next start deletes it.
+			 * cannot take its place.
 			 */
 			const put = Effect.fnUntraced(function* (
 				target: string,
@@ -332,8 +341,10 @@ export class Installer extends Context.Service<
 					yield* fs.rename(staged, target);
 					return;
 				}
-				const old = oldName(target);
-				yield* fs.remove(old, { force: true });
+				const old = target.replace(
+					exeSuffix,
+					`.old-${yield* randomUUIDv4()}.exe`
+				);
 				if (yield* fs.exists(target)) {
 					yield* fs.rename(target, old);
 				}
@@ -342,12 +353,26 @@ export class Installer extends Context.Service<
 					.pipe(Effect.tapError(() => Effect.ignore(fs.rename(old, target))));
 			}, Effect.scoped);
 
+			const removeOldBinaries = windows
+				? fs.readDirectory(folder).pipe(
+						Effect.flatMap((names) =>
+							Effect.forEach(
+								Arr.filter(names, (name) => movedAsideExe.test(name)),
+								(name) => Effect.ignore(fs.remove(path.join(folder, name))),
+								{ discard: true }
+							)
+						),
+						Effect.ignore()
+					)
+				: Effect.void;
+
 			const replaceBinary = Effect.fn("Installer.replaceBinary")(
 				function* (bytes: Uint8Array) {
 					yield* fs.makeDirectory(folder, { recursive: true });
 					yield* put(bin, bytes);
 					if (windows) {
 						yield* put(background, windowsGui(bytes));
+						yield* removeOldBinaries;
 					}
 				},
 				Effect.catchTag("PlatformError", (error) =>
@@ -838,17 +863,19 @@ export class Installer extends Context.Service<
 				file.toLowerCase() === path.resolve(process.execPath).toLowerCase();
 
 			/**
-			 * The program folder on Windows, with mx.exe, mxw.exe and the copies an update moved aside. Windows deletes no exe
-			 * that runs: the one this process runs goes once it exits, through a PowerShell that waits for it, and one
-			 * another mx runs, as the mx mcp an agent started, stays until the user quits that agent.
+			 * The program folder on Windows, with mx.exe, mxw.exe and the copies a reinstall or an update moved aside. Windows
+			 * deletes no exe that runs: the one this process runs goes once it exits, through a PowerShell that waits for it,
+			 * and one another mx runs, as the mx mcp an agent started, stays until the user quits that agent.
 			 */
 			const removeWindowsProgram = Effect.gen(function* () {
 				if (!(yield* fs.exists(folder))) {
 					return [];
 				}
-				const files = yield* Effect.filter(
-					[bin, background, oldName(bin), oldName(background)],
-					(file) => fs.exists(file)
+				const files = Arr.map(
+					Arr.filter(yield* fs.readDirectory(folder), (name) =>
+						programExe.test(name)
+					),
+					(name) => path.join(folder, name)
 				);
 				const remove = Effect.gen(function* () {
 					const inUse = yield* Effect.filter(
@@ -1009,14 +1036,6 @@ export class Installer extends Context.Service<
 				}),
 				Effect.withSpan("Installer.removals")
 			);
-
-			const removeOldBinaries = windows
-				? Effect.forEach(
-						[bin, background],
-						(file) => Effect.ignore(fs.remove(oldName(file), { force: true })),
-						{ discard: true }
-					)
-				: Effect.void;
 
 			return Installer.of({
 				install,

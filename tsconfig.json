@@ -52,6 +52,8 @@
 					"effect/ai",
 					// The mx command line.
 					"effect/cli",
+					// A name of its own for each copy of mx.exe that a reinstall moves aside.
+					"effect/Crypto",
 					// Base64 for attachment uploads.
 					"effect/encoding",
 					// Saved sign-in, attachment downloads and uploads, and test homes.
@@ -71,7 +73,9 @@
 					"effect/Stdio",
 					"effect/Terminal",
 					// Console capture in the tests.
-					"effect/testing/TestConsole"
+					"effect/testing/TestConsole",
+					// The refusal of a Windows that deletes no running exe, in the tests.
+					"effect/PlatformError#systemError"
 				],
 				"allowedExperimentalApis": [],
 				"diagnosticSeverity": {
