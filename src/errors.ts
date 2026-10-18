@@ -55,6 +55,21 @@ export class GraphRefused extends Schema.TaggedError<
 	}
 }
 
+/**
+ * Graph answered a page of a folder's messages, a delta page or a page of their ids, that does not match its schema;
+ * `issue` says where it differs.
+ */
+export class GraphUnreadable extends Schema.TaggedError<
+	GraphUnreadable,
+	{ readonly brand: unique symbol }
+>("mx/errors/GraphUnreadable")("GraphUnreadable", {
+	issue: Schema.String,
+}) {
+	override get message() {
+		return `Microsoft Graph answered a page mx cannot read: ${this.issue}`;
+	}
+}
+
 /** The secret store, the sign-in file or config.json could not be read or written; `message` says what failed. */
 export class CredentialFailed extends Schema.TaggedError<
 	CredentialFailed,

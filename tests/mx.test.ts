@@ -974,6 +974,10 @@ const idListingPath = /^\/v1\.0\/me\/mailFolders\/[^/]+\/messages$/u;
 const seedOrderLine = /^#2 .* \| Garden supplies order \| unread$/mu;
 const rotaInArchiveLine =
 	/ Archive \| Rosa Example <rosa@example\.com> \| Garden plot rota /u;
+const beanPolesInInboxLine =
+	/ Inbox \| Rosa Example <rosa@example\.com> \| Bean poles /u;
+const trellisWireLine =
+	/ Trellis \| Rosa Example <rosa@example\.com> \| Trellis wire /u;
 const timeLeft = /, (about \d+ min|less than a minute) left/u;
 const cutAtCharacters =
 	/^\(first \d+ rows, cut at 20000 characters; refine the query\)$/u;
@@ -2204,6 +2208,33 @@ describe("mx", () => {
 			expect((yield* call("message", { id })).isError).toBe(true);
 		}));
 
+	test("a delta entry with only the properties that changed, as Graph sends for a message read in Deleted Items, stores the message as Graph holds it, and the rest of its page too", () =>
+		Effect.gen(function* () {
+			const deleted = (subject: string) =>
+				microsoft.deliver({
+					body: `${subject}.`,
+					conversationId: "conversation-shed",
+					from: rosa,
+					parentFolderId: "folder-deleted",
+					received: "2026-10-10T09:00:00Z",
+					subject,
+				});
+			const hose = deleted("Hose repair");
+			const ladder = deleted("Ladder loan");
+			yield* cli("sync", "--once");
+			microsoft.readInOutlook(hose.id);
+			deleted("Rain barrel");
+			microsoft.purge(ladder.id);
+			yield* cli("sync", "--once");
+			expect(
+				yield* tool("query", {
+					sql: "SELECT folder, subject, is_read FROM mail WHERE conversation_id = 'conversation-shed' ORDER BY subject",
+				})
+			).toBe(
+				"folder\tsubject\tis_read\nDeleted Items\tHose repair\t1\nDeleted Items\tRain barrel\t0"
+			);
+		}));
+
 	test("a local id names one message for the life of the store: a message moved in Outlook keeps it, and a sent draft's id goes to no other message", () =>
 		Effect.gen(function* () {
 			const budget = idOf(
@@ -2688,6 +2719,67 @@ describe("mx", () => {
 				Effect.sync(() => {
 					microsoft.release("folder-seeds");
 					microsoft.release("folder-tools", { ids: true });
+				})
+			),
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test, its mx sync and mx status run on.
+			Effect.provide(TestClock.layer())
+		));
+
+	test("a folder whose pages Graph answers in a form mx cannot read is skipped and named in mx status, the other folders sync, sync goes on, and the folder's changes arrive once Graph answers readably", () =>
+		Effect.gen(function* () {
+			microsoft.addFolder("folder-trellis", "Trellis", "folder-root");
+			yield* cli("sync", "--once");
+			const listed = idListings().length;
+			microsoft.unreadable("folder-trellis");
+			microsoft.unreadable("folder-trellis", { ids: true });
+			for (const [parentFolderId, subject] of [
+				["folder-inbox", "Bean poles"],
+				["folder-trellis", "Trellis wire"],
+			] as const) {
+				microsoft.deliver({
+					body: `${subject} are in.`,
+					conversationId: "conversation-trellis",
+					from: rosa,
+					parentFolderId,
+					received: "2026-10-11T08:00:00Z",
+					subject,
+				});
+			}
+			const service = yield* Effect.forkChild(cli("sync"));
+			const lastError = (text: string) =>
+				Effect.map(status, ({ output }) =>
+					output.includes(`Last error: ${text}`)
+				);
+			yield* eventually(
+				"the pass that skipped Trellis",
+				lastError(
+					"Skipped folder Trellis: Microsoft Graph answered a page mx cannot read"
+				)
+			);
+			expect(yield* tool("search", { query: "bean poles" })).toMatch(
+				beanPolesInInboxLine
+			);
+			yield* eventually("the check listing the ids of Trellis", () =>
+				Arr.some(idListings().slice(listed), (request) =>
+					request.url.pathname.includes("/folder-trellis/")
+				)
+			);
+			microsoft.readable("folder-trellis");
+			microsoft.readable("folder-trellis", { ids: true });
+			yield* eventually(
+				"the next pass",
+				TestClock.adjust("60 seconds").pipe(Effect.andThen(lastError("none")))
+			);
+			expect(yield* tool("search", { query: "trellis wire" })).toMatch(
+				trellisWireLine
+			);
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.readable("folder-trellis");
+					microsoft.readable("folder-trellis", { ids: true });
+					microsoft.removeFolder("folder-trellis");
 				})
 			),
 			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one test, its mx sync and mx status run on.

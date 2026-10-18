@@ -1,4 +1,4 @@
-import { Schema } from "effect";
+import { Schema, Struct } from "effect";
 import {
 	HttpApi,
 	HttpApiEndpoint,
@@ -55,17 +55,33 @@ export type Message = typeof Message.Type;
 export const messageSelect =
 	"id,parentFolderId,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,sentDateTime,isRead,isDraft,flag,categories,importance,hasAttachments,uniqueBody";
 
-/** A delta entry for a message that left the folder, by deletion or by a move. */
+/**
+ * A delta entry for a message that left the folder, by deletion or by a move. Graph says `@removed` might carry a
+ * reason (https://learn.microsoft.com/graph/delta-query-overview#resource-representation-in-the-delta-query-response).
+ */
 export const Removed = Schema.Struct({
-	"@removed": Schema.Struct({ reason: Schema.String }),
+	"@removed": Schema.Struct({ reason: Schema.optionalKey(Schema.String) }),
 	id: Schema.String,
 });
 
-/** One page of a folder's message delta: a next link while pages remain, then the delta link for the next round. */
+/**
+ * A delta entry for a message that changed, with its id and at least the properties that changed, such as `isRead`
+ * alone (https://learn.microsoft.com/graph/delta-query-overview#resource-representation-in-the-delta-query-response).
+ * Each property it carries is checked as `Message` checks it.
+ */
+export class Changed extends Schema.Class<
+	Changed,
+	{ readonly brand: unique symbol }
+>("Changed")(Message.mapFields(Struct.mapOmit(["id"], Schema.optionalKey))) {}
+
+/**
+ * One page of a folder's message delta: a next link while pages remain, then the delta link for the next round. An
+ * entry with every property `messageSelect` asks for is a `Message`.
+ */
 export const DeltaPage = Schema.Struct({
 	"@odata.deltaLink": Schema.optionalKey(Schema.String),
 	"@odata.nextLink": Schema.optionalKey(Schema.String),
-	value: Schema.Array(Schema.Union([Removed, Message])),
+	value: Schema.Array(Schema.Union([Removed, Message, Changed])),
 });
 export type DeltaPage = typeof DeltaPage.Type;
 

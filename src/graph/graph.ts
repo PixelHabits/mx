@@ -11,6 +11,7 @@ import { Auth } from "../auth/auth.ts";
 import {
 	type CredentialFailed,
 	GraphRefused,
+	GraphUnreadable,
 	type LoginRequired,
 	MicrosoftUnavailable,
 } from "../errors.ts";
@@ -127,17 +128,30 @@ const unavailable = ({ reason }: HttpClientError.HttpClientError) => {
 	});
 };
 
-/** Narrows a request's failures to mx's errors; an answer that does not match its schema is a defect. */
-const settle = <A>(
-	effect: Effect.Effect<
-		A,
-		GraphError | HttpClientError.HttpClientError | Schema.SchemaError
-	>
-): Effect.Effect<A, GraphError> =>
-	Effect.catchTags(effect, {
-		HttpClientError: (error) => Effect.fail(unavailable(error)),
-		SchemaError: (error) => Effect.die(error),
-	});
+/** Narrows a request's failures to mx's errors, and an answer that does not match its schema as `unmatched` says. */
+const settleWith =
+	<E>(unmatched: (error: Schema.SchemaError) => Effect.Effect<never, E>) =>
+	<A>(
+		effect: Effect.Effect<
+			A,
+			GraphError | HttpClientError.HttpClientError | Schema.SchemaError
+		>
+	): Effect.Effect<A, GraphError | E> =>
+		Effect.catchTags(effect, {
+			HttpClientError: (error) => Effect.fail(unavailable(error)),
+			SchemaError: unmatched,
+		});
+
+/** An answer that does not match its schema is a defect. */
+const settle = settleWith(Effect.die);
+
+/**
+ * A page of a folder's messages that does not match its schema fails with `GraphUnreadable`, so a pass or a check skips
+ * that folder and goes on with the others.
+ */
+const settlePage = settleWith((error) =>
+	Effect.fail(GraphUnreadable.make({ issue: error.message }))
+);
 
 const recipients = (addresses: readonly string[]): readonly Recipient[] =>
 	Arr.map(addresses, (address) => ({ emailAddress: { address } }));
@@ -198,12 +212,12 @@ export class Graph extends Context.Service<
 		/** The ids of every message in the folder. */
 		readonly messageIds: (
 			folderId: string
-		) => Effect.Effect<readonly string[], GraphError>;
+		) => Effect.Effect<readonly string[], GraphError | GraphUnreadable>;
 		/** The folder's first delta page, or the page at a next or delta link Graph gave before. */
 		readonly delta: (
 			folderId: string,
 			link: Option.Option<string>
-		) => Effect.Effect<DeltaPage, GraphError>;
+		) => Effect.Effect<DeltaPage, GraphError | GraphUnreadable>;
 		readonly message: (id: string) => Effect.Effect<Message, GraphError>;
 		/** The whole body as text, quoted history included. */
 		readonly body: (id: string) => Effect.Effect<string, GraphError>;
@@ -306,22 +320,16 @@ export class Graph extends Context.Service<
 						.pipe(Effect.flatMap(HttpClientResponse.schemaBodyJson(schema)));
 			const getJson = getJsonFrom(client);
 
-			/** Every item of a collection: its first page, then the page at each `@odata.nextLink`. */
-			const everyPage = <
-				A,
-				S extends Schema.Top & {
-					readonly DecodingServices: never;
-					readonly Type: Page<A>;
-				},
-			>(
-				schema: S,
-				first: Effect.Effect<Page<A>, GraphError>
+			/** Every item of a collection: its first page, then the page `next` reads at each `@odata.nextLink`. */
+			const everyPage = <A, E>(
+				first: Effect.Effect<Page<A>, E>,
+				next: (url: string) => Effect.Effect<Page<A>, E>
 			) =>
 				Effect.gen(function* () {
 					let page = yield* first;
 					const found: A[] = [...page.value];
 					while (page["@odata.nextLink"] !== undefined) {
-						page = yield* settle(getJson(page["@odata.nextLink"], schema));
+						page = yield* next(page["@odata.nextLink"]);
 						found.push(...page.value);
 					}
 					return found;
@@ -336,7 +344,9 @@ export class Graph extends Context.Service<
 				first: Effect.Effect<typeof FolderPage.Type, GraphError>
 			): Effect.Effect<readonly Folder[], GraphError> =>
 				Effect.gen(function* () {
-					const found = yield* everyPage(FolderPage, first);
+					const found = yield* everyPage(first, (url) =>
+						settle(getJson(url, FolderPage))
+					);
 					const nested = yield* Effect.forEach(found, (parent) =>
 						parent.childFolderCount === 0
 							? Effect.succeed([parent])
@@ -366,13 +376,13 @@ export class Graph extends Context.Service<
 				folderId: string
 			) {
 				const found = yield* everyPage(
-					IdPage,
-					settle(
+					settlePage(
 						mail.messageIds({
 							params: { id: folderId },
 							query: { $select: "id", $top: idPageSize },
 						})
-					)
+					),
+					(url) => settlePage(getJson(url, IdPage))
 				);
 				return Arr.map(found, ({ id }) => id);
 			});
@@ -381,13 +391,14 @@ export class Graph extends Context.Service<
 				(folderId: string, link: Option.Option<string>) =>
 					Option.match(link, {
 						onNone: () =>
-							settle(
+							settlePage(
 								firstDelta({
 									params: { id: folderId },
 									query: { $select: messageSelect },
 								})
 							),
-						onSome: (url) => settle(getJsonFrom(deltaClient)(url, DeltaPage)),
+						onSome: (url) =>
+							settlePage(getJsonFrom(deltaClient)(url, DeltaPage)),
 					})
 			);
 
@@ -548,9 +559,8 @@ export class Graph extends Context.Service<
 				}
 			);
 
-			const subscriptions = everyPage(
-				SubscriptionPage,
-				settle(subscriptionApi.list())
+			const subscriptions = everyPage(settle(subscriptionApi.list()), (url) =>
+				settle(getJson(url, SubscriptionPage))
 			).pipe(Effect.withSpan("Graph.subscriptions"));
 
 			const subscribe: Graph["Service"]["subscribe"] = Effect.fn(

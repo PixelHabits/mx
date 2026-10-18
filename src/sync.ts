@@ -6,11 +6,17 @@ import {
 	Layer,
 	Option,
 	Result,
+	Schema,
 	Semaphore,
 	SynchronizedRef,
 } from "effect";
-import type { GraphRefused } from "./errors.ts";
-import type { DeltaPage, Message } from "./graph/api.ts";
+import type { GraphRefused, GraphUnreadable } from "./errors.ts";
+import {
+	Changed,
+	type DeltaPage,
+	type Message,
+	type Removed,
+} from "./graph/api.ts";
 import { Graph, type GraphError, isNotFound } from "./graph/graph.ts";
 import { Store } from "./store.ts";
 
@@ -23,12 +29,13 @@ const folderConcurrency = 3;
 
 /**
  * A folder or a message that a pass or a check skipped because Graph refused a request about it, as for a folder deleted
- * after the folder listing named it. The next pass or check tries it again, and the next listing drops a deleted folder.
+ * after the folder listing named it, or answered a page of the folder that mx cannot read. The next pass or check tries
+ * it again, and the next listing drops a deleted folder.
  */
 export interface Skipped {
+	readonly error: GraphRefused | GraphUnreadable;
 	/** What it skipped, as the user reads it: `folder Archive` or `a message`. */
 	readonly item: string;
-	readonly refused: GraphRefused;
 }
 
 /** The line mx sync records for what a pass or a check skipped: the first, and how many more. */
@@ -36,7 +43,7 @@ export const skippedLine = ([
 	first,
 	...others
 ]: Arr.NonEmptyReadonlyArray<Skipped>) =>
-	`Skipped ${first.item}: ${first.refused.message}${others.length === 0 ? "" : ` (and ${others.length} more)`}`;
+	`Skipped ${first.item}: ${first.error.message}${others.length === 0 ? "" : ` (and ${others.length} more)`}`;
 
 /** What one pass changed in the store, and what it skipped. */
 export interface Pass {
@@ -81,23 +88,25 @@ export interface Progress {
 
 type Entry = DeltaPage["value"][number];
 
-const isRemoved = (entry: Entry): entry is Exclude<Entry, Message> =>
+const isRemoved = (entry: Entry): entry is typeof Removed.Type =>
 	"@removed" in entry;
+
+const isChanged = Schema.is(Changed);
 
 const noProgress = () => Effect.void;
 
-/** `work`, or `item` skipped when Graph refuses it; every other failure still fails. */
-const unlessRefused = <A>(
+/** `work`, or `item` skipped when Graph refuses it or answers a page mx cannot read; every other failure still fails. */
+const orSkipped = <A>(
 	item: string,
-	work: Effect.Effect<A, GraphError>
+	work: Effect.Effect<A, GraphError | GraphUnreadable>
 ): Effect.Effect<
 	Result.Result<A, Skipped>,
 	Exclude<GraphError, GraphRefused>
 > =>
 	work.pipe(
 		Effect.map(Result.succeed),
-		Effect.catchTag("GraphRefused", (refused) =>
-			Effect.succeed(Result.fail({ item, refused }))
+		Effect.catchTag(["GraphRefused", "GraphUnreadable"], (error) =>
+			Effect.succeed(Result.fail({ error, item }))
 		)
 	);
 
@@ -125,7 +134,8 @@ const repairOf = (
  * the same delta link. A page never refiles a message the store holds in another folder: Graph may have read the page
  * before a move that another folder's page brought in, so a lookup of the message by its id decides where it goes. Only
  * a lookup moves a stored message to another folder, here and in mx mcp, and the store takes lookups in the order they
- * began.
+ * began. A page's entry with only the properties that changed is looked up too, so the store holds the whole message as
+ * Graph holds it.
  */
 export class Sync extends Context.Service<
 	Sync,
@@ -192,7 +202,8 @@ export class Sync extends Context.Service<
 
 			/**
 			 * One delta round for the folder, every page, from its saved link or from the start; `fetched` hears each page. A
-			 * message whose lookup Graph refuses is skipped, and so is the folder when Graph refuses its delta.
+			 * message whose lookup Graph refuses is skipped, and so is the folder when Graph refuses its delta or answers a
+			 * page mx cannot read; its link stays where the last round that ended left it.
 			 */
 			const round = (
 				folder: { readonly id: string; readonly name: string },
@@ -209,8 +220,11 @@ export class Sync extends Context.Service<
 					let removed = 0;
 					do {
 						const page = yield* graph.delta(folderId, next);
-						const [present, gone] = Arr.partition(page.value, (entry) =>
+						const [entries, gone] = Arr.partition(page.value, (entry) =>
 							isRemoved(entry) ? Result.fail(entry) : Result.succeed(entry)
+						);
+						const [present, changed] = Arr.partition(entries, (entry) =>
+							isChanged(entry) ? Result.fail(entry) : Result.succeed(entry)
 						);
 						const filedElsewhere = yield* store.transaction(
 							Effect.andThen(
@@ -224,14 +238,16 @@ export class Sync extends Context.Service<
 								)
 							)
 						);
-						// Graph may have read this page before a move that the store already holds, so Graph says where each one is.
-						const located = yield* Effect.forEach(filedElsewhere, (message) =>
-							unlessRefused("a message", locate(message.id))
+						// Graph may have read this page before a move that the store already holds, and a changed entry holds only
+						// some of a message, so Graph says where each one is and what it holds.
+						const located = yield* Effect.forEach(
+							[...filedElsewhere, ...changed],
+							(entry) => orSkipped("a message", locate(entry.id))
 						);
 						skipped.push(...Arr.getFailures(located));
-						yield* fetched(present.length);
-						kept.push(...Arr.map(present, (message) => message.id));
-						saved += present.length;
+						yield* fetched(entries.length);
+						kept.push(...Arr.map(entries, (entry) => entry.id));
+						saved += entries.length;
 						removed += gone.length;
 						next = Option.fromNullishOr(page["@odata.nextLink"]);
 						deltaLink = page["@odata.deltaLink"];
@@ -251,13 +267,15 @@ export class Sync extends Context.Service<
 					);
 					return { removed, saved, skipped };
 				}).pipe(
-					Effect.catchTag("GraphRefused", (refused) =>
-						refused.status === 410 && Option.isSome(link)
+					Effect.catchTag(["GraphRefused", "GraphUnreadable"], (error) =>
+						error._tag === "GraphRefused" &&
+						error.status === 410 &&
+						Option.isSome(link)
 							? round(folder, Option.none(), fetched)
 							: Effect.succeed({
 									removed: 0,
 									saved: 0,
-									skipped: [{ item: `folder ${folder.name}`, refused }],
+									skipped: [{ error, item: `folder ${folder.name}` }],
 								})
 					)
 				);
@@ -335,7 +353,7 @@ export class Sync extends Context.Service<
 					folders,
 					(folder) =>
 						Effect.map(
-							unlessRefused(
+							orSkipped(
 								`folder ${folder.displayName}`,
 								graph.messageIds(folder.id)
 							),
@@ -369,7 +387,7 @@ export class Sync extends Context.Service<
 				const repairs = yield* Effect.forEach(
 					differ,
 					(id) =>
-						unlessRefused(
+						orSkipped(
 							"a message",
 							Effect.map(locate(id), (now) => repairOf(inStore.get(id), now))
 						),

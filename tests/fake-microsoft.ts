@@ -172,11 +172,17 @@ export class FakeMicrosoft {
 		],
 	]);
 	private readonly messages = new Map<string, FakeMessage>();
-	/** Each change names the folder it touched, in order. */
+	/**
+	 * Each change names the folder it touched, in order; a change Graph reports with only the properties that changed is
+	 * `partial`.
+	 */
 	private readonly changes: {
 		readonly folderId: string;
 		readonly id: string;
+		readonly partial?: true;
 	}[] = [];
+	/** The reads of a folder, its delta pages or the listing of its message ids, that Graph answers in a form mx cannot read. */
+	private readonly unreadables = new Set<string>();
 	private nextId = 100;
 	private readonly uploads = new Map<
 		string,
@@ -384,6 +390,38 @@ export class FakeMicrosoft {
 			message.parentFolderId = folderId;
 			this.changes.push({ folderId, id });
 		}
+	}
+
+	/** Marks a message read the way Outlook does, so the next delta reports only its `isRead` and `parentFolderId`. */
+	readInOutlook(id: string) {
+		const message = this.messages.get(id);
+		if (message !== undefined) {
+			message.isRead = true;
+			this.changes.push({
+				folderId: message.parentFolderId,
+				id,
+				partial: true,
+			});
+		}
+	}
+
+	/**
+	 * Makes Graph answer the folder's delta pages, or with `ids` the listing of its message ids, with an entry that has no
+	 * id, until `readable`.
+	 */
+	unreadable(folderId: string, { ids = false } = {}) {
+		this.unreadables.add(heldKey(folderId, ids));
+	}
+
+	readable(folderId: string, { ids = false } = {}) {
+		this.unreadables.delete(heldKey(folderId, ids));
+	}
+
+	/** The entries of a page of the folder, and the entry without an id while the read is `unreadable`. */
+	private entries(folderId: string, ids: boolean, value: readonly unknown[]) {
+		return this.unreadables.has(heldKey(folderId, ids))
+			? [...value, { "@odata.type": "#microsoft.graph.message" }]
+			: value;
 	}
 
 	/** Makes Graph answer the next read of the message by its id, then delete the message for good, as Outlook can. */
@@ -678,8 +716,12 @@ export class FakeMicrosoft {
 				this.roundsEnded.push(folderId);
 			}
 			return json({
-				value: Arr.map(all.slice(offset, offset + 2), (message) =>
-					this.messageJson(message, asText)
+				value: this.entries(
+					folderId,
+					false,
+					Arr.map(all.slice(offset, offset + 2), (message) =>
+						this.messageJson(message, asText)
+					)
 				),
 				...(more
 					? { "@odata.nextLink": `${self}?$skiptoken=${offset + 2}` }
@@ -688,28 +730,39 @@ export class FakeMicrosoft {
 						}),
 			});
 		}
-		const ids = Arr.dedupe(
-			Arr.map(
-				Arr.filter(
-					this.changes.slice(Number(token)),
-					(change) => change.folderId === folderId
-				),
-				(change) => change.id
-			)
+		const changes = Arr.filter(
+			this.changes.slice(Number(token)),
+			(change) => change.folderId === folderId
 		);
+		const ids = Arr.dedupe(Arr.map(changes, (change) => change.id));
 		this.roundsEnded.push(folderId);
 		return json({
 			"@odata.deltaLink": `${self}?$deltatoken=${this.changes.length}`,
-			value: Arr.map(ids, (id) => {
-				const message = this.messages.get(id);
-				return message !== undefined && message.parentFolderId === folderId
-					? this.messageJson(message, asText)
-					: {
+			value: this.entries(
+				folderId,
+				false,
+				Arr.map(ids, (id) => {
+					const message = this.messages.get(id);
+					if (message === undefined || message.parentFolderId !== folderId) {
+						return {
 							"@odata.type": "#microsoft.graph.message",
 							"@removed": { reason: "deleted" },
 							id,
 						};
-			}),
+					}
+					return Arr.every(
+						changes,
+						(change) => change.id !== id || change.partial === true
+					)
+						? {
+								"@odata.type": "#microsoft.graph.message",
+								id,
+								isRead: message.isRead,
+								parentFolderId: message.parentFolderId,
+							}
+						: this.messageJson(message, asText);
+				})
+			),
 		});
 	}
 
@@ -730,7 +783,11 @@ export class FakeMicrosoft {
 		const next = new URL(url);
 		next.searchParams.set("$skip", String(offset + 2));
 		return json({
-			value: Arr.map(all.slice(offset, offset + 2), ({ id }) => ({ id })),
+			value: this.entries(
+				folderId,
+				true,
+				Arr.map(all.slice(offset, offset + 2), ({ id }) => ({ id }))
+			),
 			...(offset + 2 < all.length ? { "@odata.nextLink": next.href } : {}),
 		});
 	}
