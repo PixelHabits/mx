@@ -1108,6 +1108,70 @@ describe("mx", () => {
 			}
 		}));
 
+	test("mx mcp lists the triage prompt, which takes an optional since, and the interview prompt, which takes nothing", () =>
+		Effect.gen(function* () {
+			const client = yield* McpClient;
+			expect(yield* client.request("prompts/list")).toMatchObject({
+				prompts: [
+					{
+						arguments: [
+							{
+								description:
+									"The first day of mail to triage, as YYYY-MM-DD; 7 days before today unless given.",
+								name: "since",
+								required: false,
+							},
+						],
+						description: "Review new mail and report what needs the user",
+						name: "triage",
+					},
+					{
+						arguments: [],
+						description:
+							"Learn how the user handles mail, so triage follows it",
+						name: "interview",
+					},
+				],
+			});
+		}));
+
+	test("the triage prompt asks for the mail received since the date it is given", () =>
+		Effect.gen(function* () {
+			const client = yield* McpClient;
+			const text = yield* client.prompt("triage", { since: "2026-10-01" });
+			expect(lines(text)[0]).toBe(
+				"Triage the user's mail received since 2026-10-01."
+			);
+			expect(text).toContain("folder Inbox, since 2026-10-01, no query");
+		}));
+
+	test("the triage prompt without a date asks for the mail of the 7 days before the user's today", () =>
+		Effect.gen(function* () {
+			yield* TestClock.setTime(
+				Temporal.PlainDateTime.from("2026-01-05T12:00").toZonedDateTime(
+					Temporal.Now.timeZoneId()
+				).epochMilliseconds
+			);
+			const text = yield* Effect.gen(function* () {
+				const { client, stdio } = yield* connect;
+				yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+					Effect.provide(stdio),
+					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+					Effect.provide(platform, { local: true }),
+					Effect.forkScoped
+				);
+				return yield* client.prompt("triage");
+			}).pipe(Effect.scoped);
+			expect(lines(text)[0]).toBe(
+				"Triage the user's mail received since 2025-12-29."
+			);
+			expect(text).toContain("folder Inbox, since 2025-12-29, no query");
+		}).pipe(
+			// @effect-diagnostics-next-line strictEffectProvide:off - the test clock this one mx mcp process runs on.
+			Effect.provide(TestClock.layer())
+		));
+
 	test(
 		"the binary that bun run build cross-compiles for this system starts, answers --version and lists the ten tools over MCP",
 		() =>

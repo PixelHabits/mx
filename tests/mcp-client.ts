@@ -45,6 +45,18 @@ const ToolResult = Schema.Struct({
 	structuredContent: Schema.optionalKey(Schema.Unknown),
 });
 
+const PromptResult = Schema.Struct({
+	messages: Schema.Tuple([
+		Schema.Struct({
+			content: Schema.Struct({
+				text: Schema.String,
+				type: Schema.Literal("text"),
+			}),
+			role: Schema.Literal("user"),
+		}),
+	]),
+});
+
 /**
  * A client of `mx mcp` over its stdio, as Claude Code or Codex runs it: newline-delimited JSON-RPC on MCP 2026-07-28.
  * `connect` returns the Stdio the server reads and writes and a client that sends one request at a time.
@@ -66,6 +78,11 @@ export class McpClient extends Context.Service<
 			readonly structured: unknown;
 			readonly text: string;
 		}>;
+		/** A `prompts/get`: the text of the one user message it answers. */
+		readonly prompt: (
+			name: string,
+			args?: Record<string, string>
+		) => Effect.Effect<string>;
 	}
 >()("mx/tests/mcp-client/McpClient") {}
 
@@ -126,7 +143,20 @@ const makeClient = (
 		};
 	});
 
-	return McpClient.of({ call, request });
+	const prompt = Effect.fnUntraced(function* (
+		name: string,
+		args: Record<string, string> = {}
+	) {
+		const {
+			messages: [message],
+		} = yield* Effect.flatMap(
+			request("prompts/get", { arguments: args, name }),
+			Schema.decodeUnknownEffect(PromptResult)
+		).pipe(Effect.orDie);
+		return message.content.text;
+	});
+
+	return McpClient.of({ call, prompt, request });
 };
 
 /** Offers each line of `stream` to `lines`, in a fiber of the scope. */

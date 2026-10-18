@@ -375,7 +375,61 @@ const fileName = (name: string) =>
 	name.replaceAll(unsafeInFileName, "_").replace(leadingDots, "_") ||
 	"attachment";
 
-/** The MCP tools, registered on the `McpServer` in context. Reads answer from the store; writes go to Graph first. */
+/** The day triage starts from unless the agent names one: 7 days before the user's today. */
+const weekAgo = Effect.map(Clock.currentTimeMillis, (now) =>
+	Temporal.Instant.fromEpochMilliseconds(now)
+		.toZonedDateTimeISO(Temporal.Now.timeZoneId())
+		.toPlainDate()
+		.subtract({ days: 7 })
+);
+
+const triageText = (
+	since: string
+) => `Triage the user's mail received since ${since}.
+
+1. Look for the user's mail preferences in your memory or instructions: who matters, what is noise, how they file mail. If there are none, say once that the interview prompt can set them up, then carry on.
+2. Survey with search: folder Inbox, since ${since}, no query, limit 200. If 200 lines come back, tell the user how far back the survey reached. Judge each conversation from its line. Don't open automated mail unless a preference says it matters, or its subject shows a failure or a deadline.
+3. Open the conversations from people with thread. Note what each one asks of the user, and whether the user already replied.
+4. Report in this order: what needs the user's reply, with the ask and the date; what needs other action; failing systems and alerts; then a count of the rest, grouped by sender.
+5. Change nothing in the mailbox. Offer the moves, flags and deletes you would make, and make them only after the user agrees.`;
+
+const interviewText = `Learn how the user handles mail, so later triage follows their way of working.
+
+1. Survey first, before you ask anything: search the Inbox and Sent Items for the last 30 days, with no query and limit 200. Note who writes to the user most, which senders are automated, what the user flags, and which conversations the user answered.
+2. Then interview the user, a few questions at a time: their role and what they are responsible for; whose mail always matters; which automated mail they want to see and which is noise; how they want mail filed (folders, categories, flags); how fast they reply and what counts as urgent; what triage should leave alone.
+3. Write a short summary of their preferences, and show it to them for corrections.
+4. If you can save memories, or edit an instruction file such as CLAUDE.md or AGENTS.md, save the agreed summary there under the heading "Mail preferences". If you can't, give the user the summary to paste into their agent's custom instructions.
+5. Change nothing in the mailbox during the interview.`;
+
+/** The MCP prompts, registered on the `McpServer` in context. */
+const prompts = Effect.andThen(
+	McpServer.registerPrompt({
+		content: ({ since }) =>
+			Effect.map(since === undefined ? weekAgo : Effect.succeed(since), (day) =>
+				triageText(day.toString())
+			),
+		description: "Review new mail and report what needs the user",
+		name: "triage",
+		parameters: {
+			since: Schema.optionalKey(
+				PlainDateFromString.annotate({
+					description:
+						"The first day of mail to triage, as YYYY-MM-DD; 7 days before today unless given.",
+				})
+			),
+		},
+	}),
+	McpServer.registerPrompt({
+		content: () => Effect.succeed(interviewText),
+		description: "Learn how the user handles mail, so triage follows it",
+		name: "interview",
+	})
+);
+
+/**
+ * The MCP tools, then the prompts, registered on the `McpServer` in context. Reads answer from the store; writes go to
+ * Graph first.
+ */
 export const tools = Layer.effectDiscard(
 	Effect.gen(function* () {
 		const store = yield* Store;
@@ -808,13 +862,16 @@ export const tools = Layer.effectDiscard(
 				).pipe(Effect.flatMap(savedLine))
 			)
 		);
+
+		yield* prompts;
 	})
 );
 
 /**
- * `mx mcp`: the tools over stdio, on MCP 2026-07-28, where every request carries its own protocol version. The server
- * reads requests as soon as it starts, so the store and Graph open before it, and the tools register right after it
- * with nothing to wait for; a `tools/list` never answers before them.
+ * `mx mcp`: the tools and prompts over stdio, on MCP 2026-07-28, where every request carries its own protocol version.
+ * The server reads requests as soon as it starts, so the store and Graph open before it, and the tools and prompts
+ * register right after it in one layer, with nothing to wait for; a `tools/list` or `prompts/list` never answers before
+ * them.
  */
 export const serve = (version: string) =>
 	tools.pipe(
