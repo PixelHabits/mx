@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pushes the PKGBUILD and .SRCINFO that build.sh wrote to the AUR, with AUR_SSH_PRIVATE_KEY.
+# Pushes the PKGBUILD, .SRCINFO and install script that build.sh prepared to the AUR, with AUR_SSH_PRIVATE_KEY.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -23,11 +23,11 @@ export GIT_SSH_COMMAND="ssh -i $key_file -o IdentitiesOnly=yes -o UserKnownHosts
 
 # Cloning a package the AUR does not have yet gives an empty repository, and the first push creates the package.
 git clone "ssh://aur@aur.archlinux.org/$pkgname.git" "$aur_dir"
-cp "$package_dir/PKGBUILD" "$package_dir/.SRCINFO" "$aur_dir/"
+cp "$package_dir/PKGBUILD" "$package_dir/.SRCINFO" "$package_dir/mx-mail-bin.install" "$aur_dir/"
 cd "$aur_dir"
 git config user.name 'github-actions[bot]'
 git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-git add PKGBUILD .SRCINFO
+git add PKGBUILD .SRCINFO mx-mail-bin.install
 
 if git diff --cached --quiet; then
   echo 'AUR package is already up to date.'

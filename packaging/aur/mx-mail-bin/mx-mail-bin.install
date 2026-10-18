@@ -1,0 +1,9 @@
+post_remove() {
+	cat <<'END'
+==> pacman leaves each user's mx data in their home folder. Run `mx uninstall` before you remove the package to delete it.
+==> To clean up by hand now, run `systemctl --user stop mx-sync`, then delete
+    ~/.local/share/mx ~/.config/mx ~/.local/state/mx ~/.cache/mx
+    ~/.config/systemd/user/default.target.wants/mx-sync.service
+    and remove mx from your agents' settings.
+END
+}

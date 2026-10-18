@@ -12,6 +12,8 @@ makedepends=('bun' 'git')
 optdepends=('cloudflared: Graph push notifications; without it, mx downloads its own')
 # Stripping a Bun executable cuts off the program it carries.
 options=('!strip' '!debug')
+# pacman can't reach users' home folders, so removal only says what is left there.
+install="$pkgname.install"
 source=("mx::git+file://${startdir%/packaging/arch}")
 sha256sums=('SKIP')
 

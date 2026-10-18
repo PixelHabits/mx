@@ -14,6 +14,8 @@ provides=('mx-mail')
 conflicts=('mx-mail')
 # Stripping a Bun executable cuts off the program it carries.
 options=('!strip' '!debug')
+# pacman can't reach users' home folders, so removal only says what is left there.
+install="$pkgname.install"
 
 _release="$url/releases/download/v$pkgver"
 source=(

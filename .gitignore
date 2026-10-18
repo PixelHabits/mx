@@ -6,3 +6,4 @@ dist/
 .env*.local
 packaging/arch/*
 !packaging/arch/PKGBUILD
+!packaging/arch/mx-mail.install
