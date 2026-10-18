@@ -12,14 +12,22 @@ import {
 	Stream,
 } from "effect";
 
-const protocolVersion = "2026-07-28";
+const modern = "2026-07-28";
+
+const clientInfo = { name: "mx-test", version: "1.0.0" };
 
 /** Every 2026-07-28 request names its protocol version and the client's capabilities; there is no handshake. */
 const meta = {
 	"io.modelcontextprotocol/clientCapabilities": {},
-	"io.modelcontextprotocol/clientInfo": { name: "mx-test", version: "1.0.0" },
-	"io.modelcontextprotocol/protocolVersion": protocolVersion,
+	"io.modelcontextprotocol/clientInfo": clientInfo,
+	"io.modelcontextprotocol/protocolVersion": modern,
 };
+
+const InitializeResult = Schema.Struct({
+	instructions: Schema.optionalKey(Schema.String),
+	protocolVersion: Schema.String,
+	serverInfo: Schema.Struct({ name: Schema.String }),
+});
 
 const Frame = Schema.Struct({
 	error: Schema.optionalKey(Schema.Unknown),
@@ -59,12 +67,18 @@ const PromptResult = Schema.Struct({
 });
 
 /**
- * A client of `mx mcp` over its stdio, as Claude Code or Codex runs it: newline-delimited JSON-RPC on MCP 2026-07-28.
- * `connect` returns the Stdio the server reads and writes and a client that sends one request at a time.
+ * A client of `mx mcp` over its stdio: newline-delimited JSON-RPC on MCP 2026-07-28, as Claude Code runs it, or on a
+ * version with a handshake, as Claude Desktop and Codex run it. `connect` returns the Stdio the server reads and writes
+ * and a client that sends one request at a time.
  */
 export class McpClient extends Context.Service<
 	McpClient,
 	{
+		/**
+		 * The handshake a client on a version before 2026-07-28 opens with: an `initialize` at its version, then the
+		 * `notifications/initialized` that ends it. Answers what the `initialize` answered.
+		 */
+		readonly initialize: Effect.Effect<typeof InitializeResult.Type>;
 		/** The `result` of a request, or a defect with the JSON-RPC error. */
 		readonly request: (
 			method: string,
@@ -88,13 +102,14 @@ export class McpClient extends Context.Service<
 >()("mx/tests/mcp-client/McpClient") {}
 
 /**
- * A client that sends each request as one line through `send`, and hands each line the server writes to `lines` to the
- * request it answers, in a fiber of the scope, so several requests can be in flight. Notifications are dropped, and a
- * line that is no JSON-RPC frame fails every request in flight.
+ * A client on MCP `version` that sends each message as one line through `send`, and hands each line the server writes to
+ * `lines` to the request it answers, in a fiber of the scope, so several requests can be in flight. Notifications are
+ * dropped, and a line that is no JSON-RPC frame fails every request in flight.
  */
 const makeClient = Effect.fnUntraced(function* (
 	lines: Queue.Queue<string>,
-	send: (line: string) => Effect.Effect<void>
+	send: (line: string) => Effect.Effect<void>,
+	version: string
 ) {
 	let nextId = 0;
 	const waiting = new Map<number, Deferred.Deferred<typeof Frame.Type>>();
@@ -119,6 +134,11 @@ const makeClient = Effect.fnUntraced(function* (
 		Effect.forkScoped
 	);
 
+	const write = (message: Record<string, unknown>) =>
+		Effect.flatMap(encodeJson({ ...message, jsonrpc: "2.0" }), (line) =>
+			send(`${line}\n`)
+		);
+
 	const request = Effect.fnUntraced(function* (
 		method: string,
 		params: Record<string, unknown> = {}
@@ -127,13 +147,11 @@ const makeClient = Effect.fnUntraced(function* (
 		const id = nextId;
 		const answered = yield* Deferred.make<typeof Frame.Type>();
 		waiting.set(id, answered);
-		const line = yield* encodeJson({
+		yield* write({
 			id,
-			jsonrpc: "2.0",
 			method,
-			params: { ...params, _meta: meta },
+			params: version === modern ? { ...params, _meta: meta } : params,
 		});
-		yield* send(`${line}\n`);
 		const frame = yield* Deferred.await(answered).pipe(
 			Effect.ensuring(Effect.sync(() => waiting.delete(id)))
 		);
@@ -176,7 +194,19 @@ const makeClient = Effect.fnUntraced(function* (
 		return message.content.text;
 	});
 
-	return McpClient.of({ call, prompt, request });
+	const initialize = Effect.flatMap(
+		request("initialize", {
+			capabilities: {},
+			clientInfo,
+			protocolVersion: version,
+		}),
+		Schema.decodeUnknownEffect(InitializeResult)
+	).pipe(
+		Effect.orDie,
+		Effect.tap(() => write({ method: "notifications/initialized" }))
+	);
+
+	return McpClient.of({ call, initialize, prompt, request });
 });
 
 /** Offers each line of `stream` to `lines`, in a fiber of the scope. */
@@ -192,8 +222,8 @@ const readLines = <E>(stream: Stream.Stream<Uint8Array, E>) =>
 		return lines;
 	});
 
-/** A client and the Stdio of an `mx mcp` that runs in this process. */
-export const connect = Effect.gen(function* () {
+/** A client on MCP `version` and the Stdio of an `mx mcp` that runs in this process. */
+export const connect = Effect.fnUntraced(function* (version = modern) {
 	const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done>();
 	const stdout = yield* Queue.unbounded<string | Uint8Array, Cause.Done>();
 	const encoder = new TextEncoder();
@@ -209,8 +239,10 @@ export const connect = Effect.gen(function* () {
 		stdout: () => Sink.fromQueue(stdout),
 	});
 	return {
-		client: yield* makeClient(lines, (line) =>
-			Effect.asVoid(Queue.offer(stdin, encoder.encode(line)))
+		client: yield* makeClient(
+			lines,
+			(line) => Effect.asVoid(Queue.offer(stdin, encoder.encode(line))),
+			version
 		),
 		stdio: stdio satisfies Layer.Layer<Stdio.Stdio>,
 	};
@@ -240,10 +272,13 @@ export const spawnClient = (exe: string, env: Record<string, string>) =>
 				onError: (error) => error,
 			})
 		);
-		return yield* makeClient(lines, (line) =>
-			Effect.sync(() => {
-				server.stdin.write(line);
-				server.stdin.flush();
-			})
+		return yield* makeClient(
+			lines,
+			(line) =>
+				Effect.sync(() => {
+					server.stdin.write(line);
+					server.stdin.flush();
+				}),
+			modern
 		);
 	});

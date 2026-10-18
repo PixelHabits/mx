@@ -182,7 +182,7 @@ const server = ManagedRuntime.make(
 	Layer.effect(
 		McpClient,
 		Effect.gen(function* () {
-			const { client, stdio } = yield* connect;
+			const { client, stdio } = yield* connect();
 			yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
 				// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of the mx mcp process.
 				Effect.provide(stdio),
@@ -1109,7 +1109,7 @@ describe("mx", () => {
 			const { frames, system } = fakeTerminal(platform, []);
 			const listed = yield* withStdoutTerminal(true)(
 				Effect.gen(function* () {
-					const { client, stdio } = yield* connect;
+					const { client, stdio } = yield* connect();
 					yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
 						// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
 						Effect.provide(stdio),
@@ -1124,11 +1124,11 @@ describe("mx", () => {
 			expect(frames).toEqual([]);
 		}));
 
-	test("mx mcp speaks MCP 2026-07-28 only and lists the eleven tools, marking reads read-only and every write but draft destructive", () =>
+	test("mx mcp speaks MCP 2026-07-28, then the 2025-11-25 and 2025-06-18 handshakes, and lists the eleven tools, marking reads read-only and every write but draft destructive", () =>
 		Effect.gen(function* () {
 			const client = yield* McpClient;
 			expect(yield* client.request("server/discover")).toMatchObject({
-				supportedVersions: ["2026-07-28"],
+				supportedVersions: ["2026-07-28", "2025-11-25", "2025-06-18"],
 			});
 			const { tools: listed } = (yield* client.request("tools/list")) as {
 				tools: {
@@ -1162,6 +1162,67 @@ describe("mx", () => {
 				expect(inputSchema.anyOf).toBeUndefined();
 			}
 		}));
+
+	for (const [version, sender] of [
+		["2025-11-25", "Claude Desktop"],
+		["2025-06-18", "Codex"],
+	] as const) {
+		test(`mx mcp answers the initialize at MCP ${version} that ${sender} opens with, then lists the tools and prompts it lists on 2026-07-28 and answers them`, () =>
+			Effect.gen(function* () {
+				const modern = yield* McpClient;
+				const { client, stdio } = yield* connect(version);
+				yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+					Effect.provide(stdio),
+					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+					Effect.provide(platform, { local: true }),
+					Effect.forkScoped
+				);
+				const initialized = yield* client.initialize;
+				const discovered = (yield* modern.request("server/discover")) as {
+					instructions: string;
+				};
+				expect(initialized.protocolVersion).toBe(version);
+				expect(initialized.serverInfo.name).toBe("mx");
+				expect(initialized.instructions).toBe(discovered.instructions);
+				const list = Effect.fnUntraced(function* (
+					from: typeof client,
+					what: "prompts" | "tools"
+				) {
+					const listed = (yield* from.request(`${what}/list`)) as Record<
+						typeof what,
+						{ name: string }[]
+					>;
+					return listed[what];
+				});
+				const listed = yield* list(client, "tools");
+				expect(Arr.map(listed, ({ name }) => name).sort()).toEqual(tools);
+				expect(listed).toEqual(yield* list(modern, "tools"));
+				expect(yield* list(client, "prompts")).toEqual(
+					yield* list(modern, "prompts")
+				);
+				const counted = yield* client.call("query", { sql: "SELECT 1 AS one" });
+				expect(counted.isError).toBe(false);
+				expect(lines(counted.text).slice(-2)).toEqual(["one", "1"]);
+				const text = yield* client.prompt("triage", { since: "2026-10-01" });
+				expect(lines(text)[0]).toBe(
+					"Triage the user's mail received since 2026-10-01."
+				);
+			}).pipe(Effect.scoped));
+	}
+
+	test("mx mcp never agrees to MCP 2025-03-26, which no client sends: it answers an initialize at it with 2025-11-25", () =>
+		Effect.gen(function* () {
+			const { client, stdio } = yield* connect("2025-03-26");
+			yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+				// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+				Effect.provide(stdio),
+				// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+				Effect.provide(platform, { local: true }),
+				Effect.forkScoped
+			);
+			expect((yield* client.initialize).protocolVersion).toBe("2025-11-25");
+		}).pipe(Effect.scoped));
 
 	test("mx mcp lists the triage prompt, which takes an optional since, and the interview prompt, which takes nothing", () =>
 		Effect.gen(function* () {
@@ -1208,7 +1269,7 @@ describe("mx", () => {
 				).epochMilliseconds
 			);
 			const text = yield* Effect.gen(function* () {
-				const { client, stdio } = yield* connect;
+				const { client, stdio } = yield* connect();
 				yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
 					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
 					Effect.provide(stdio),
@@ -1905,7 +1966,7 @@ describe("mx", () => {
 
 	test("query stops a query that runs past 10 seconds and says so, while mx mcp answers other calls", () =>
 		Effect.gen(function* () {
-			const { client, stdio } = yield* connect;
+			const { client, stdio } = yield* connect();
 			yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
 				// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
 				Effect.provide(stdio),
@@ -3044,7 +3105,7 @@ describe("mx", () => {
 			}));
 			const before = yield* contents;
 			const found = yield* Effect.gen(function* () {
-				const { client, stdio } = yield* connect;
+				const { client, stdio } = yield* connect();
 				yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
 					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
 					Effect.provide(stdio),

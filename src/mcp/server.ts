@@ -905,7 +905,8 @@ Reading mail costs context:
 If the user has saved mail preferences in your memory or instructions, follow them. If they have none and ask you to triage, offer once to interview them first about how they handle mail.`;
 
 /**
- * `mx mcp`: the tools and prompts over stdio, on MCP 2026-07-28, where every request carries its own protocol version.
+ * `mx mcp`: the tools and prompts over stdio, on MCP 2026-07-28, where every request carries its own protocol version,
+ * and on the `initialize` handshakes that Claude Desktop opens at 2025-11-25 and Codex at 2025-06-18.
  * The server reads requests as soon as it starts, so the store and Graph open before it, and the tools and prompts
  * register right after it in one layer, with nothing to wait for; a `tools/list` or `prompts/list` never answers before
  * them.
@@ -916,7 +917,11 @@ export const serve = (version: string) =>
 			McpServer.layerStdio({
 				instructions,
 				name: "mx",
-				protocols: [McpProtocol.v2026_07_28],
+				protocols: [
+					McpProtocol.v2026_07_28,
+					McpProtocol.v2025_11_25,
+					McpProtocol.v2025_06_18,
+				],
 				version,
 			})
 		),
