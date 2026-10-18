@@ -1,0 +1,39 @@
+# Changelog
+
+## [0.1.0](https://github.com/PixelHabits/mx/compare/v0.1.0...v0.1.0) (2026-10-18)
+
+
+### Features
+
+* **arch:** say what pacman leaves in home folders when mx is removed ([2d358bf](https://github.com/PixelHabits/mx/commit/2d358bf363f14ea18dbb0f1abbf2012b4fda2b64))
+* build an Arch package from source, and let it own the binary and the sync unit ([407f6bf](https://github.com/PixelHabits/mx/commit/407f6bfef7740b8fb7d5e7de9881f431f3a6cff9))
+* build for Linux and Windows, and set mx up with mx install ([008b0eb](https://github.com/PixelHabits/mx/commit/008b0eb16971a291b0cbd9a40f0fb6153fe4451b))
+* **build:** build mx for macOS on Apple silicon and Intel, and check it on macOS ([7729473](https://github.com/PixelHabits/mx/commit/7729473be69636e17214eee5f43f631ba01bd6a7))
+* **install:** ask which agents to set up and write their MCP configs directly ([e2bc19c](https://github.com/PixelHabits/mx/commit/e2bc19c8697e674f2b5a9df3999e796676884695))
+* **install:** run mx sync as a launchd LaunchAgent on macOS ([3d64b63](https://github.com/PixelHabits/mx/commit/3d64b63682b7513128e9e6bbfcc13ce6798713ea))
+* **install:** run the first sync in the foreground with progress, and sync folders in parallel ([34fa608](https://github.com/PixelHabits/mx/commit/34fa6083bfad0c9323c7d7186922e236dfadeb22))
+* **install:** say how to put ~/.local/bin on PATH when the shell lacks it ([884fb0c](https://github.com/PixelHabits/mx/commit/884fb0c7ff693c38ab3f23eda351a78700c813b8))
+* **mcp:** a query tool runs one read-only SELECT over views of the store ([28e0133](https://github.com/PixelHabits/mx/commit/28e01332cfd40210f5a40cfe17732757813a71e2))
+* **mcp:** heal a stored message that Graph answers 404 for ([cd04787](https://github.com/PixelHabits/mx/commit/cd047873fc8b020d85271e43e4c5bf073b355f2f))
+* **mcp:** point agents and the prompts at query for counting ([7051093](https://github.com/PixelHabits/mx/commit/7051093373360695c943cd9766826b65b921f31a))
+* **mcp:** serve a triage prompt and an interview prompt ([a3edff1](https://github.com/PixelHabits/mx/commit/a3edff173dcd9a4c10bc823a51f74b3d4524877f))
+* **mcp:** tell agents how to read the mailbox cheaply ([9a68377](https://github.com/PixelHabits/mx/commit/9a683772556f0a87022b72163496ed0957d2ea6f))
+* **paths:** keep mx's files where macOS expects them ([3612276](https://github.com/PixelHabits/mx/commit/36122763ff9639411e3eeaf19b730142e737bfdd))
+* play a banner when mx runs bare on a terminal ([7270f66](https://github.com/PixelHabits/mx/commit/7270f66ce80addd42837ad78aaa63d9f9119481e))
+* **push:** download the pinned cloudflared on macOS ([6f15345](https://github.com/PixelHabits/mx/commit/6f153452733a4a70276dd4ccd89d3121787ce51f))
+* **search:** rank by relevance, match word forms, and list each conversation once ([06596a4](https://github.com/PixelHabits/mx/commit/06596a4097ae9601d53424d8d15cfe9fae609b40))
+* ship third-party notices with every binary ([0648eb6](https://github.com/PixelHabits/mx/commit/0648eb6d1ee35ad11ca865bbbeb5ecd667b0eb8c))
+* **store:** version the store with numbered migrations, and refuse a store a newer mx wrote ([f850bd7](https://github.com/PixelHabits/mx/commit/f850bd70f7d3282f12073c8e2cbbed6ff972b97e))
+* sync a Microsoft 365 mailbox through Graph and serve it to agents over MCP ([29033b0](https://github.com/PixelHabits/mx/commit/29033b02715976777dd5ab8215737ef9e620b2c0))
+* **sync:** check the store against Graph after the first pass and daily ([4dda290](https://github.com/PixelHabits/mx/commit/4dda2905af225ed7b7837e51a08c94411b3ab466))
+* **sync:** follow the mailbox through Graph push, with polling as the fallback ([0b42208](https://github.com/PixelHabits/mx/commit/0b422089c7bb76eb2ffafdfad963ae4382784a25))
+* **sync:** record a heartbeat, report it in mx status, and warn in read tools ([d16f9ea](https://github.com/PixelHabits/mx/commit/d16f9eaa8be8a8672d028b55b0461e4c96669781))
+* update mx from a signed release manifest ([5585d9b](https://github.com/PixelHabits/mx/commit/5585d9bd4c1a4601e04a69fc31fee0c7cdabb90a))
+
+
+### Bug Fixes
+
+* **install:** count the exit of a stopped mx sync as clean in its systemd unit ([765e0ab](https://github.com/PixelHabits/mx/commit/765e0ab58d4ff2c2127bede2baa8c97e50f23f0f))
+* name the Arch packages in the uninstall and update messages ([4278eaf](https://github.com/PixelHabits/mx/commit/4278eaf1417c767b6a9d204cdc5e8cbe4ba8f9cc))
+* **sync:** read partial delta entries, and skip a folder whose page mx cannot read ([c732a89](https://github.com/PixelHabits/mx/commit/c732a89b86c0b6c12fab6d2c23ee7a1a83423315))
+* **sync:** skip a folder or a message Graph refuses, and keep mx sync running ([9e63123](https://github.com/PixelHabits/mx/commit/9e631233f7cd718dc150417b346fc6031d49860d))
