@@ -11,7 +11,7 @@
 		"manifest": "bun scripts/manifest.ts",
 		"prepare": "lefthook install && effect-tsgo patch",
 		"release": "bun scripts/release.ts",
-		"test": "bun test --isolate tests",
+		"test": "bun test --isolate ./tests",
 		"typecheck": "tsc -p tsconfig.json --noEmit"
 	},
 	"dependencies": {
