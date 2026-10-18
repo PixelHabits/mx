@@ -109,7 +109,7 @@ const compile = Effect.fnUntraced(function* (
 
 export const build = compile(targets);
 
-/** `bun run build linux-x64` builds only the platforms it names, as the Arch package does. */
+/** `bun run build linux-x64` builds only the platforms it names, as the source build in `packaging/arch` does. */
 const platformsNamed = Effect.gen(function* () {
 	const named = Bun.argv.slice(2);
 	const unknown = Arr.filter(

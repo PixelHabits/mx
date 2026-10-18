@@ -1,7 +1,7 @@
 import { Array as Arr, Effect, Option, Order, Schema } from "effect";
 import packageJson from "../package.json" with { type: "json" };
 
-/** The file `bun run build` writes next to the binaries; every release and the Arch package ship it. */
+/** The file `bun run build` writes next to the binaries; every release and the Arch packages ship it. */
 export const noticesFile = "dist/THIRD_PARTY_NOTICES";
 
 /** The Bun that `packageManager` pins, which builds every release; `licenses/` holds its LICENSE.md. */

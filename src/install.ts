@@ -377,7 +377,7 @@ export class Installer extends Context.Service<
 				]);
 				return {
 					register: Effect.gen(function* () {
-						// The Arch package ships the unit in /usr/lib/systemd/user.
+						// The Arch packages ship the unit in /usr/lib/systemd/user.
 						if (!packaged) {
 							yield* fs
 								.makeDirectory(path.dirname(unitFile), { recursive: true })
@@ -403,7 +403,7 @@ export class Installer extends Context.Service<
 									remove: Effect.andThen(
 										unregister,
 										Console.log(
-											`Stopped mx sync and disabled ${unitName}. pacman -R mx removes ${bin} and the unit.`
+											`Stopped mx sync and disabled ${unitName}. pacman -R mx-mail-bin removes ${bin} and the unit, or pacman -R mx-mail for a package built from source.`
 										)
 									),
 									what: `the start of mx sync at sign-in: systemctl --user disable ${unitName}`,

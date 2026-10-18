@@ -26,9 +26,9 @@ export class Paths extends Context.Service<
 		 * always has a Keychain, so there it holds only the log.
 		 */
 		readonly state: string;
-		/** The installed binary: `~/.local/bin/mx`, `/usr/bin/mx` from the Arch package, or `%LOCALAPPDATA%\Programs\mx\mx.exe`. */
+		/** The installed binary: `~/.local/bin/mx`, `/usr/bin/mx` from an Arch package, or `%LOCALAPPDATA%\Programs\mx\mx.exe`. */
 		readonly bin: string;
-		/** Whether mx runs from the Arch package, which owns the binary and the sync unit, so pacman installs and updates them. */
+		/** Whether mx runs from an Arch package, which owns the binary and the sync unit, so pacman installs and updates them. */
 		readonly packaged: boolean;
 		/** `$XDG_CONFIG_HOME`, `~/Library/Application Support` on macOS, or `%APPDATA%` on Windows, where other programs keep their settings. */
 		readonly config: string;

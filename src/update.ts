@@ -109,7 +109,7 @@ export class Updater extends Context.Service<
 			const update = Effect.gen(function* () {
 				if (packaged) {
 					return yield* failed(
-						"mx came from the Arch package; update it with pacman."
+						"mx came from an Arch package; update it as you installed it: yay -Syu for mx-mail-bin, or rebuild mx-mail from source."
 					);
 				}
 				if (!(yield* fs.exists(bin).pipe(Effect.orDie))) {

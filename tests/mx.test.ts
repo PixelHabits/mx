@@ -3443,14 +3443,14 @@ describe("mx", () => {
 	);
 
 	test(
-		"mx update from the Arch package refuses, says to update with pacman, and fetches no release",
+		"mx update from the Arch package refuses, names the AUR package to update, and fetches no release",
 		() =>
 			Effect.gen(function* () {
 				const asked = Arr.filter(microsoft.received, (request) =>
 					isReleaseRequest(request.url)
 				).length;
 				const failure = yield* Effect.flip(fromPackage(cli("update")));
-				expect(failure.message).toContain("pacman");
+				expect(failure.message).toContain("mx-mail-bin");
 				expect(
 					Arr.filter(microsoft.received, (request) =>
 						isReleaseRequest(request.url)
@@ -3461,7 +3461,7 @@ describe("mx", () => {
 	);
 
 	test(
-		"mx uninstall --yes from the Arch package disables the unit and leaves the binary and the unit to pacman",
+		"mx uninstall --yes from the Arch package disables the unit and leaves the binary and the unit to pacman -R mx-mail-bin",
 		() =>
 			Effect.gen(function* () {
 				const before = processes.commands.length;
@@ -3474,7 +3474,7 @@ describe("mx", () => {
 					"systemctl --user disable --now mx-sync.service",
 					"systemctl --user daemon-reload",
 				]);
-				expect(output).toContain("pacman -R mx");
+				expect(output).toContain("pacman -R mx-mail-bin");
 				expect(output).not.toContain(`Removed ${packaged}`);
 			}),
 		{ because: "the Arch package is for Arch Linux", systems: ["linux"] }
