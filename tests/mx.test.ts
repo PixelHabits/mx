@@ -199,6 +199,13 @@ const server = ManagedRuntime.make(
 afterAll(() => server.dispose().then(() => machine.dispose()));
 
 /**
+ * How long a test may run. Bun's own limit fails a test but leaves its effect running, with `process.platform` still
+ * faked for the tests after it, so mx's runtime interrupts the test at this one and its finalizers run first; Bun's,
+ * at twice this, is the backstop for a test that its interruption does not stop.
+ */
+const testTimeout = Duration.seconds(30);
+
+/**
  * One test, on mx's own runtime. A test of what only some systems have names them in `only`; elsewhere the test is
  * skipped, and its name says why.
  */
@@ -217,8 +224,8 @@ const test = <E>(
 	const skipped = only !== undefined && !only.systems.includes(os);
 	return it.skipIf(skipped)(
 		skipped ? `${name} (skipped: ${only.because})` : name,
-		() => server.runPromise(body()),
-		30_000
+		() => server.runPromise(Effect.timeout(body(), testTimeout)),
+		Duration.toMillis(Duration.times(testTimeout, 2))
 	);
 };
 
