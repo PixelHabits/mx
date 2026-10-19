@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/PixelHabits/mx/compare/v0.2.0...v0.3.0) (2026-10-19)
+
+
+### Features
+
+* **log:** keep a log of every tool call in log.sqlite, and show it with mx log ([d38c46c](https://github.com/PixelHabits/mx/commit/d38c46c47bebf7d349cc59f72a417a16daccac4b))
+* **mcp:** create, rename and move folders, and move a folder to Deleted Items ([accf68e](https://github.com/PixelHabits/mx/commit/accf68ecdac4664d8dbdb6a92402bccf65ac42d2))
+
 ## [0.2.0](https://github.com/PixelHabits/mx/compare/v0.1.1...v0.2.0) (2026-10-19)
 
 
