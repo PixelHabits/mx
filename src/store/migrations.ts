@@ -3,6 +3,7 @@ import { Array as Arr, Effect } from "effect";
 import { SqlClient } from "effect/sql";
 import { NewerStore } from "../errors.ts";
 import { initial } from "./migrations/0001-initial.ts";
+import { accounts } from "./migrations/0002-accounts.ts";
 
 /** The table in which the store records each migration it ran, by id and name. */
 const table = "effect_sql_migrations";
@@ -18,7 +19,10 @@ const table = "effect_sql_migrations";
  * The `query` tool reads the tables through the views in `views.ts`, so a migration that changes a table they read
  * changes them too.
  */
-export const migrations = { "0001_initial": initial };
+export const migrations = {
+	"0001_initial": initial,
+	"0002_accounts": accounts,
+};
 
 /**
  * Runs each migration in `known` that the store has not recorded. A store that records a migration `known` lacks was

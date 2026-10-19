@@ -10,6 +10,7 @@ import {
 	Semaphore,
 	SynchronizedRef,
 } from "effect";
+import { onlyAccount } from "./auth/config.ts";
 import type { GraphRefused, GraphUnreadable } from "./errors.ts";
 import {
 	Changed,
@@ -173,6 +174,8 @@ export class Sync extends Context.Service<
 		Effect.gen(function* () {
 			const graph = yield* Graph;
 			const store = yield* Store;
+			/** The account whose mailbox `graph` reads, under which the store files every folder this Sync lists. */
+			const accountId = onlyAccount.id;
 			const oneAtATime = yield* Semaphore.make(1);
 
 			/** Adds the folder from Graph when the store does not know it yet. */
@@ -184,7 +187,7 @@ export class Sync extends Context.Service<
 					[graph.folder(folderId), graph.folder("sentitems")],
 					{ concurrency: 2 }
 				);
-				yield* store.saveFolder(folder, folder.id === sentItems.id);
+				yield* store.saveFolder(accountId, folder, folder.id === sentItems.id);
 			});
 
 			const locate = Effect.fn("Sync.locate")(function* (graphId: string) {
@@ -284,7 +287,7 @@ export class Sync extends Context.Service<
 			const listFolders = Effect.gen(function* () {
 				const folders = yield* graph.folders;
 				const sentItems = yield* graph.folder("sentitems");
-				yield* store.saveFolders(folders, sentItems.id);
+				yield* store.saveFolders(accountId, folders, sentItems.id);
 				return folders;
 			});
 
@@ -294,7 +297,7 @@ export class Sync extends Context.Service<
 				const folders = yield* listFolders;
 				const links = new Map(
 					Arr.getSomes(
-						Arr.map(yield* store.folders, ({ deltaLink, id }) =>
+						Arr.map(yield* store.folders(accountId), ({ deltaLink, id }) =>
 							Option.map(deltaLink, (saved) => [id, saved] as const)
 						)
 					)
@@ -366,7 +369,7 @@ export class Sync extends Context.Service<
 				);
 				const [listed, unlisted] = Arr.partition(listings, identity);
 				const inGraph = new Map(Arr.flatten(listed));
-				const inStore = yield* store.placements;
+				const inStore = yield* store.placements(accountId);
 				const refusedFolders = new Set(
 					Arr.map(unlisted, ({ folderId }) => folderId)
 				);
@@ -409,7 +412,7 @@ export class Sync extends Context.Service<
 			}).pipe(oneAtATime.withPermits(1), Effect.withSpan("Sync.reconcile"));
 
 			const finishedFirstPass = Effect.map(
-				store.folders,
+				store.folders(accountId),
 				(stored) =>
 					Arr.isReadonlyArrayNonEmpty(stored) &&
 					Arr.every(stored, ({ deltaLink }) => Option.isSome(deltaLink))
@@ -419,7 +422,7 @@ export class Sync extends Context.Service<
 				folderId: string
 			) {
 				const folder = Arr.findFirst(
-					yield* store.folders,
+					yield* store.folders(accountId),
 					(stored) => stored.id === folderId
 				);
 				if (Option.isNone(folder)) {

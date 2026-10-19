@@ -37,6 +37,7 @@ const Flag = Schema.Literals([0, 1]);
 
 /** A message row joined with its folder, as SQLite returns it. */
 const Row = Schema.Struct({
+	account_id: Schema.Int,
 	bcc_list: Schema.fromJsonString(Schema.Array(Address)),
 	body: Schema.String,
 	categories: Schema.fromJsonString(Schema.Array(Schema.String)),
@@ -99,6 +100,8 @@ const FolderRow = Schema.Struct({
 
 /** A stored message, by its short local id. */
 export interface Stored {
+	/** The account whose folder files it. */
+	readonly accountId: number;
 	readonly attachments: boolean;
 	readonly bcc: readonly Address[];
 	readonly body: string;
@@ -127,7 +130,7 @@ export interface Stored {
 /** One conversation a search found, by its best match. */
 export interface Found {
 	readonly message: Stored;
-	/** The conversation's other messages, in every folder, whether they match or not. */
+	/** The conversation's other messages, in every folder of its account, whether they match or not. */
 	readonly others: number;
 }
 
@@ -152,6 +155,7 @@ const instant = (millis: number | null) =>
 	);
 
 const stored = (row: typeof Row.Type): Stored => ({
+	accountId: row.account_id,
 	attachments: row.has_attachments === 1,
 	bcc: row.bcc_list,
 	body: row.body,
@@ -233,25 +237,34 @@ const connection = Layer.unwrap(
 );
 
 /**
- * The local copy of the mailbox in SQLite: folders with their delta links, one row per message with a short integer id
- * that stays with the message through moves and never names another message, and an FTS5 index over subject, sender
- * and new text that triggers keep current.
+ * The local copy of the mailbox in SQLite: folders with their delta links, each filed under the account whose mailbox
+ * holds it, one row per message with a short integer id that stays with the message through moves and never names
+ * another message, and an FTS5 index over subject, sender and new text that triggers keep current. A message is in its
+ * folder's account.
  */
 export class Store extends Context.Service<
 	Store,
 	{
-		readonly folders: Effect.Effect<readonly StoredFolder[]>;
+		/** The account's folders. */
+		readonly folders: (
+			accountId: number
+		) => Effect.Effect<readonly StoredFolder[]>;
 		readonly hasFolder: (id: string) => Effect.Effect<boolean>;
 		/**
-		 * Adds, renames or moves one folder, below its parent when the store has the parent, and the folders inside it
-		 * with it. Its delta link stays. Answers the path it saved.
+		 * Adds one folder of the account, or renames or moves it, below its parent when the store has the parent, and the
+		 * folders inside it with it. Its delta link stays. Answers the path it saved.
 		 */
 		readonly saveFolder: (
+			accountId: number,
 			folder: Folder,
 			sent: boolean
 		) => Effect.Effect<string>;
-		/** Replaces the folder list; a folder no longer listed leaves with its messages. Delta links stay. */
+		/**
+		 * Replaces the account's folder list: a folder of the account no longer listed leaves with its messages, and
+		 * other accounts' folders stay. Delta links stay.
+		 */
 		readonly saveFolders: (
+			accountId: number,
 			folders: readonly Folder[],
 			sentItemsId: string
 		) => Effect.Effect<void>;
@@ -283,8 +296,10 @@ export class Store extends Context.Service<
 			lookup: Lookup,
 			answer: Option.Option<Message>
 		) => Effect.Effect<void>;
-		/** The folder id each stored message is filed in, by its Graph id. */
-		readonly placements: Effect.Effect<ReadonlyMap<string, string>>;
+		/** The folder id each stored message of the account is filed in, by its Graph id. */
+		readonly placements: (
+			accountId: number
+		) => Effect.Effect<ReadonlyMap<string, string>>;
 		/** Removes the folder's messages whose Graph ids `kept` does not list. */
 		readonly keepOnly: (
 			folderId: string,
@@ -300,18 +315,20 @@ export class Store extends Context.Service<
 			graphId: string
 		) => Effect.Effect<Option.Option<Stored>>;
 		/**
-		 * Up to `limit` conversations with a message that passes the filter, one per conversation: with `text`, the best
-		 * match of each, best first; without it, the newest of each, newest first.
+		 * Up to `limit` conversations of the account with a message that passes the filter, one per conversation: with
+		 * `text`, the best match of each, best first; without it, the newest of each, newest first.
 		 */
 		readonly search: (filter: {
+			readonly accountId: number;
 			readonly folderId: Option.Option<string>;
 			readonly from: Option.Option<string>;
 			readonly limit: number;
 			readonly since: Option.Option<Temporal.Instant>;
 			readonly text: Option.Option<string>;
 		}) => Effect.Effect<readonly Found[]>;
-		/** The conversation's messages in every folder, oldest first. */
+		/** The conversation's messages in every folder of the account, oldest first. */
 		readonly conversation: (
+			accountId: number,
 			conversationId: string
 		) => Effect.Effect<readonly Stored[]>;
 		/** Every address a message in Sent Items came from, lower-cased. */
@@ -345,7 +362,7 @@ export class Store extends Context.Service<
 			yield* run(sql`PRAGMA foreign_keys = ON`);
 			yield* migrate(migrations);
 
-			const select = sql`SELECT m.*, f.path AS folder_path, f.sent AS folder_sent, ${sql.literal(messageLink)} AS link FROM messages m JOIN folders f ON f.id = m.folder_id`;
+			const select = sql`SELECT m.*, f.account_id, f.path AS folder_path, f.sent AS folder_sent, ${sql.literal(messageLink)} AS link FROM messages m JOIN folders f ON f.id = m.folder_id`;
 			/** When the message arrived; a draft has no received time until Graph saves it, so its sent or saved time stands in. */
 			const arrived = sql`COALESCE(m.received_at, m.sent_at)`;
 
@@ -358,30 +375,32 @@ export class Store extends Context.Service<
 			const transaction = <A>(effect: Effect.Effect<A>) =>
 				Effect.orDie(sql.withTransaction(effect));
 
-			const folders = all(
-				FolderRow,
-				sql`SELECT id, name, path, sent, delta_link FROM folders`
-			).pipe(
-				Effect.map(
-					Arr.map(
-						(row): StoredFolder => ({
-							deltaLink: Option.fromNullishOr(row.delta_link),
-							id: row.id,
-							name: row.name,
-							path: row.path,
-							sent: row.sent === 1,
-						})
+			const folders = (accountId: number) =>
+				all(
+					FolderRow,
+					sql`SELECT id, name, path, sent, delta_link FROM folders WHERE account_id = ${accountId}`
+				).pipe(
+					Effect.map(
+						Arr.map(
+							(row): StoredFolder => ({
+								deltaLink: Option.fromNullishOr(row.delta_link),
+								id: row.id,
+								name: row.name,
+								path: row.path,
+								sent: row.sent === 1,
+							})
+						)
 					)
-				)
-			);
+				);
 
 			const upsertFolder = (
+				accountId: number,
 				folder: Folder,
 				folderPath: string,
 				sent: boolean
 			) =>
 				run(
-					sql`INSERT INTO folders (id, parent_id, name, path, sent) VALUES (${folder.id}, ${folder.parentFolderId}, ${folder.displayName}, ${folderPath}, ${sent ? 1 : 0})
+					sql`INSERT INTO folders (id, account_id, parent_id, name, path, sent) VALUES (${folder.id}, ${accountId}, ${folder.parentFolderId}, ${folder.displayName}, ${folderPath}, ${sent ? 1 : 0})
 					ON CONFLICT (id) DO UPDATE SET parent_id = excluded.parent_id, name = excluded.name, path = excluded.path, sent = excluded.sent`
 				);
 
@@ -400,7 +419,7 @@ export class Store extends Context.Service<
 					(rows) => Option.map(Arr.head(rows), ({ path }) => path)
 				);
 
-			const saveFolder = (folder: Folder, sent: boolean) =>
+			const saveFolder = (accountId: number, folder: Folder, sent: boolean) =>
 				transaction(
 					Effect.gen(function* () {
 						const before = yield* storedPath(folder.id);
@@ -411,7 +430,7 @@ export class Store extends Context.Service<
 								onSome: (parent) => `${parent}/${folder.displayName}`,
 							}
 						);
-						yield* upsertFolder(folder, saved, sent);
+						yield* upsertFolder(accountId, folder, saved, sent);
 						if (Option.isSome(before)) {
 							yield* run(
 								sql`WITH RECURSIVE inside (id) AS (
@@ -426,6 +445,7 @@ export class Store extends Context.Service<
 				);
 
 			const saveFolders = Effect.fnUntraced(function* (
+				accountId: number,
 				listed: readonly Folder[],
 				sentItemsId: string
 			) {
@@ -442,11 +462,16 @@ export class Store extends Context.Service<
 						Effect.forEach(
 							listed,
 							(folder) =>
-								upsertFolder(folder, pathOf(folder), folder.id === sentItemsId),
+								upsertFolder(
+									accountId,
+									folder,
+									pathOf(folder),
+									folder.id === sentItemsId
+								),
 							{ discard: true }
 						),
 						run(
-							sql`DELETE FROM folders WHERE id NOT IN (SELECT value FROM json_each(${ids}))`
+							sql`DELETE FROM folders WHERE account_id = ${accountId} AND id NOT IN (SELECT value FROM json_each(${ids}))`
 						)
 					)
 				);
@@ -530,15 +555,16 @@ export class Store extends Context.Service<
 					})
 				);
 
-			const placements = all(
-				Schema.Struct({ folder_id: Schema.String, graph_id: Schema.String }),
-				sql`SELECT graph_id, folder_id FROM messages`
-			).pipe(
-				Effect.map(
-					(rows): ReadonlyMap<string, string> =>
-						new Map(Arr.map(rows, (row) => [row.graph_id, row.folder_id]))
-				)
-			);
+			const placements = (accountId: number) =>
+				all(
+					Schema.Struct({ folder_id: Schema.String, graph_id: Schema.String }),
+					sql`SELECT m.graph_id, m.folder_id FROM messages m JOIN folders f ON f.id = m.folder_id WHERE f.account_id = ${accountId}`
+				).pipe(
+					Effect.map(
+						(rows): ReadonlyMap<string, string> =>
+							new Map(Arr.map(rows, (row) => [row.graph_id, row.folder_id]))
+					)
+				);
 
 			const keepOnly = (folderId: string, kept: readonly string[]) =>
 				Effect.flatMap(jsonIds(kept), (ids) =>
@@ -572,8 +598,9 @@ export class Store extends Context.Service<
 							sql`SELECT rowid AS id, ${sql.literal(relevance)} AS rank FROM search WHERE search MATCH ${ftsQuery(text)}`,
 					})}),
 					matched AS (
-						SELECT m.id, m.conversation_id, c.rank, ${arrived} AS at FROM candidates c JOIN messages m ON m.id = c.id
-						WHERE (${folderId} IS NULL OR m.folder_id = ${folderId})
+						SELECT m.id, m.conversation_id, c.rank, ${arrived} AS at FROM candidates c JOIN messages m ON m.id = c.id JOIN folders f ON f.id = m.folder_id
+						WHERE f.account_id = ${filter.accountId}
+						AND (${folderId} IS NULL OR m.folder_id = ${folderId})
 						AND (${from} IS NULL OR m.from_address LIKE ${from} ESCAPE '!' OR m.from_name LIKE ${from} ESCAPE '!')
 						AND (${since} IS NULL OR ${arrived} >= ${since})
 					),
@@ -581,8 +608,8 @@ export class Store extends Context.Service<
 						SELECT id, rank, at, row_number() OVER (PARTITION BY conversation_id ORDER BY rank, at DESC, id DESC) AS place
 						FROM matched
 					)
-					SELECT m.*, f.path AS folder_path, f.sent AS folder_sent, ${sql.literal(messageLink)} AS link,
-						(SELECT count(*) FROM messages t WHERE t.conversation_id = m.conversation_id) - 1 AS others
+					SELECT m.*, f.account_id, f.path AS folder_path, f.sent AS folder_sent, ${sql.literal(messageLink)} AS link,
+						(SELECT count(*) FROM messages t JOIN folders tf ON tf.id = t.folder_id WHERE t.conversation_id = m.conversation_id AND tf.account_id = f.account_id) - 1 AS others
 					FROM best b JOIN messages m ON m.id = b.id JOIN folders f ON f.id = m.folder_id
 					WHERE b.place = 1
 					ORDER BY b.rank, b.at DESC, b.id DESC LIMIT ${filter.limit}`
@@ -595,9 +622,9 @@ export class Store extends Context.Service<
 				);
 			};
 
-			const conversation = (conversationId: string) =>
+			const conversation = (accountId: number, conversationId: string) =>
 				messages(
-					sql`WHERE m.conversation_id = ${conversationId} ORDER BY COALESCE(m.sent_at, m.received_at), m.id`
+					sql`WHERE f.account_id = ${accountId} AND m.conversation_id = ${conversationId} ORDER BY COALESCE(m.sent_at, m.received_at), m.id`
 				);
 
 			const ownAddresses = all(

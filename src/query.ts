@@ -12,10 +12,11 @@ import {
 	Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { type Account, onlyAccount } from "./auth/config.ts";
 import { Refused } from "./errors.ts";
 import { isOutlookLink } from "./outlook.ts";
 import { Paths } from "./paths.ts";
-import { views } from "./store/views.ts";
+import { aliasesTable, views } from "./store/views.ts";
 
 /** The argument that makes mx answer one query: `mx query-worker`, the child process the `query` tool runs. */
 export const queryWorker = "query-worker";
@@ -31,7 +32,10 @@ const maxRows = 200;
 const maxCharacters = 20_000;
 const maxValueLength = 200;
 
-/** What the worker reads on stdin: the store to open and the agent's SQL. */
+/**
+ * What the worker reads on stdin: the store to open and the agent's SQL. The worker answers the mx mcp of an older
+ * release, which an update leaves running on the new binary, so the request only gains optional fields.
+ */
 const Request = Schema.fromJsonString(
 	Schema.Struct({ database: Schema.String, sql: Schema.String })
 );
@@ -98,8 +102,18 @@ const table = (
  * first part and drops the rest unread, so SQL that ends the statement early, as with a `)` that closes mx's
  * parenthesis, is refused. A comment can still hide mx's LIMIT, so the table stops at `maxRows` itself.
  */
-const select = ({ database, sql }: typeof Request.Type): typeof Answer.Type => {
+const select = (
+	{ database, sql }: typeof Request.Type,
+	accounts: readonly Account[]
+): typeof Answer.Type => {
 	const db = new Database(database, { readonly: true });
+	db.run(aliasesTable);
+	for (const { alias, id } of accounts) {
+		db.run("INSERT INTO aliases (account_id, alias) VALUES (?, ?)", [
+			id,
+			alias,
+		]);
+	}
 	for (const view of views) {
 		db.run(view);
 	}
@@ -120,10 +134,13 @@ const select = ({ database, sql }: typeof Request.Type): typeof Answer.Type => {
 	return { table: table(statement.columnNames, statement.iterate()) };
 };
 
-/** The answer to the request, with SQLite's own message when it refused the SQL. */
-const answer = (request: typeof Request.Type): typeof Answer.Type => {
+/** The answer to the request over the views of `accounts`, with SQLite's own message when it refused the SQL. */
+const answer = (
+	request: typeof Request.Type,
+	accounts: readonly Account[]
+): typeof Answer.Type => {
 	try {
-		return select(request);
+		return select(request, accounts);
 	} catch (error) {
 		if (error instanceof SQLiteError) {
 			return { refused: error.message };
@@ -138,7 +155,7 @@ export const answerQuery = Effect.gen(function* () {
 		Effect.flatMap(Schema.decodeEffect(Request)),
 		Effect.orDie
 	);
-	const answered = yield* Effect.sync(() => answer(request));
+	const answered = yield* Effect.sync(() => answer(request, [onlyAccount]));
 	const text = yield* Schema.encodeEffect(Answer)(answered).pipe(Effect.orDie);
 	yield* Effect.promise(() => Bun.write(Bun.stdout, text));
 });

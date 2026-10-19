@@ -18,6 +18,7 @@ import {
 	String as Str,
 } from "effect";
 import { McpProtocol, McpSchema, McpServer, Tool } from "effect/ai";
+import { onlyAccount } from "../auth/config.ts";
 import {
 	type CredentialFailed,
 	type GraphRefused,
@@ -210,9 +211,9 @@ const search = Tool.make("search", {
 const sqlQuery = Tool.make("query", {
 	description: `Runs one read-only SQLite SELECT over the local copy of the mailbox, to count, group, join and filter mail instead of reading many search lines. Answers a tab-separated table with a header row: at most 200 rows and 20000 characters, each value but a link cut at 200 characters. Times are UTC ISO 8601 text, such as 2026-10-01T14:00:00Z; is_ and has_ columns and from_me are 1 or 0.
 Views:
-- mail, one row per message: id (the #id), folder (a path such as Inbox/Projects), conversation_id, received_at, sent_at, from_name, from_address, to_addresses, cc_addresses, bcc_addresses, subject, is_read, flag (notFlagged, flagged or complete), categories, importance (low, normal or high), has_attachments, is_draft, from_me (the user sent it), link (opens the message in Outlook on the web). to_addresses, cc_addresses, bcc_addresses and categories are JSON arrays; split them with json_each.
-- folders: path, total (messages), unread.
-- conversations, one row per conversation: conversation_id, messages, unread, mine (messages the user sent), last_id (the id of its newest message), last_link (the link of its newest message).
+- mail, one row per message: id (the #id), account (the alias of the account it is in), folder (a path such as Inbox/Projects), conversation_id, received_at, sent_at, from_name, from_address, to_addresses, cc_addresses, bcc_addresses, subject, is_read, flag (notFlagged, flagged or complete), categories, importance (low, normal or high), has_attachments, is_draft, from_me (the user sent it), link (opens the message in Outlook on the web). to_addresses, cc_addresses, bcc_addresses and categories are JSON arrays; split them with json_each.
+- folders: account, path, total (messages), unread.
+- conversations, one row per conversation: account, conversation_id, messages, unread, mine (messages the user sent), last_id (the id of its newest message), last_link (the link of its newest message).
 Message bodies are not here: search finds words in them, and message reads one.
 Examples:
 SELECT from_address, count(*) AS n FROM mail WHERE folder = 'Inbox' AND received_at >= '2026-10-01' GROUP BY from_address ORDER BY n DESC
@@ -718,7 +719,7 @@ export const tools = Layer.effectDiscard(
 
 		const folderNamed = Effect.fnUntraced(function* (name: string) {
 			const wanted = Str.toLowerCase(name);
-			const folders = yield* store.folders;
+			const folders = yield* store.folders(onlyAccount.id);
 			const byPath = Arr.filter(
 				folders,
 				(folder) => Str.toLowerCase(folder.path) === wanted
@@ -769,7 +770,7 @@ export const tools = Layer.effectDiscard(
 				});
 			}
 			return Arr.some(
-				yield* store.folders,
+				yield* store.folders(onlyAccount.id),
 				(deleted) =>
 					deleted.id === id &&
 					pipe(`${folder.path}/`, Str.startsWith(`${deleted.path}/`))
@@ -807,7 +808,7 @@ export const tools = Layer.effectDiscard(
 			const names = pipe(wanted, Str.split("/"));
 			yield* Effect.forEach(names, checkFolderName, { discard: true });
 			const byPath = new Map(
-				Arr.map(yield* store.folders, (folder) => [
+				Arr.map(yield* store.folders(onlyAccount.id), (folder) => [
 					Str.toLowerCase(folder.path),
 					folder,
 				])
@@ -842,7 +843,7 @@ export const tools = Layer.effectDiscard(
 							name
 						)
 					);
-				const saved = yield* store.saveFolder(made, false);
+				const saved = yield* store.saveFolder(onlyAccount.id, made, false);
 				created.push(saved);
 				place = Option.some({ id: made.id, path: saved });
 			}
@@ -858,7 +859,7 @@ export const tools = Layer.effectDiscard(
 			const renamed = yield* graph
 				.renameFolder(found.id, name)
 				.pipe(unlessTaken(parentOf(found.path), name));
-			return `Renamed ${found.path} to ${yield* store.saveFolder(renamed, false)}.`;
+			return `Renamed ${found.path} to ${yield* store.saveFolder(onlyAccount.id, renamed, false)}.`;
 		});
 
 		const moveFolder = Effect.fnUntraced(function* (
@@ -890,7 +891,7 @@ export const tools = Layer.effectDiscard(
 						found.name
 					)
 				);
-			return `Moved ${found.path} to ${yield* store.saveFolder(moved, false)}.`;
+			return `Moved ${found.path} to ${yield* store.saveFolder(onlyAccount.id, moved, false)}.`;
 		});
 
 		const numbered = (found: Stored) =>
@@ -1036,6 +1037,7 @@ export const tools = Layer.effectDiscard(
 					)
 				);
 				const found = yield* store.search({
+					accountId: onlyAccount.id,
 					folderId: folder,
 					from: Option.fromUndefinedOr(params.from),
 					limit: params.limit ?? defaultLimit,
@@ -1056,7 +1058,10 @@ export const tools = Layer.effectDiscard(
 		yield* registerRead(thread, ({ id }) =>
 			Effect.gen(function* () {
 				const found = yield* stored(id);
-				const conversation = yield* store.conversation(found.conversationId);
+				const conversation = yield* store.conversation(
+					found.accountId,
+					found.conversationId
+				);
 				return threadText(conversation, yield* store.ownAddresses);
 			})
 		);
@@ -1233,7 +1238,7 @@ export const tools = Layer.effectDiscard(
 				const moved = yield* graph
 					.moveFolder(found.id, "deleteditems")
 					.pipe(unlessTaken(Option.some("Deleted Items"), found.name));
-				return `Moved ${found.path} to ${yield* store.saveFolder(moved, false)}, where Outlook can restore it.`;
+				return `Moved ${found.path} to ${yield* store.saveFolder(onlyAccount.id, moved, false)}, where Outlook can restore it.`;
 			})
 		);
 

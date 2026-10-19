@@ -37,6 +37,13 @@ export interface SignInConfig {
 	readonly tenant: string;
 }
 
+/** An account: its id in the store, which files its folders and their mail under it, and the alias it shows as. */
+export const Account = Schema.Struct({ alias: Schema.String, id: Schema.Int });
+export type Account = typeof Account.Type;
+
+/** The one account mx signs in to, which config.json does not name yet. */
+export const onlyAccount: Account = { alias: "main", id: 1 };
+
 /** `config.json`: the client id and the tenant `mx login` saved. */
 const ConfigFile = Schema.Struct({ clientId: ClientId, tenant: Tenant });
 const decodeConfigFile = Schema.decodeEffect(Schema.fromJsonString(ConfigFile));
