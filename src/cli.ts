@@ -6,11 +6,9 @@ import {
 	Console,
 	Duration,
 	Effect,
-	FileSystem,
 	Layer,
 	Logger,
 	Option,
-	Path,
 	Schema,
 	Stream,
 	Terminal,
@@ -41,12 +39,14 @@ import {
 	UpdateFailed,
 } from "./errors.ts";
 import { Installer, type Removal } from "./install.ts";
+import { entryJson, entryText, Log, type Logged } from "./log.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
 import { showProgress } from "./progress.ts";
 import { statusReport } from "./status.ts";
 import { Store } from "./store.ts";
 import { Sync, summary } from "./sync.ts";
+import { InstantFromString, PlainDateFromString } from "./temporal.ts";
 import { Updater } from "./update.ts";
 import { Watch } from "./watch.ts";
 import { ownsConsole } from "./windows.ts";
@@ -78,23 +78,16 @@ const login = Command.make(
 /** How often mx sync checks for a newer release. */
 const updateCheckInterval = Duration.days(1);
 
-/** The background mx sync on Windows has no console, so its log also goes to a file in the state folder. */
-const syncLog =
-	process.platform === "win32"
-		? Layer.unwrap(
-				Effect.gen(function* () {
-					const { state } = yield* Paths;
-					const path = yield* Path.Path;
-					yield* (yield* FileSystem.FileSystem).makeDirectory(state, {
-						recursive: true,
-					});
-					return Logger.layer(
-						[Logger.toFile(Logger.formatSimple, path.join(state, "sync.log"))],
-						{ mergeWithExisting: true }
-					);
-				})
-			)
-		: Layer.empty;
+/**
+ * mx sync's log lines go to the log as sync lines. On Linux they also go to stderr, which journald keeps within its own
+ * size limit. On macOS launchd appends stderr to sync.log and never caps it, so there they go to the log alone, and
+ * sync.log keeps only what mx prints as it fails. On Windows the background mxw.exe has no console.
+ */
+const syncLog = Layer.suspend(() =>
+	Logger.layer([Log.useSync(({ syncLogger }) => syncLogger)], {
+		mergeWithExisting: process.platform !== "darwin",
+	})
+).pipe(Layer.provide(Log.layer));
 
 const sync = Command.make(
 	"sync",
@@ -239,7 +232,7 @@ const uninstall = Command.make(
 ).pipe(
 	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
 	Command.withDescription(
-		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, the installed binary, the client id and the tenant, the mail store, the saved sign-in, the attachment cache and the state folder. It lists them and asks first; --yes removes them without asking."
+		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, the installed binary, the client id and the tenant, the mail store, the saved sign-in, the attachment cache, and the state folder with the tool call log. It lists them and asks first; --yes removes them without asking."
 	)
 );
 
@@ -301,6 +294,103 @@ const status = Command.make("status", {}, () =>
 	)
 );
 
+/** How often `mx log --follow` looks for new rows. */
+const followInterval = Duration.seconds(1);
+
+/** A date in the local time zone, which starts at its midnight, or an instant. */
+const Since = Schema.Union([InstantFromString, PlainDateFromString]);
+
+const log = Command.make(
+	"log",
+	{
+		follow: Flag.Boolean("follow").pipe(
+			Flag.withDefault(false),
+			Flag.withDescription(
+				"After the rows, print each new row as it arrives, until Ctrl+C."
+			)
+		),
+		json: Flag.Boolean("json").pipe(
+			Flag.withDefault(false),
+			Flag.withDescription(
+				"Print each row as one JSON object with every field."
+			)
+		),
+		limit: Flag.Int("limit").pipe(
+			Flag.withSchema(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
+			Flag.withDefault(20),
+			Flag.withDescription(
+				"How many of the newest rows to print, 20 unless given."
+			)
+		),
+		since: Flag.String("since").pipe(
+			Flag.withSchema(Since),
+			Flag.optional,
+			Flag.withDescription(
+				"Only rows from this date or instant on, such as 2026-10-19 or 2026-10-19T14:00:00Z."
+			)
+		),
+		sync: Flag.Boolean("sync").pipe(
+			Flag.withDefault(false),
+			Flag.withDescription("Include the lines mx sync logs.")
+		),
+		tool: Flag.String("tool").pipe(
+			Flag.optional,
+			Flag.withDescription("Only the calls of this tool or prompt.")
+		),
+	},
+	({ follow, json, limit, since, sync: withSync, tool }) =>
+		Effect.gen(function* () {
+			const { read } = yield* Log;
+			const filter = {
+				name: tool,
+				since: Option.map(since, (start) =>
+					start instanceof Temporal.PlainDate
+						? start.toZonedDateTime(Temporal.Now.timeZoneId()).toInstant()
+						: start
+				),
+				sync: withSync,
+			};
+			/** Prints `rows` and answers the id of the last one, or `last` when there are none. */
+			const print = (rows: readonly Logged[], last: Option.Option<number>) =>
+				Effect.as(
+					Effect.forEach(
+						rows,
+						(row) =>
+							Effect.flatMap(
+								json ? entryJson(row) : entryText(row),
+								Console.log
+							),
+						{ discard: true }
+					),
+					Option.orElse(
+						Option.map(Arr.last(rows), ({ id }) => id),
+						() => last
+					)
+				);
+			const printed = yield* Effect.flatMap(
+				read({ ...filter, after: Option.none(), limit: Option.some(limit) }),
+				(rows) => print(rows, Option.none())
+			);
+			if (!follow) {
+				return;
+			}
+			const followFrom = (last: Option.Option<number>): Effect.Effect<never> =>
+				Effect.sleep(followInterval).pipe(
+					Effect.andThen(
+						read({ ...filter, after: last, limit: Option.none() })
+					),
+					Effect.flatMap((rows) => print(rows, last)),
+					Effect.flatMap(followFrom)
+				);
+			return yield* followFrom(printed);
+		})
+).pipe(
+	Command.provide(Log.layer.pipe(Layer.provide(Paths.layer))),
+	Command.withDescription(
+		"Print the log of every tool call and prompt, oldest first: when, which agent, what it sent, what mx answered, whether it failed, and how long it took. --sync includes the lines mx sync logs."
+	)
+);
+
 const reindex = Command.make("reindex", {}, () =>
 	Effect.gen(function* () {
 		const count = yield* (yield* Store).reindex;
@@ -331,6 +421,7 @@ export const mx = Command.make("mx", {}, () =>
 		sync,
 		status,
 		mcp,
+		log,
 		reindex,
 		install,
 		uninstall,

@@ -1,8 +1,11 @@
 import {
 	Array as Arr,
+	Cause,
 	Clock,
 	Context,
+	Duration,
 	Effect,
+	Exit,
 	FileSystem,
 	Layer,
 	Option,
@@ -22,6 +25,7 @@ import {
 } from "../errors.ts";
 import { FlagStatus, type Message, type Recipient } from "../graph/api.ts";
 import { type Compose, Graph, isNotFound } from "../graph/graph.ts";
+import { Log } from "../log.ts";
 import { Paths } from "../paths.ts";
 import { Query } from "../query.ts";
 import { syncWarning } from "../status.ts";
@@ -327,10 +331,58 @@ const textResult = (text: string, isError: boolean) =>
 		isError,
 	});
 
+/** What mx answers a call: its text, and whether the text is an error. */
+interface Answer {
+	readonly isError: boolean;
+	readonly text: string;
+}
+
 /**
- * Registers `tool` with a handler that answers plain text, with the line `note` gives, if any, before it.
- * `McpServer.toolkit` would answer every result as JSON and repeat it as structured content, which Claude Code shows the
- * model in place of the text.
+ * Runs `answer`, mx's answer to one `tools/call` or `prompts/get`, and writes the call to the log as it ends: the agent
+ * that asked, what it sent, and what mx answered or how the call failed. Writing never fails the call, since a call
+ * whose side effect ran must answer: had `send` failed after Microsoft took the mail, the agent would send it again.
+ */
+const logged = <E extends { readonly message: string }>(
+	log: Log["Service"],
+	call: {
+		readonly arguments: unknown;
+		readonly kind: "tool" | "prompt";
+		readonly name: string;
+	},
+	answer: Effect.Effect<Answer, E>
+) =>
+	Effect.gen(function* () {
+		const { clientInfo } = yield* McpSchema.McpRequestContext;
+		const started = yield* Clock.currentTimeMillis;
+		return yield* Effect.onExit(answer, (exit) =>
+			Effect.flatMap(Clock.currentTimeMillis, (ended) =>
+				log.write({
+					...call,
+					agent: Option.map(
+						Option.fromUndefinedOr(clientInfo),
+						({ name, version }) => ({ name, version })
+					),
+					at: Temporal.Instant.fromEpochMilliseconds(started),
+					duration: Duration.millis(ended - started),
+					...Exit.match(exit, {
+						onFailure: (cause) => ({
+							isError: true,
+							result: Option.match(Cause.findErrorOption(cause), {
+								onNone: () => Cause.pretty(cause),
+								onSome: (error) => error.message,
+							}),
+						}),
+						onSuccess: ({ isError, text }) => ({ isError, result: text }),
+					}),
+				})
+			)
+		);
+	});
+
+/**
+ * Registers `tool` with a handler that answers plain text, with the line `note` gives, if any, before it, and logs each
+ * call. `McpServer.toolkit` would answer every result as JSON and repeat it as structured content, which Claude Code
+ * shows the model in place of the text.
  */
 const register = Effect.fnUntraced(function* <
 	P extends Schema.Top & { readonly DecodingServices: never },
@@ -348,34 +400,37 @@ const register = Effect.fnUntraced(function* <
 	note: Effect.Effect<Option.Option<string>> = Effect.succeedNone
 ) {
 	const server = yield* McpServer.McpServer;
+	const log = yield* Log;
 	const decode = Schema.decodeUnknownEffect(tool.parametersSchema);
 	yield* server.addTool({
 		annotations: tool.annotations,
 		handle: (payload: unknown) =>
-			decode(payload ?? {}).pipe(
-				Effect.mapError((error) =>
-					McpSchema.InvalidParams.make({ message: error.message })
-				),
-				Effect.flatMap((params) =>
-					run(params).pipe(
-						Effect.match({
-							onFailure: (error) => ({ isError: true, text: error.message }),
-							onSuccess: (text) => ({ isError: false, text }),
-						})
-					)
-				),
-				Effect.flatMap(({ isError, text }) =>
-					Effect.map(note, (warning) =>
-						textResult(
-							Option.match(warning, {
+			logged(
+				log,
+				{ arguments: payload ?? {}, kind: "tool", name: tool.name },
+				decode(payload ?? {}).pipe(
+					Effect.mapError((error) =>
+						McpSchema.InvalidParams.make({ message: error.message })
+					),
+					Effect.flatMap((params) =>
+						run(params).pipe(
+							Effect.match({
+								onFailure: (error) => ({ isError: true, text: error.message }),
+								onSuccess: (text) => ({ isError: false, text }),
+							})
+						)
+					),
+					Effect.flatMap(({ isError, text }) =>
+						Effect.map(note, (warning) => ({
+							isError,
+							text: Option.match(warning, {
 								onNone: () => text,
 								onSome: (first) => `${first}\n${text}`,
 							}),
-							isError
-						)
+						}))
 					)
 				)
-			),
+			).pipe(Effect.map(({ isError, text }) => textResult(text, isError))),
 		tool: McpSchema.Tool.make({
 			annotations: {
 				destructiveHint: Context.get(tool.annotations, Tool.Destructive),
@@ -424,29 +479,54 @@ const interviewText = `Learn how the user handles mail, so later triage follows 
 4. If you can save memories, or edit an instruction file such as CLAUDE.md or AGENTS.md, save the agreed summary there under the heading "Mail preferences". If you can't, give the user the summary to paste into their agent's custom instructions.
 5. Change nothing in the mailbox during the interview.`;
 
-/** The MCP prompts, registered on the `McpServer` in context. */
-const prompts = Effect.andThen(
-	McpServer.registerPrompt({
-		content: ({ since }) =>
-			Effect.map(since === undefined ? weekAgo : Effect.succeed(since), (day) =>
-				triageText(day.toString())
-			),
-		description: "Review new mail and report what needs the user",
-		name: "triage",
-		parameters: {
-			since: Schema.optionalKey(
-				PlainDateFromString.annotate({
-					description:
-						"The first day of mail to triage, as YYYY-MM-DD; 7 days before today unless given.",
-				})
-			),
-		},
-	}),
-	McpServer.registerPrompt({
-		content: () => Effect.succeed(interviewText),
-		description: "Learn how the user handles mail, so triage follows it",
-		name: "interview",
-	})
+/** Runs `content`, the text of the prompt `name`, logged as a `prompts/get` of it with `params`. */
+const loggedPrompt = (
+	log: Log["Service"],
+	name: string,
+	params: unknown,
+	content: Effect.Effect<string>
+) =>
+	logged(
+		log,
+		{ arguments: params, kind: "prompt", name },
+		Effect.map(content, (text) => ({ isError: false, text }))
+	).pipe(Effect.map(({ text }) => text));
+
+/**
+ * The MCP prompts, registered on the `McpServer` in context. A prompt logs the arguments it decoded, which are the ones
+ * the agent sent; arguments it cannot decode never reach it, and the agent gets the error.
+ */
+const prompts = Effect.flatMap(Log, (log) =>
+	Effect.andThen(
+		McpServer.registerPrompt({
+			content: ({ since }) =>
+				loggedPrompt(
+					log,
+					"triage",
+					{ since },
+					Effect.map(
+						since === undefined ? weekAgo : Effect.succeed(since),
+						(day) => triageText(day.toString())
+					)
+				),
+			description: "Review new mail and report what needs the user",
+			name: "triage",
+			parameters: {
+				since: Schema.optionalKey(
+					PlainDateFromString.annotate({
+						description:
+							"The first day of mail to triage, as YYYY-MM-DD; 7 days before today unless given.",
+					})
+				),
+			},
+		}),
+		McpServer.registerPrompt({
+			content: () =>
+				loggedPrompt(log, "interview", {}, Effect.succeed(interviewText)),
+			description: "Learn how the user handles mail, so triage follows it",
+			name: "interview",
+		})
+	)
 );
 
 /**
@@ -926,7 +1006,13 @@ export const serve = (version: string) =>
 			})
 		),
 		Layer.provide(
-			Layer.mergeAll(Graph.layer, Store.layer, Sync.layer, Query.layer)
+			Layer.mergeAll(
+				Graph.layer,
+				Store.layer,
+				Sync.layer,
+				Query.layer,
+				Log.layer
+			)
 		),
 		Layer.provide(Paths.layer)
 	);

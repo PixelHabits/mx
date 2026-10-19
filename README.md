@@ -158,6 +158,8 @@ mx status
 
 When your mail may be out of date, your agent sees a warning line before its answer, such as `⚠ Mail last synced 3 h ago and mx sync is not running. Run mx status.` If the warning says `Sign-in expired. Run mx login.`, run `mx login`. mx restarts its background sync, and your agents use the new sign-in from their next request.
 
+To see what your agents asked mx and what mx answered, run `mx log`. It prints the last 20 tool calls, oldest first: when, which agent, what it sent, the whole answer, and how long it took. `--tool send` shows one tool, `--since 2026-10-19` starts at a date, `--sync` adds the background sync's own lines, and `--follow` keeps printing new calls as they arrive.
+
 ## Updates
 
 mx updates itself from this repository's GitHub releases. It checks once a day and installs only releases signed with the project's release key. To check now, run `mx update`. If you installed mx from the AUR or built the Arch package, update it that way instead.
@@ -166,6 +168,7 @@ mx updates itself from this repository's GitHub releases. It checks once a day a
 
 - **Your mail stays on your machine.** mx keeps a copy of your mailbox in a local database and sends your mail nowhere but Microsoft. It also contacts GitHub to check for updates and Cloudflare for new-mail alerts.
 - **Your sign-in is stored in your system's secret store:** the Keychain on macOS, Windows Credential Manager, or the Secret Service on Linux. On a Linux machine with no secret store, mx keeps it in a file only your user can read.
+- **mx keeps a log of every tool call**, with what your agent asked and what mx answered, in `log.sqlite` in its state folder. The log is capped at 50 MB, only your user can read it, and it never leaves your machine. `mx uninstall` removes it.
 - **New-mail alerts** come from Microsoft through a temporary Cloudflare tunnel to your machine. They carry only message ids, and mx checks a secret on each one. If the tunnel is unavailable, mx checks for mail every minute instead.
 - **Releases are attested, and updates are signed.** Check a download with `gh attestation verify mx-linux-x64 --repo PixelHabits/mx`. mx installs only updates signed with the project's release key. Code signing for the Windows and macOS binaries is coming soon.
 
@@ -177,7 +180,7 @@ To report a security problem, see [SECURITY.md](SECURITY.md).
 mx uninstall
 ```
 
-mx lists what it will remove and asks first. It removes everything: the program, its entries in your agents' settings, your saved sign-in and your local copy of your mail. On Windows it also takes mx off your PATH. Your mailbox in Microsoft 365 is not touched.
+mx lists what it will remove and asks first. It removes everything: the program, its entries in your agents' settings, your saved sign-in, your local copy of your mail and the log of tool calls. On Windows it also takes mx off your PATH. Your mailbox in Microsoft 365 is not touched.
 
 Quit your agents first. If one is still running mx, uninstall tells you which files to delete after you quit it.
 

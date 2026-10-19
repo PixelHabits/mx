@@ -22,10 +22,12 @@ export class Paths extends Context.Service<
 		/** `mx.sqlite` in the data folder. */
 		readonly database: string;
 		/**
-		 * `$XDG_STATE_HOME/mx`, `~/Library/Logs/mx` or `%LOCALAPPDATA%\mx\state`, for the sign-in file and the sync log. macOS
-		 * always has a Keychain, so there it holds only the log.
+		 * `$XDG_STATE_HOME/mx`, `~/Library/Logs/mx` or `%LOCALAPPDATA%\mx\state`, for the sign-in file and the logs. macOS
+		 * always has a Keychain, so there it holds only the logs.
 		 */
 		readonly state: string;
+		/** `log.sqlite` in the state folder: every tool call, prompt and mx sync line. */
+		readonly log: string;
 		/** The installed binary: `~/.local/bin/mx`, `/usr/bin/mx` from an Arch package, or `%LOCALAPPDATA%\Programs\mx\mx.exe`. */
 		readonly bin: string;
 		/** Whether mx runs from an Arch package, which owns the binary and the sync unit, so pacman installs and updates them. */
@@ -57,6 +59,7 @@ export class Paths extends Context.Service<
 				data: path.join(root, "data"),
 				database: path.join(root, "data", "mx.sqlite"),
 				home,
+				log: path.join(root, "state", "log.sqlite"),
 				packaged: false,
 				state: path.join(root, "state"),
 			});
@@ -75,6 +78,7 @@ export class Paths extends Context.Service<
 				data: path.join(root, "data"),
 				database: path.join(root, "data", "mx.sqlite"),
 				home,
+				log: path.join(library, "Logs", "mx", "log.sqlite"),
 				packaged: false,
 				state: path.join(library, "Logs", "mx"),
 			});
@@ -95,6 +99,7 @@ export class Paths extends Context.Service<
 			data: path.join(data, "mx"),
 			database: path.join(data, "mx", "mx.sqlite"),
 			home,
+			log: path.join(state, "mx", "log.sqlite"),
 			packaged,
 			state: path.join(state, "mx"),
 		});

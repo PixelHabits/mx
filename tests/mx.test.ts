@@ -17,10 +17,12 @@ import {
 	Layer,
 	ManagedRuntime,
 	Option,
+	Order,
 	Path,
 	PlatformError,
 	Queue,
 	Record as Rec,
+	Scheduler,
 	Schema,
 	Terminal,
 } from "effect";
@@ -1034,6 +1036,53 @@ const laterMigration = {
 	),
 };
 
+/** The log every mx process writes its tool calls, prompts and sync lines to, and the most live data it may hold. */
+const logFile = join(stateFolder, "log.sqlite");
+const logCap = 50 * 1024 * 1024;
+
+/** The bytes of the pages SQLite uses in the database `db`, leaving out the free pages it reuses. */
+const liveBytes = (db: Database) =>
+	db
+		.query<{ bytes: number }, []>(
+			"SELECT (page_count - freelist_count) * page_size AS bytes FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()"
+		)
+		.get()?.bytes ?? 0;
+
+/** The rows `mx log --json` prints with `args` on `system`, decoded. */
+const loggedRowsOn =
+	(system: typeof platform) =>
+	(...args: string[]) =>
+		Effect.flatMap(cliOn(system)("log", "--json", ...args), ({ output }) =>
+			Effect.forEach(
+				Arr.filter(lines(output), (line) => line !== ""),
+				parseJson
+			)
+		);
+const loggedRows = loggedRowsOn(platform);
+
+const instantText = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/u;
+
+/** A logged tool call or prompt of the test client in this process, with `fields`. */
+const loggedCall = (fields: Record<string, unknown>) => ({
+	agent: { name: "mx-test", version: "1.0.0" },
+	at: expect.stringMatching(instantText),
+	durationMs: expect.any(Number),
+	id: expect.any(Number),
+	pid: process.pid,
+	...fields,
+});
+
+/** The lines `mx log` prints for one call: its header, then what the agent sent and the whole answer, indented. */
+const loggedText = (header: string, sent: string, answer: string) => {
+	const [first = "", ...rest] = lines(answer);
+	return [
+		header,
+		`  arguments: ${sent}`,
+		`  result: ${first}`,
+		...Arr.map(rest, (line) => `    ${line}`),
+	];
+};
+
 /** The messages Graph holds in every folder now. */
 const mailboxSize = () =>
 	Arr.reduce(
@@ -1074,6 +1123,8 @@ const replyDraftLine = /^#\d+ .* Drafts \| to Carol Example/u;
 const permanent = /permanentDelete/u;
 const runningLine = /^mx sync: running, last heard from \d+ s ago$/u;
 const lastSyncLine = /^Last sync: \d{4}-\d{2}-\d{2} \d{2}:\d{2}, \d+ s ago$/u;
+/** The line mx sync logs as it starts, when push comes up or cannot. */
+const pushModeLine = /^Push is (up through|unavailable:) /u;
 const loopbackUrl = /^http:\/\/127\.0\.0\.1:\d+$/u;
 const loopbackAddress = /^127\.0\.0\.1:\d+$/u;
 const aliceLatestLine =
@@ -1368,6 +1419,297 @@ describe("mx", () => {
 			Effect.provide(TestClock.layer())
 		));
 
+	test("mx log --json shows each tool call and prompt an agent made, with the agent, what it sent, the whole answer, whether it failed and how long it took", () =>
+		Effect.gen(function* () {
+			const counted = yield* tool("query", { sql: "SELECT 'logged' AS call" });
+			const missing = yield* refusal("thread", { id: 999_999 });
+			const interview = yield* (yield* McpClient).prompt("interview");
+			const rows = yield* loggedRows("--limit", "3");
+			expect(rows).toEqual([
+				loggedCall({
+					arguments: { sql: "SELECT 'logged' AS call" },
+					isError: false,
+					kind: "tool",
+					name: "query",
+					result: counted,
+				}),
+				loggedCall({
+					arguments: { id: 999_999 },
+					isError: true,
+					kind: "tool",
+					name: "thread",
+					result: missing,
+				}),
+				loggedCall({
+					arguments: {},
+					isError: false,
+					kind: "prompt",
+					name: "interview",
+					result: interview,
+				}),
+			]);
+			for (const row of rows) {
+				const { durationMs } = row as { durationMs: number };
+				expect(Number.isInteger(durationMs) && durationMs >= 0).toBe(true);
+			}
+		}));
+
+	test("a tool answers even when mx cannot write its log, and mx mcp says on stderr that the log failed", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const { client, stdio } = yield* connect();
+			yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+				// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+				Effect.provide(stdio),
+				Effect.forkScoped
+			);
+			yield* client.request("tools/list");
+			const aside = `${logFile}.aside`;
+			const answer = yield* Effect.acquireUseRelease(
+				// A folder where the log should be is a file SQLite cannot open.
+				Effect.andThen(fs.rename(logFile, aside), fs.makeDirectory(logFile)),
+				() => client.call("query", { sql: "SELECT 'unlogged' AS call" }),
+				() =>
+					Effect.orDie(
+						Effect.andThen(
+							fs.remove(logFile, { recursive: true }),
+							fs.rename(aside, logFile)
+						)
+					)
+			);
+			expect(answer.isError).toBe(false);
+			expect(lines(answer.text).slice(-2)).toEqual(["call", "unlogged"]);
+			const errors = Arr.map(yield* TestConsole.errorLines, String);
+			expect(Arr.filter(errors, (line) => line.includes(logFile))).toHaveLength(
+				1
+			);
+			const [newest] = yield* loggedRows("--limit", "1");
+			expect(newest).not.toMatchObject({
+				arguments: { sql: "SELECT 'unlogged' AS call" },
+			});
+		}).pipe(
+			Effect.scoped,
+			// @effect-diagnostics-next-line strictEffectProvide:off - the machine this mx mcp process and the test share, with one console.
+			Effect.provide(platform, { local: true })
+		));
+
+	test("mx log prints each call in the local time zone with its agent, what it sent and the whole answer, oldest first; --tool, --since and --limit choose the rows", () =>
+		Effect.gen(function* () {
+			yield* tool("query", { sql: "SELECT 'before' AS call" });
+			yield* Effect.promise(() => Bun.sleep(5));
+			const since = Temporal.Now.instant();
+			yield* Effect.promise(() => Bun.sleep(5));
+			const second = yield* tool("query", { sql: "SELECT 'second' AS call" });
+			yield* refusal("thread", { id: 999_999 });
+			const third = yield* tool("query", { sql: "SELECT 'third' AS call" });
+			const headers = Arr.map(
+				yield* loggedRows("--tool", "query", "--limit", "2"),
+				(row) => {
+					const { at, durationMs } = row as { at: string; durationMs: number };
+					const shown = Temporal.Instant.from(at)
+						.toZonedDateTimeISO(Temporal.Now.timeZoneId())
+						.toPlainDateTime()
+						.toString({ smallestUnit: "second" })
+						.replace("T", " ");
+					return `${shown} mx-test 1.0.0 tool query (ok, ${durationMs} ms)`;
+				}
+			);
+			const { output } = yield* cli(
+				"log",
+				"--tool",
+				"query",
+				"--since",
+				since.toString()
+			);
+			expect(lines(output)).toEqual([
+				...loggedText(
+					headers[0] ?? "",
+					`{"sql":"SELECT 'second' AS call"}`,
+					second
+				),
+				...loggedText(
+					headers[1] ?? "",
+					`{"sql":"SELECT 'third' AS call"}`,
+					third
+				),
+			]);
+			const { output: newest } = yield* cli(
+				"log",
+				"--tool",
+				"query",
+				"--limit",
+				"1"
+			);
+			expect(lines(newest)).toEqual(
+				loggedText(headers[1] ?? "", `{"sql":"SELECT 'third' AS call"}`, third)
+			);
+			const tomorrow = Temporal.Now.plainDateISO().add({ days: 1 });
+			const { output: none } = yield* cli(
+				"log",
+				"--since",
+				tomorrow.toString()
+			);
+			expect(none).toBe("");
+		}));
+
+	test("mx log --follow prints each row written after it started", () =>
+		Effect.gen(function* () {
+			const following = yield* Effect.forkChild(
+				runMx(["log", "--follow", "--tool", "query", "--limit", "1"])
+			);
+			const output = Effect.map(TestConsole.logLines, (logged) =>
+				Arr.join(Arr.map(logged, String), "\n")
+			);
+			yield* eventually(
+				"the newest query call",
+				Effect.map(output, (text) => text !== "")
+			);
+			yield* tool("query", { sql: "SELECT 'followed' AS call" });
+			yield* eventually(
+				"the call made while mx log follows",
+				Effect.map(output, (text) =>
+					text.includes(`arguments: {"sql":"SELECT 'followed' AS call"}`)
+				)
+			);
+			yield* Fiber.interrupt(following);
+		}).pipe(
+			// @effect-diagnostics-next-line strictEffectProvide:off - the machine this mx log process and the test share, with one console.
+			Effect.provide(platform, { local: true }),
+			onTestClock
+		));
+
+	test("two mx mcp processes that write the log at the same time both land every row", () =>
+		Effect.gen(function* () {
+			const env = {
+				...environment,
+				// Nothing reaches Microsoft: every request goes to a closed port.
+				HTTPS_PROXY: "http://127.0.0.1:9",
+				...Rec.getSomes({ SystemRoot: systemRoot }),
+			};
+			const fromSource = [process.execPath, "--no-env-file", "src/main.ts"];
+			const clients = yield* Effect.all([
+				spawnClient(fromSource, env),
+				spawnClient(fromSource, env),
+			]);
+			const sent = Arr.flatMap(clients, (client, index) =>
+				Arr.map(Arr.range(1, 10), (n) => ({
+					client,
+					query: `process-${index}-call-${n}`,
+				}))
+			);
+			yield* Effect.forEach(
+				sent,
+				({ client, query }) => client.call("search", { query }),
+				{ concurrency: "unbounded" }
+			);
+			const rows = (yield* loggedRows(
+				"--tool",
+				"search",
+				"--limit",
+				String(sent.length)
+			)) as readonly {
+				arguments: { query: string };
+				isError: boolean;
+				pid: number;
+			}[];
+			expect(
+				Arr.sort(
+					Arr.map(rows, (row) => row.arguments.query),
+					Order.String
+				)
+			).toEqual(
+				Arr.sort(
+					Arr.map(sent, ({ query }) => query),
+					Order.String
+				)
+			);
+			const pids = new Set(Arr.map(rows, (row) => row.pid));
+			expect(pids.size).toBe(2);
+			expect(pids.has(process.pid)).toBe(false);
+		}).pipe(Effect.scoped));
+
+	test("parallel tool calls through one mx mcp each land their row, and no answer waits on another call's write, however often Effect switches between the calls", () =>
+		Effect.gen(function* () {
+			const { client, stdio } = yield* connect();
+			yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+				// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+				Effect.provide(stdio),
+				// Each fiber lets the others run after 16 steps instead of Effect's default 2048, as the scheduler may after any step.
+				Effect.provideService(Scheduler.MaxOpsBeforeYield, 16),
+				Effect.forkScoped
+			);
+			const queries = Arr.map(Arr.range(1, 3), (n) => `parallel-call-${n}`);
+			const started = Temporal.Now.instant();
+			yield* Effect.forEach(
+				queries,
+				(query) =>
+					Effect.flatMap(client.call("search", { query }), ({ isError }) =>
+						isError ? Effect.die(`search ${query} failed.`) : Effect.void
+					),
+				{ concurrency: "unbounded" }
+			);
+			const took = Temporal.Now.instant().since(started);
+			const rows = (yield* loggedRows(
+				"--tool",
+				"search",
+				"--limit",
+				String(queries.length)
+			)) as readonly { arguments: { query: string } }[];
+			expect(
+				Arr.sort(
+					Arr.map(rows, (row) => row.arguments.query),
+					Order.String
+				)
+			).toEqual(Arr.sort(queries, Order.String));
+			// SQLite's busy timeout, which a write waits out while another holds the log.
+			expect(took.total("seconds")).toBeLessThan(5);
+		}).pipe(
+			Effect.scoped,
+			// @effect-diagnostics-next-line strictEffectProvide:off - the machine this mx mcp process and the test share.
+			Effect.provide(platform, { local: true })
+		));
+
+	test("the log keeps at most 50 MB of live data: after a call it deletes the oldest rows until it fits, and the newest rows stay", () =>
+		Effect.gen(function* () {
+			const seeds = 60;
+			const megabyte = "x".repeat(1024 * 1024);
+			yield* withDatabase(logFile, (db) => {
+				const insert = db.prepare(
+					"INSERT INTO entries (at, pid, kind, name, arguments, result, is_error, duration_ms) VALUES (?, 1, 'tool', ?, '{}', ?, 0, 1)"
+				);
+				db.transaction(() => {
+					for (let n = 0; n < seeds; n += 1) {
+						insert.run(
+							Temporal.Now.instant().epochMilliseconds,
+							`seed ${n}`,
+							megabyte
+						);
+					}
+				})();
+				expect(liveBytes(db)).toBeGreaterThan(logCap);
+			});
+			yield* tool("query", { sql: "SELECT 'capped' AS call" });
+			const { live, names } = yield* withDatabase(logFile, (db) => ({
+				live: liveBytes(db),
+				names: Arr.map(
+					db
+						.query<{ name: string }, []>(
+							"SELECT name FROM entries WHERE kind != 'sync' ORDER BY id"
+						)
+						.all(),
+					(row) => row.name
+				),
+			}));
+			expect(live).toBeLessThanOrEqual(logCap);
+			const kept = names.slice(0, -1);
+			expect(names.at(-1)).toBe("query");
+			expect(kept.length).toBeGreaterThan(0);
+			expect(kept.length).toBeLessThan(seeds);
+			expect(kept).toEqual(
+				Arr.map(Arr.range(seeds - kept.length, seeds - 1), (n) => `seed ${n}`)
+			);
+		}));
+
 	test(
 		"the binary that bun run build cross-compiles for this system starts, answers --version, lists the eleven tools over MCP and answers a query",
 		() =>
@@ -1398,7 +1740,7 @@ describe("mx", () => {
 				);
 				expect(code).toBe(0);
 				expect(answer.trim()).toBe(`mx v${running}`);
-				const client = yield* spawnClient(built.file, env);
+				const client = yield* spawnClient([built.file], env);
 				const { tools: listed } = (yield* client.request("tools/list")) as {
 					tools: { name: string }[];
 				};
@@ -1844,6 +2186,49 @@ describe("mx", () => {
 				"Last error: none",
 			]);
 		}));
+
+	test("mx sync writes each line it logs to the log as it logs it, where mx log --sync shows it, and on Windows it writes no sync.log", () =>
+		onWindows(
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const syncRows = Effect.map(
+					loggedRows("--sync", "--limit", "100"),
+					(rows) =>
+						Arr.filter(rows, (row) => (row as { kind: string }).kind === "sync")
+				);
+				const service = yield* Effect.forkChild(
+					cli("sync").pipe(
+						// @effect-diagnostics-next-line strictEffectProvide:off - a clock that stands still, so a line mx sync held back for a while would stay out of the log.
+						Effect.provide(TestClock.layer())
+					)
+				);
+				yield* eventually(
+					"the push line in the log while mx sync runs",
+					Effect.map(
+						syncRows,
+						Arr.some((row) =>
+							pushModeLine.test((row as { message: string }).message)
+						)
+					)
+				);
+				expect(yield* syncRows).toContainEqual({
+					at: expect.stringMatching(instantText),
+					id: expect.any(Number),
+					kind: "sync",
+					level: "Info",
+					message: expect.stringMatching(pushModeLine),
+					pid: process.pid,
+				});
+				yield* Fiber.interrupt(service);
+				expect(
+					Arr.filter(
+						yield* loggedRows("--limit", "100"),
+						(row) => (row as { kind: string }).kind === "sync"
+					)
+				).toEqual([]);
+				expect(yield* fs.exists(join(local, "state", "sync.log"))).toBe(false);
+			})
+		));
 
 	test("mx sync --once stores every mail folder, child folders included, through Graph delta with text bodies and immutable ids", () =>
 		Effect.gen(function* () {

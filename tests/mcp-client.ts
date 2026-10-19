@@ -248,12 +248,19 @@ export const connect = Effect.fnUntraced(function* (version = modern) {
 	};
 });
 
-/** A client of `exe mcp`, started as its own process with `env`, which the scope stops. */
-export const spawnClient = (exe: string, env: Record<string, string>) =>
+/**
+ * A client of `<command> mcp`, started as its own process with `env` in the repository's folder, which the scope
+ * stops. `command` is a binary, or Bun and the source of mx.
+ */
+export const spawnClient = (
+	command: readonly string[],
+	env: Record<string, string>
+) =>
 	Effect.gen(function* () {
 		const server = yield* Effect.acquireRelease(
 			Effect.sync(() =>
-				Bun.spawn([exe, "mcp"], {
+				Bun.spawn([...command, "mcp"], {
+					cwd: `${import.meta.dir}/..`,
 					env,
 					stderr: "inherit",
 					stdin: "pipe",

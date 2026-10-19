@@ -1007,9 +1007,9 @@ export class Installer extends Context.Service<
 					yield* removeFile("the attachment cache", cache),
 					yield* removeFile(
 						onSystem({
-							darwin: "the log folder",
-							linux: "the state folder",
-							win32: "the state folder",
+							darwin: "the log folder with the tool call log",
+							linux: "the state folder with the tool call log",
+							win32: "the state folder with the tool call log",
 						}),
 						state
 					),
