@@ -2202,9 +2202,12 @@ describe("mx", () => {
 					(rows) =>
 						Arr.filter(rows, (row) => (row as { kind: string }).kind === "sync")
 				);
+				// The clock stands still at the present, so a line mx sync held back for a while would stay out of the log,
+				// and the heartbeat it records is current for the tests after it.
 				const service = yield* Effect.forkChild(
-					cli("sync").pipe(
-						// @effect-diagnostics-next-line strictEffectProvide:off - a clock that stands still, so a line mx sync held back for a while would stay out of the log.
+					TestClock.setTime(Temporal.Now.instant().epochMilliseconds).pipe(
+						Effect.andThen(cli("sync")),
+						// @effect-diagnostics-next-line strictEffectProvide:off - the clock that stands still, above.
 						Effect.provide(TestClock.layer())
 					)
 				);
