@@ -6,14 +6,16 @@ import {
 	Effect,
 	Layer,
 	Option,
+	pipe,
 	Redacted,
 	Schema,
+	String as Str,
 	Stream,
 	SynchronizedRef,
 	type Terminal,
 } from "effect";
 import { TerminalCapabilities } from "effect/cli";
-import { Hex } from "effect/encoding";
+import { Base64Url } from "effect/encoding";
 import {
 	HttpClient,
 	type HttpClientError,
@@ -29,12 +31,15 @@ import {
 	SignInFailed,
 } from "../errors.ts";
 import { policy } from "../http-policy.ts";
-import type { SignInConfig } from "./config.ts";
+import { AccountId, type Identity, type SignInConfig } from "./config.ts";
 import { Credentials, type SignIn } from "./credentials.ts";
 
-/** Delegated mail read, write and send, and a refresh token. */
-const scope =
+/** Delegated mail read, write and send, and a refresh token: what every refresh asks for. */
+const graphScope =
 	"https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send offline_access";
+
+/** The Graph scopes and the OpenID ones, whose id token names who signed in, with no Graph permission of its own. */
+const identityScope = `${graphScope} openid email profile`;
 
 /** The sign-in endpoints of `tenant`; at `organizations`, Entra finds the user's tenant from the account that signs in. */
 const authority = (tenant: string) =>
@@ -69,6 +74,22 @@ const Tokens = Schema.Struct({
 	refresh_token: Schema.RedactedFromValue(Schema.String),
 });
 
+/** The tokens of a request that asked for the OpenID scopes, with the id token that names who signed in. */
+const IdentifiedTokens = Schema.Struct({
+	...Tokens.fields,
+	id_token: Schema.String,
+});
+
+/** The claims mx reads from an id token: the address, as `email` or else `preferred_username`, the tenant and the user. */
+const Claims = Schema.fromJsonString(
+	Schema.Struct({
+		email: Schema.optionalKey(Schema.String),
+		oid: Schema.String,
+		preferred_username: Schema.optionalKey(Schema.String),
+		tid: Schema.String,
+	})
+);
+
 const OAuthError = Schema.Struct({ error: Schema.String });
 
 /** The token endpoint's answer: the decoded body on a 2xx, or its status and OAuth error code. */
@@ -96,6 +117,99 @@ const refusedToken = (status: number, code: string | undefined) =>
 		status,
 	});
 
+/**
+ * Who the id token names. mx reads its payload without checking its signature: it came straight from the token endpoint
+ * over TLS.
+ */
+const identityOf = (idToken: string) =>
+	Effect.fromResult(
+		Base64Url.decodeString(pipe(idToken, Str.split("."))[1] ?? "")
+	).pipe(
+		Effect.flatMap(Schema.decodeEffect(Claims)),
+		Effect.map(({ email, oid, preferred_username, tid }): Identity => {
+			const address = email ?? preferred_username;
+			return { ...(address === undefined ? {} : { address }), oid, tid };
+		}),
+		Effect.mapError(() =>
+			MicrosoftUnavailable.make({
+				message: "The token endpoint answered an id token mx cannot read.",
+				reason: "token",
+			})
+		)
+	);
+
+/** A new sign-in: its refresh token, and who signed in. */
+export interface SignedIn {
+	readonly identity: Identity;
+	readonly refreshToken: Redacted.Redacted<string>;
+}
+
+/** The token endpoint's answer to `form` posted to `url`: the body decoded with `schema` on a 2xx, or the status and OAuth error code. */
+type Post = <S extends Schema.Top>(
+	url: string,
+	form: Record<string, string>,
+	schema: S
+) => Effect.Effect<
+	Answer<S["Type"]>,
+	MicrosoftUnavailable,
+	S["DecodingServices"]
+>;
+
+/** Posts to Microsoft's token endpoint; every token request is safe to repeat, since Entra keeps a used refresh token valid. */
+const tokenEndpoint = Effect.map(HttpClient.HttpClient, (client): Post => {
+	const transport = policy(client, { retryable: () => true });
+	const answer = <S extends Schema.Top>(
+		response: HttpClientResponse.HttpClientResponse,
+		schema: S
+	): Effect.Effect<
+		Answer<S["Type"]>,
+		MicrosoftUnavailable,
+		S["DecodingServices"]
+	> =>
+		Effect.gen(function* () {
+			const { status } = response;
+			if (status >= 200 && status < 300) {
+				const value = yield* HttpClientResponse.schemaBodyJson(schema)(
+					response
+				).pipe(Effect.mapError(() => refusedToken(status, undefined)));
+				return { _tag: "Answered", value } as const;
+			}
+			const code = yield* HttpClientResponse.schemaBodyJson(OAuthError)(
+				response
+			).pipe(
+				Effect.map(({ error }) => error),
+				Effect.option
+			);
+			return {
+				_tag: "Refused",
+				code: Option.getOrUndefined(code),
+				status,
+			} as const;
+		});
+	return (url, form, schema) =>
+		transport
+			.execute(
+				HttpClientRequest.post(url).pipe(
+					HttpClientRequest.acceptJson,
+					HttpClientRequest.bodyUrlParams(form)
+				)
+			)
+			.pipe(
+				Effect.flatMap((response) => answer(response, schema)),
+				Effect.catchTag("HttpClientError", (error) =>
+					Effect.fail(unavailable(error))
+				)
+			);
+});
+
+/** A refresh Microsoft refused: only a new sign-in helps after `invalid_grant` or `interaction_required`. */
+const refusedRefresh = (status: number, code: string | undefined) =>
+	code !== undefined && signInAgain.has(code)
+		? LoginRequired.make({
+				reason: `Microsoft refused the saved sign-in (${code}).`,
+			})
+		: refusedToken(status, code);
+
 /** A cached access token, the id of the sign-in it came from, and the instant mx stops using it. */
 interface Cached {
 	readonly expiresAt: number;
@@ -104,29 +218,14 @@ interface Cached {
 }
 
 /**
- * Microsoft sign-in for the mailbox: the device-code flow that saves a sign-in, and access tokens for Graph, refreshed
- * from the saved sign-in. Entra returns a new refresh token on each refresh and does not revoke the old one, so two
- * processes refresh on their own and the last write wins. Each request reads the saved sign-in, so a process that runs
- * while `mx login` signs in again uses the new sign-in from its next request.
+ * Access tokens for Graph, refreshed from the saved sign-in of the account in `AccountId`, with the client id and the
+ * tenant that sign-in was issued for. Entra returns a new refresh token on each refresh and does not revoke the old one,
+ * so two processes refresh on their own and the last write wins. Each request reads the saved sign-in, so a process
+ * that runs while `mx login` signs the account in again uses the new sign-in from its next request.
  */
 export class Auth extends Context.Service<
 	Auth,
 	{
-		/**
-		 * Saves the client id and the tenant, and asks the tenant for a device code; `complete` waits for the user to enter
-		 * it and saves the new sign-in.
-		 */
-		readonly startLogin: (config: SignInConfig) => Effect.Effect<
-			{
-				readonly complete: Effect.Effect<
-					void,
-					SignInFailed | MicrosoftUnavailable | CredentialFailed
-				>;
-				readonly url: string;
-				readonly userCode: string;
-			},
-			MicrosoftUnavailable | CredentialFailed
-		>;
 		/**
 		 * Sends each request with a current access token. A 401 replaces the token and sends the request once more.
 		 */
@@ -141,135 +240,9 @@ export class Auth extends Context.Service<
 	static readonly layerNoDeps = Layer.effect(
 		Auth,
 		Effect.gen(function* () {
+			const account = yield* AccountId;
 			const credentials = yield* Credentials;
-			/** Every token request is safe to repeat: Entra keeps a used refresh token valid. */
-			const transport = policy(yield* HttpClient.HttpClient, {
-				retryable: () => true,
-			});
-			/** The token endpoint's answer: the body decoded with `schema` on a 2xx, or the status and OAuth error code. */
-			const answer = <S extends Schema.Top>(
-				response: HttpClientResponse.HttpClientResponse,
-				schema: S
-			): Effect.Effect<
-				Answer<S["Type"]>,
-				MicrosoftUnavailable,
-				S["DecodingServices"]
-			> =>
-				Effect.gen(function* () {
-					const { status } = response;
-					if (status >= 200 && status < 300) {
-						const value = yield* HttpClientResponse.schemaBodyJson(schema)(
-							response
-						).pipe(Effect.mapError(() => refusedToken(status, undefined)));
-						return { _tag: "Answered", value } as const;
-					}
-					const code = yield* HttpClientResponse.schemaBodyJson(OAuthError)(
-						response
-					).pipe(
-						Effect.map(({ error }) => error),
-						Effect.option
-					);
-					return {
-						_tag: "Refused",
-						code: Option.getOrUndefined(code),
-						status,
-					} as const;
-				});
-			const post = <S extends Schema.Top>(
-				url: string,
-				form: Record<string, string>,
-				schema: S
-			) =>
-				transport
-					.execute(
-						HttpClientRequest.post(url).pipe(
-							HttpClientRequest.acceptJson,
-							HttpClientRequest.bodyUrlParams(form)
-						)
-					)
-					.pipe(
-						Effect.flatMap((response) => answer(response, schema)),
-						Effect.catchTag("HttpClientError", (error) =>
-							Effect.fail(unavailable(error))
-						)
-					);
-
-			const startLogin = Effect.fn("Auth.startLogin")(function* (
-				config: SignInConfig
-			) {
-				const { clientId, tenant } = config;
-				yield* credentials.use(config);
-				const id = Hex.encode(crypto.getRandomValues(new Uint8Array(16)));
-				const started = yield* post(
-					`${authority(tenant)}/devicecode`,
-					{ client_id: clientId, scope },
-					DeviceCode
-				);
-				if (started._tag === "Refused") {
-					return yield* refusedToken(started.status, started.code);
-				}
-				const code = started.value;
-				const poll = (
-					interval: Duration.Duration
-				): Effect.Effect<
-					typeof Tokens.Type,
-					SignInFailed | MicrosoftUnavailable
-				> =>
-					Effect.sleep(interval).pipe(
-						Effect.andThen(
-							post(
-								`${authority(tenant)}/token`,
-								{
-									client_id: clientId,
-									device_code: Redacted.value(code.device_code),
-									grant_type: deviceCodeGrant,
-								},
-								Tokens
-							)
-						),
-						Effect.flatMap((polled) => {
-							if (polled._tag === "Answered") {
-								return Effect.succeed(polled.value);
-							}
-							if (polled.code === "authorization_pending") {
-								return poll(interval);
-							}
-							if (polled.code === "slow_down") {
-								return poll(Duration.sum(interval, defaultPollInterval));
-							}
-							return Effect.fail(
-								polled.code === undefined
-									? refusedToken(polled.status, undefined)
-									: SignInFailed.make({ code: polled.code })
-							);
-						})
-					);
-				const complete = poll(
-					code.interval === undefined
-						? defaultPollInterval
-						: Duration.seconds(code.interval)
-				).pipe(
-					Effect.timeoutOrElse({
-						duration: Duration.seconds(code.expires_in),
-						orElse: () =>
-							Effect.fail(SignInFailed.make({ code: "expired_token" })),
-					}),
-					Effect.flatMap(({ refresh_token }) =>
-						credentials.write({
-							clientId,
-							id,
-							refreshToken: refresh_token,
-							tenant,
-						})
-					),
-					Effect.withSpan("Auth.login")
-				);
-				return {
-					complete,
-					url: code.verification_uri,
-					userCode: code.user_code,
-				};
-			});
+			const post = yield* tokenEndpoint;
 
 			/**
 			 * A new access token for the `saved` sign-in, with its rotated refresh token saved. When `mx login` saved another
@@ -288,24 +261,19 @@ export class Auth extends Context.Service<
 							client_id: saved.clientId,
 							grant_type: "refresh_token",
 							refresh_token: Redacted.value(saved.refreshToken),
-							scope,
+							scope: graphScope,
 						},
 						Tokens
 					);
 					if (refreshed._tag === "Refused") {
-						return yield* refreshed.code !== undefined &&
-						signInAgain.has(refreshed.code)
-							? LoginRequired.make({
-									reason: `Microsoft refused the saved sign-in (${refreshed.code}).`,
-								})
-							: refusedToken(refreshed.status, refreshed.code);
+						return yield* refusedRefresh(refreshed.status, refreshed.code);
 					}
-					const latest = yield* credentials.read;
+					const latest = yield* credentials.read(account);
 					if (latest.id !== saved.id) {
 						return yield* refresh(latest);
 					}
 					const tokens = refreshed.value;
-					yield* credentials.write({
+					yield* credentials.write(account, {
 						...saved,
 						refreshToken: tokens.refresh_token,
 					});
@@ -334,7 +302,7 @@ export class Auth extends Context.Service<
 			) =>
 				SynchronizedRef.modifyEffect(cache, (cached) =>
 					Effect.gen(function* () {
-						const saved = yield* credentials.read;
+						const saved = yield* credentials.read(account);
 						const now = yield* Clock.currentTimeMillis;
 						if (
 							Option.isSome(cached) &&
@@ -366,7 +334,7 @@ export class Auth extends Context.Service<
 					})
 				);
 
-			return Auth.of({ authorize, startLogin });
+			return Auth.of({ authorize });
 		})
 	);
 
@@ -375,25 +343,159 @@ export class Auth extends Context.Service<
 	);
 }
 
+/** A device-code sign-in under way: the code to enter at the URL, and `complete`, which waits for the user to enter it. */
+export interface StartedLogin<E> {
+	readonly complete: Effect.Effect<void, E>;
+	readonly url: string;
+	readonly userCode: string;
+}
+
 /**
- * The device-code sign-in with `config`: prints the URL and the code, waits for the user, and saves the sign-in. On a
- * terminal, as GitHub CLI does, it copies the code to the clipboard and opens the URL in the browser when the user
- * presses Enter. The sign-in finishes whenever the code is entered, also on another device with no key pressed, and
- * input that ends before Enter, as Esc and Ctrl+C end it in raw mode, interrupts it as Ctrl+C does anywhere else.
+ * Microsoft's sign-in for any account: the device-code flow, and the refresh that learns who signed in to a saved
+ * sign-in. Both ask for the OpenID scopes along with Graph's, so the id token names who signed in.
  */
-export const signIn = Effect.fnUntraced(function* (
+export class Login extends Context.Service<
+	Login,
 	{
-		auth,
+		/** Asks the tenant for a device code; `complete` waits for the user to enter it and answers the new sign-in. */
+		readonly start: (config: SignInConfig) => Effect.Effect<
+			{
+				readonly complete: Effect.Effect<
+					SignedIn,
+					SignInFailed | MicrosoftUnavailable
+				>;
+				readonly url: string;
+				readonly userCode: string;
+			},
+			MicrosoftUnavailable
+		>;
+		/** Refreshes `signIn` with the OpenID scopes: who signed in, and the rotated refresh token. */
+		readonly identify: (
+			signIn: SignIn
+		) => Effect.Effect<SignedIn, LoginRequired | MicrosoftUnavailable>;
+	}
+>()("mx/auth/auth/Login") {
+	static readonly layer = Layer.effect(
+		Login,
+		Effect.gen(function* () {
+			const post = yield* tokenEndpoint;
+
+			const signedIn = ({
+				id_token,
+				refresh_token,
+			}: typeof IdentifiedTokens.Type) =>
+				Effect.map(
+					identityOf(id_token),
+					(identity): SignedIn => ({ identity, refreshToken: refresh_token })
+				);
+
+			const start = Effect.fn("Login.start")(function* ({
+				clientId,
+				tenant,
+			}: SignInConfig) {
+				const started = yield* post(
+					`${authority(tenant)}/devicecode`,
+					{ client_id: clientId, scope: identityScope },
+					DeviceCode
+				);
+				if (started._tag === "Refused") {
+					return yield* refusedToken(started.status, started.code);
+				}
+				const code = started.value;
+				const poll = (
+					interval: Duration.Duration
+				): Effect.Effect<
+					typeof IdentifiedTokens.Type,
+					SignInFailed | MicrosoftUnavailable
+				> =>
+					Effect.sleep(interval).pipe(
+						Effect.andThen(
+							post(
+								`${authority(tenant)}/token`,
+								{
+									client_id: clientId,
+									device_code: Redacted.value(code.device_code),
+									grant_type: deviceCodeGrant,
+								},
+								IdentifiedTokens
+							)
+						),
+						Effect.flatMap((polled) => {
+							if (polled._tag === "Answered") {
+								return Effect.succeed(polled.value);
+							}
+							if (polled.code === "authorization_pending") {
+								return poll(interval);
+							}
+							if (polled.code === "slow_down") {
+								return poll(Duration.sum(interval, defaultPollInterval));
+							}
+							return Effect.fail(
+								polled.code === undefined
+									? refusedToken(polled.status, undefined)
+									: SignInFailed.make({ code: polled.code })
+							);
+						})
+					);
+				const complete = poll(
+					code.interval === undefined
+						? defaultPollInterval
+						: Duration.seconds(code.interval)
+				).pipe(
+					Effect.timeoutOrElse({
+						duration: Duration.seconds(code.expires_in),
+						orElse: () =>
+							Effect.fail(SignInFailed.make({ code: "expired_token" })),
+					}),
+					Effect.flatMap(signedIn),
+					Effect.withSpan("Login.complete")
+				);
+				return {
+					complete,
+					url: code.verification_uri,
+					userCode: code.user_code,
+				};
+			});
+
+			const identify = Effect.fn("Login.identify")(function* (saved: SignIn) {
+				const refreshed = yield* post(
+					`${authority(saved.tenant)}/token`,
+					{
+						client_id: saved.clientId,
+						grant_type: "refresh_token",
+						refresh_token: Redacted.value(saved.refreshToken),
+						scope: identityScope,
+					},
+					IdentifiedTokens
+				);
+				if (refreshed._tag === "Refused") {
+					return yield* refusedRefresh(refreshed.status, refreshed.code);
+				}
+				return yield* signedIn(refreshed.value);
+			});
+
+			return Login.of({ identify, start });
+		})
+	);
+}
+
+/**
+ * The device-code sign-in `started`: prints the URL and the code, and waits for the user and for `complete`, which saves
+ * the sign-in. On a terminal, as GitHub CLI does, it copies the code to the clipboard and opens the URL in the browser
+ * when the user presses Enter. The sign-in finishes whenever the code is entered, also on another device with no key
+ * pressed, and input that ends before Enter, as Esc and Ctrl+C end it in raw mode, interrupts it as Ctrl+C does anywhere
+ * else.
+ */
+export const signIn = Effect.fnUntraced(function* <E>(
+	{
 		spawner,
 		terminal,
 	}: {
-		readonly auth: Auth["Service"];
 		readonly spawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
 		readonly terminal: Terminal.Terminal;
 	},
-	config: SignInConfig
+	{ complete, url, userCode }: StartedLogin<E>
 ) {
-	const { complete, url, userCode } = yield* auth.startLogin(config);
 	if ((yield* TerminalCapabilities.TerminalCapabilities).canPrompt) {
 		const copied = yield* copyToClipboard(spawner, userCode);
 		yield* Console.log(

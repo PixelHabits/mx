@@ -12,7 +12,7 @@ import {
 	Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
-import { type Account, onlyAccount } from "./auth/config.ts";
+import { AccountsFile, fallbackAlias } from "./auth/config.ts";
 import { Refused } from "./errors.ts";
 import { isOutlookLink } from "./outlook.ts";
 import { Paths } from "./paths.ts";
@@ -96,6 +96,15 @@ const table = (
 	return lines.length === 1 ? `${header}\n(no rows)` : Arr.join(lines, "\n");
 };
 
+/** An account the views show, by its id in the store, with the alias config.json gives it. */
+interface Aliased {
+	readonly alias: string;
+	readonly id: number;
+}
+
+/** Without config.json mx names no account, and the mail a store holds is account 1's, which shows as main. */
+const unnamed: readonly Aliased[] = [{ alias: fallbackAlias, id: 1 }];
+
 /**
  * Selects `sql` from the store at `database`, opened read-only, so SQLite refuses every write; SQLite's refusal throws.
  * mx's SELECT around the SQL makes SQLite's parser refuse anything but one SELECT. Bun prepares only a statement's
@@ -104,7 +113,7 @@ const table = (
  */
 const select = (
 	{ database, sql }: typeof Request.Type,
-	accounts: readonly Account[]
+	accounts: readonly Aliased[]
 ): typeof Answer.Type => {
 	const db = new Database(database, { readonly: true });
 	db.run(aliasesTable);
@@ -137,7 +146,7 @@ const select = (
 /** The answer to the request over the views of `accounts`, with SQLite's own message when it refused the SQL. */
 const answer = (
 	request: typeof Request.Type,
-	accounts: readonly Account[]
+	accounts: readonly Aliased[]
 ): typeof Answer.Type => {
 	try {
 		return select(request, accounts);
@@ -149,13 +158,26 @@ const answer = (
 	}
 };
 
-/** `mx query-worker`: reads a request on stdin, and writes its answer on stdout, SQLite's error verbatim when it refused. */
+/**
+ * `mx query-worker`: reads a request on stdin, and writes its answer on stdout, SQLite's error verbatim when it refused.
+ * The aliases come from config.json as it is now, so the views show an alias changed after mx mcp started.
+ */
 export const answerQuery = Effect.gen(function* () {
 	const request = yield* Effect.promise(() => Bun.stdin.text()).pipe(
 		Effect.flatMap(Schema.decodeEffect(Request)),
 		Effect.orDie
 	);
-	const answered = yield* Effect.sync(() => answer(request, [onlyAccount]));
+	const answered = yield* (yield* AccountsFile).read.pipe(
+		Effect.map((accounts) =>
+			answer(
+				request,
+				Arr.isReadonlyArrayNonEmpty(accounts) ? accounts : unnamed
+			)
+		),
+		Effect.catchTag("CredentialFailed", ({ message }) =>
+			Effect.succeed({ refused: message })
+		)
+	);
 	const text = yield* Schema.encodeEffect(Answer)(answered).pipe(Effect.orDie);
 	yield* Effect.promise(() => Bun.write(Bun.stdout, text));
 });

@@ -10,7 +10,7 @@ import {
 	Semaphore,
 	SynchronizedRef,
 } from "effect";
-import { onlyAccount } from "./auth/config.ts";
+import { AccountId } from "./auth/config.ts";
 import type { GraphRefused, GraphUnreadable } from "./errors.ts";
 import {
 	Changed,
@@ -175,7 +175,7 @@ export class Sync extends Context.Service<
 			const graph = yield* Graph;
 			const store = yield* Store;
 			/** The account whose mailbox `graph` reads, under which the store files every folder this Sync lists. */
-			const accountId = onlyAccount.id;
+			const accountId = yield* AccountId;
 			const oneAtATime = yield* Semaphore.make(1);
 
 			/** Adds the folder from Graph when the store does not know it yet. */

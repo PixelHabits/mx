@@ -18,7 +18,7 @@ import {
 	String as Str,
 } from "effect";
 import { McpProtocol, McpSchema, McpServer, Tool } from "effect/ai";
-import { onlyAccount } from "../auth/config.ts";
+import { AccountId } from "../auth/config.ts";
 import {
 	type CredentialFailed,
 	type GraphRefused,
@@ -637,6 +637,8 @@ export const tools = Layer.effectDiscard(
 		const store = yield* Store;
 		const graph = yield* Graph;
 		const sync = yield* Sync;
+		/** The account whose folders the folder tools change and whose mail search finds. */
+		const accountId = yield* AccountId;
 		const queries = yield* Query;
 		const fs = yield* FileSystem.FileSystem;
 		const path = yield* Path.Path;
@@ -719,7 +721,7 @@ export const tools = Layer.effectDiscard(
 
 		const folderNamed = Effect.fnUntraced(function* (name: string) {
 			const wanted = Str.toLowerCase(name);
-			const folders = yield* store.folders(onlyAccount.id);
+			const folders = yield* store.folders(accountId);
 			const byPath = Arr.filter(
 				folders,
 				(folder) => Str.toLowerCase(folder.path) === wanted
@@ -770,7 +772,7 @@ export const tools = Layer.effectDiscard(
 				});
 			}
 			return Arr.some(
-				yield* store.folders(onlyAccount.id),
+				yield* store.folders(accountId),
 				(deleted) =>
 					deleted.id === id &&
 					pipe(`${folder.path}/`, Str.startsWith(`${deleted.path}/`))
@@ -808,7 +810,7 @@ export const tools = Layer.effectDiscard(
 			const names = pipe(wanted, Str.split("/"));
 			yield* Effect.forEach(names, checkFolderName, { discard: true });
 			const byPath = new Map(
-				Arr.map(yield* store.folders(onlyAccount.id), (folder) => [
+				Arr.map(yield* store.folders(accountId), (folder) => [
 					Str.toLowerCase(folder.path),
 					folder,
 				])
@@ -843,7 +845,7 @@ export const tools = Layer.effectDiscard(
 							name
 						)
 					);
-				const saved = yield* store.saveFolder(onlyAccount.id, made, false);
+				const saved = yield* store.saveFolder(accountId, made, false);
 				created.push(saved);
 				place = Option.some({ id: made.id, path: saved });
 			}
@@ -859,7 +861,7 @@ export const tools = Layer.effectDiscard(
 			const renamed = yield* graph
 				.renameFolder(found.id, name)
 				.pipe(unlessTaken(parentOf(found.path), name));
-			return `Renamed ${found.path} to ${yield* store.saveFolder(onlyAccount.id, renamed, false)}.`;
+			return `Renamed ${found.path} to ${yield* store.saveFolder(accountId, renamed, false)}.`;
 		});
 
 		const moveFolder = Effect.fnUntraced(function* (
@@ -891,7 +893,7 @@ export const tools = Layer.effectDiscard(
 						found.name
 					)
 				);
-			return `Moved ${found.path} to ${yield* store.saveFolder(onlyAccount.id, moved, false)}.`;
+			return `Moved ${found.path} to ${yield* store.saveFolder(accountId, moved, false)}.`;
 		});
 
 		const numbered = (found: Stored) =>
@@ -1037,7 +1039,7 @@ export const tools = Layer.effectDiscard(
 					)
 				);
 				const found = yield* store.search({
-					accountId: onlyAccount.id,
+					accountId,
 					folderId: folder,
 					from: Option.fromUndefinedOr(params.from),
 					limit: params.limit ?? defaultLimit,
@@ -1238,7 +1240,7 @@ export const tools = Layer.effectDiscard(
 				const moved = yield* graph
 					.moveFolder(found.id, "deleteditems")
 					.pipe(unlessTaken(Option.some("Deleted Items"), found.name));
-				return `Moved ${found.path} to ${yield* store.saveFolder(onlyAccount.id, moved, false)}, where Outlook can restore it.`;
+				return `Moved ${found.path} to ${yield* store.saveFolder(accountId, moved, false)}, where Outlook can restore it.`;
 			})
 		);
 
@@ -1289,5 +1291,5 @@ export const serve = (version: string) =>
 				Log.layer
 			)
 		),
-		Layer.provide(Paths.layer)
+		Layer.provide(Layer.mergeAll(Paths.layer, AccountId.first))
 	);

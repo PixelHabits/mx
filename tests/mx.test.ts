@@ -33,9 +33,7 @@ import type { ChildProcess } from "effect/process";
 import { SqlClient } from "effect/sql";
 import { TestClock, TestConsole } from "effect/testing";
 import packageJson from "../package.json" with { type: "json" };
-import { savedConfig } from "../src/auth/config.ts";
 import { mx, run as runMx } from "../src/cli.ts";
-import { Paths } from "../src/paths.ts";
 import { migrate, migrations } from "../src/store/migrations.ts";
 import {
 	deleteAfterExit,
@@ -160,20 +158,18 @@ const unconfiguredEnvironment = Rec.remove(
 
 /**
  * What every mx process runs on: Microsoft and the internet, Bun with faked child processes, a console that keeps its
- * lines, Config over `env` and the saved config.json, and the terminal's capabilities from `env` and the TTY state of
- * stdin and stdout, as `src/main.ts` sets it up.
+ * lines, Config over `env`, and the terminal's capabilities from `env` and the TTY state of stdin and stdout, as
+ * `src/main.ts` sets it up.
  */
 const platformWith = (env: Record<string, string>) => {
-	const bunWithEnv = Layer.merge(
-		BunServices.layer,
-		ConfigProvider.layer(ConfigProvider.fromUnknown(env))
-	);
+	const config = ConfigProvider.layer(ConfigProvider.fromUnknown(env));
+	const bunWithEnv = Layer.merge(BunServices.layer, config);
 	return Layer.mergeAll(
 		microsoft.layer,
 		BunServices.layer,
-		processes.layer,
+		processes.layer(env),
 		TestConsole.layer,
-		savedConfig.pipe(Layer.provide(Paths.layer), Layer.provide(bunWithEnv)),
+		config,
 		TerminalCapabilities.layer.pipe(Layer.provide(bunWithEnv)),
 		Layer.succeed(Home, home)
 	);
@@ -1847,7 +1843,7 @@ describe("mx", () => {
 			const forms = tokenForms();
 			expect(forms[0]?.get("client_id")).toBe(clientId);
 			expect(forms[0]?.get("scope")).toBe(
-				"https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send offline_access"
+				"https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send offline_access openid email profile"
 			);
 			expect(
 				Arr.filter(
@@ -2010,8 +2006,17 @@ describe("mx", () => {
 			expect(drawn).toContain("Client id");
 			expect(drawn).toContain("Tenant");
 			expect(yield* readJson(configFile)).toEqual({
-				clientId,
-				tenant: "organizations",
+				accounts: [
+					{
+						address: "sam@example.test",
+						alias: "main",
+						clientId,
+						id: 1,
+						oid: microsoft.mailbox.oid,
+						tenant: "organizations",
+						tid: microsoft.mailbox.tid,
+					},
+				],
 			});
 			expect(tokenForms().at(-1)?.get("client_id")).toBe(clientId);
 			expect(tenantsAsked().at(-1)).toBe("organizations");
@@ -2031,8 +2036,14 @@ describe("mx", () => {
 			yield* eventually("a device code", () => devicecodeRequests() > asked);
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
 			expect(yield* readJson(configFile)).toEqual({
-				clientId: otherClientId,
-				tenant: "organizations",
+				accounts: [
+					{
+						alias: "main",
+						clientId: otherClientId,
+						id: 1,
+						tenant: "organizations",
+					},
+				],
 			});
 			yield* Fiber.join(login);
 			expect(tokenForms().at(-1)?.get("client_id")).toBe(otherClientId);
@@ -2049,8 +2060,7 @@ describe("mx", () => {
 			yield* eventually("a device code", () => devicecodeRequests() > asked);
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
 			expect(yield* readJson(configFile)).toEqual({
-				clientId: otherClientId,
-				tenant,
+				accounts: [{ alias: "main", clientId: otherClientId, id: 1, tenant }],
 			});
 			yield* Fiber.join(login);
 			expect(tenantsAsked().at(-1)).toBe(tenant);
@@ -2223,8 +2233,9 @@ describe("mx", () => {
 				expect.stringMatching(lastSyncLine),
 				"Mode: poll",
 				`Version: mx sync ${running}, this binary ${running}`,
+				"Account main: sam@example.test",
 				"Sign-in: saved",
-				"Client id: set",
+				`Client id: ${otherClientId}`,
 				`Tenant: ${tenant}`,
 				"Last error: none",
 			]);
@@ -2677,6 +2688,8 @@ describe("mx", () => {
 				[process.execPath, "--no-env-file", "src/main.ts", "query-worker"],
 				{
 					cwd: `${import.meta.dir}/..`,
+					// The worker reads the aliases in config.json, which it finds through the environment of the mx mcp that starts it.
+					env: { ...environment, ...Rec.getSomes({ SystemRoot: systemRoot }) },
 					stderr: "inherit",
 					stdin: new TextEncoder().encode(request),
 					stdout: "pipe",
@@ -5417,7 +5430,11 @@ describe("mx", () => {
 				}
 				yield* writeJson(join(root, ".claude.json"), { numStartups: 1 });
 				const system = ownWindows(root);
-				const { system: onTerminal } = fakeTerminal(system, ["return"]);
+				// Enter picks the agents mx offers, and keeps the alias mx offers for the first account.
+				const { system: onTerminal } = fakeTerminal(system, [
+					"return",
+					"return",
+				]);
 				yield* withTerminal(true)(cliOn(onTerminal)("install"));
 				for (const { file, settings } of configs) {
 					expect(yield* readJson(file)).toEqual({

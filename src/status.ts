@@ -1,4 +1,5 @@
 import { Array as Arr, Duration, Option } from "effect";
+import type { Account } from "./auth/config.ts";
 import type { Heartbeat } from "./store.ts";
 import { localTime } from "./temporal.ts";
 
@@ -82,29 +83,39 @@ export const syncWarning = (
 	);
 };
 
-/**
- * What `mx status` prints, one fact per line, and the first problem, which makes it exit non-zero: sync not running,
- * mail out of date, its last error, or a secret store that cannot be read.
- */
-export const statusReport = ({
-	clientId,
-	heartbeat,
-	now,
-	signIn,
-	tenant,
-	version,
-}: {
-	/** Whether a client id is set, by `mx login` or `MX_CLIENT_ID`. */
-	readonly clientId: boolean;
-	readonly heartbeat: Option.Option<Heartbeat>;
-	readonly now: Temporal.Instant;
-	/** The sign-in line, and the problem when the secret store could not be read. */
+/** An account as `mx status` shows it: its sign-in line, and the problem when the secret store could not be read. */
+export interface AccountStatus {
+	readonly account: Account;
 	readonly signIn: {
 		readonly line: string;
 		readonly problem: Option.Option<string>;
 	};
-	/** The tenant mx signs in at. */
-	readonly tenant: string;
+}
+
+/** An account's lines: its alias with who signed in to it once mx knows, its sign-in, its client id and its tenant. */
+const accountLines = ({
+	account: { address, alias, clientId, tenant },
+	signIn,
+}: AccountStatus) => [
+	address === undefined ? `Account ${alias}` : `Account ${alias}: ${address}`,
+	`Sign-in: ${signIn.line}`,
+	`Client id: ${clientId}`,
+	`Tenant: ${tenant}`,
+];
+
+/**
+ * What `mx status` prints, one fact per line with the lines of each account, and the first problem, which makes it exit
+ * non-zero: sync not running, mail out of date, its last error, or a secret store that cannot be read.
+ */
+export const statusReport = ({
+	accounts,
+	heartbeat,
+	now,
+	version,
+}: {
+	readonly accounts: readonly AccountStatus[];
+	readonly heartbeat: Option.Option<Heartbeat>;
+	readonly now: Temporal.Instant;
 	readonly version: string;
 }) => {
 	const alive = Option.exists(heartbeat, (beat) => isAlive(beat, now));
@@ -123,9 +134,9 @@ export const statusReport = ({
 		})}`,
 		`Mode: ${Option.match(heartbeat, { onNone: () => "unknown", onSome: (beat) => beat.mode })}`,
 		`Version: mx sync ${Option.match(heartbeat, { onNone: () => "unknown", onSome: (beat) => beat.version })}, this binary ${version}`,
-		`Sign-in: ${signIn.line}`,
-		`Client id: ${clientId ? "set" : "none. Run mx login."}`,
-		`Tenant: ${tenant}`,
+		...(Arr.isReadonlyArrayNonEmpty(accounts)
+			? Arr.flatMap(accounts, accountLines)
+			: ["Accounts: none. Run mx login."]),
 		`Last error: ${Option.getOrElse(error, () => "none")}`,
 	];
 	const problem = Arr.getSomes([
@@ -134,7 +145,7 @@ export const statusReport = ({
 			? Option.none()
 			: Option.some(`${synced(lastSuccess, now)}.`),
 		Option.map(error, (message) => `mx sync reports an error: ${message}`),
-		signIn.problem,
+		...Arr.map(accounts, ({ signIn }) => signIn.problem),
 	]);
 	return { problem: Arr.head(problem), text: Arr.join(lines, "\n") };
 };

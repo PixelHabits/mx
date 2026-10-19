@@ -1,9 +1,9 @@
 import { outlookLink } from "../outlook.ts";
 
 /**
- * The accounts the views show, by their id in the store, with the alias each shows as. Config, not the store, holds the
- * aliases, so the connection that runs a query fills this TEMP table before it creates the views, which leave out the
- * mail of every account it does not list.
+ * The aliases of the accounts, by their id in the store. Config, not the store, holds the aliases, so the connection that
+ * runs a query fills this TEMP table before it creates the views. An account the store holds and the table does not list
+ * shows by its id, as `account 2`, so no mail leaves the views when config.json and the store disagree.
  */
 export const aliasesTable =
 	"CREATE TEMP TABLE aliases (account_id INTEGER PRIMARY KEY, alias TEXT NOT NULL)";
@@ -24,7 +24,7 @@ export const views = [
 	// A link opens the message in Outlook on the web.
 	`CREATE TEMP VIEW mail AS
 SELECT m.id,
-	a.alias AS account,
+	coalesce(a.alias, 'account ' || f.account_id) AS account,
 	f.path AS folder,
 	m.conversation_id,
 	strftime('%Y-%m-%dT%H:%M:%SZ', m.received_at / 1000, 'unixepoch') AS received_at,
@@ -46,10 +46,10 @@ SELECT m.id,
 		WHERE s.sent = 1 AND o.from_address != ''
 	)) AS from_me,
 	${outlookLink("m.graph_id")} AS link
-FROM main.messages m JOIN main.folders f ON f.id = m.folder_id JOIN aliases a ON a.account_id = f.account_id`,
+FROM main.messages m JOIN main.folders f ON f.id = m.folder_id LEFT JOIN aliases a ON a.account_id = f.account_id`,
 	`CREATE TEMP VIEW folders AS
-SELECT a.alias AS account, f.path, count(m.id) AS total, count(m.id) FILTER (WHERE m.is_read = 0) AS unread
-FROM main.folders f JOIN aliases a ON a.account_id = f.account_id LEFT JOIN main.messages m ON m.folder_id = f.id
+SELECT coalesce(a.alias, 'account ' || f.account_id) AS account, f.path, count(m.id) AS total, count(m.id) FILTER (WHERE m.is_read = 0) AS unread
+FROM main.folders f LEFT JOIN aliases a ON a.account_id = f.account_id LEFT JOIN main.messages m ON m.folder_id = f.id
 GROUP BY f.id`,
 	// The newest message comes first as search orders it: by when it arrived, a draft by when it was sent or saved.
 	`CREATE TEMP VIEW conversations AS

@@ -86,7 +86,10 @@ export class NotFound extends Schema.TaggedError<
 	message: Schema.String,
 }) {}
 
-/** A tool refuses a request it could carry out, such as deleting a message that is not a draft through `delete_draft`. */
+/**
+ * mx refuses a request it could carry out, such as deleting a message that is not a draft through `delete_draft`, or
+ * adding a mailbox that is already an account.
+ */
 export class Refused extends Schema.TaggedError<
 	Refused,
 	{ readonly brand: unique symbol }

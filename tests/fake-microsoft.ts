@@ -7,7 +7,7 @@ import {
 	pipe,
 	String as Str,
 } from "effect";
-import { Base64 } from "effect/encoding";
+import { Base64, Base64Url } from "effect/encoding";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { FakeSubscriptions, FakeTunnels } from "./fake-push.ts";
 import { type FakeReleases, isReleaseRequest } from "./fake-releases.ts";
@@ -122,10 +122,15 @@ const parseRecipients = (value: unknown): Address[] =>
 
 const content = (value: unknown) => (value as { content: string }).content;
 
+/** The `n`th synthetic GUID that starts with `lead`, such as a tenant or object id. */
+const guid = (lead: string, n: number) =>
+	`${lead}-0000-4000-8000-${pipe(String(n), Str.padStart(12, "0"))}`;
+
 /**
  * One synthetic user's mailbox as Graph holds it: its folders and messages, the change log its delta links replay, its
  * push subscriptions and the user's sign-in. Every folder, message and subscription id starts with `prefix`, so no id
- * is in two mailboxes; the default mailbox's prefix is empty.
+ * is in two mailboxes; the default mailbox's prefix is empty. `tid` and `oid`, the user's tenant and object id, are
+ * the `n`th mailbox's own.
  */
 export class FakeMailbox {
 	/** The newest access token Microsoft issued for this mailbox, the only one Graph answers for it. */
@@ -153,10 +158,14 @@ export class FakeMailbox {
 
 	readonly prefix: string;
 	readonly user: Address;
+	readonly tid: string;
+	readonly oid: string;
 
-	constructor(prefix: string, user: Address, tunnels: FakeTunnels) {
+	constructor(prefix: string, user: Address, tunnels: FakeTunnels, n: number) {
 		this.prefix = prefix;
 		this.user = user;
+		this.tid = guid("7e000000", n);
+		this.oid = guid("0b000000", n);
 		this.subscriptions = new FakeSubscriptions(tunnels, prefix);
 		for (const [id, displayName] of startingFolders) {
 			this.folders.set(`${prefix}${id}`, {
@@ -231,6 +240,18 @@ export class FakeMailbox {
 const deviceCode = (mailbox: FakeMailbox) =>
 	`${mailbox.prefix}synthetic-device-code`;
 
+/** An unsigned id token for the user of `mailbox`, with the claims `openid email profile` bring. */
+const idToken = (mailbox: FakeMailbox) => {
+	const part = (value: object) => Base64Url.encode(JSON.stringify(value));
+	return `${part({ alg: "none", typ: "JWT" })}.${part({
+		email: mailbox.user.address,
+		name: mailbox.user.name,
+		oid: mailbox.oid,
+		preferred_username: mailbox.user.address,
+		tid: mailbox.tid,
+	})}.`;
+};
+
 /**
  * Microsoft's token endpoint and Graph for synthetic mailboxes, in memory: the default mailbox, and any that
  * `addMailbox` adds. Each issued access and refresh token carries a counter and belongs to one mailbox; a refresh token
@@ -243,7 +264,7 @@ export class FakeMicrosoft {
 	readonly received: Received[] = [];
 	readonly tunnels = new FakeTunnels();
 	/** The mailbox the tests use unless they add another: Sam's, with folder ids such as `folder-inbox`. */
-	readonly mailbox = new FakeMailbox("", owner, this.tunnels);
+	readonly mailbox = new FakeMailbox("", owner, this.tunnels, 1);
 	/** The default mailbox's push subscriptions. */
 	readonly subscriptions = this.mailbox.subscriptions;
 	/** The mailbox whose user enters the code at the verification URI: each device code issued from now on signs it in. */
@@ -251,6 +272,8 @@ export class FakeMicrosoft {
 	private readonly mailboxes = [this.mailbox];
 	/** Device-code polls still to answer `authorization_pending`. */
 	pendingPolls = 1;
+	/** The scope each device code was asked with; its sign-in answers an id token when that scope names openid. */
+	private readonly deviceScopes = new Map<string, string>();
 	/** When set, every refresh answers `invalid_grant`. */
 	refuseRefresh = false;
 	/** Graph requests still to answer 429. */
@@ -407,7 +430,12 @@ export class FakeMicrosoft {
 	 * subscription ids start with `name`, so none is in another mailbox. A test signs in to it through `signingIn`.
 	 */
 	addMailbox(name: string, user: Address) {
-		const mailbox = new FakeMailbox(`${name}-`, user, this.tunnels);
+		const mailbox = new FakeMailbox(
+			`${name}-`,
+			user,
+			this.tunnels,
+			this.mailboxes.length + 1
+		);
 		this.mailboxes.push(mailbox);
 		return mailbox;
 	}
@@ -656,8 +684,11 @@ export class FakeMicrosoft {
 		}
 	}
 
-	/** Signs in `mailbox` with a new access token, which Graph answers in place of its last, and a refresh token. */
-	private issue(mailbox: FakeMailbox) {
+	/**
+	 * Signs in `mailbox` with a new access token, which Graph answers in place of its last, and a refresh token, and with
+	 * an id token when `scope` names openid.
+	 */
+	private issue(mailbox: FakeMailbox, scope: string) {
 		this.issued += 1;
 		mailbox.accessToken = `synthetic-access-token-${this.issued}`;
 		const refreshToken = `synthetic-refresh-token-${this.issued}`;
@@ -670,6 +701,9 @@ export class FakeMicrosoft {
 			scope:
 				"https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send",
 			token_type: "Bearer",
+			...(pipe(scope, Str.split(" ")).includes("openid")
+				? { id_token: idToken(mailbox) }
+				: {}),
 		});
 	}
 
@@ -748,6 +782,10 @@ export class FakeMicrosoft {
 	/** Answers the token endpoint: a device code redeems for its mailbox, and a refresh token for the mailbox it belongs to. */
 	private login(url: URL, form: URLSearchParams) {
 		if (pipe(url.pathname, Str.endsWith("/oauth2/v2.0/devicecode"))) {
+			this.deviceScopes.set(
+				deviceCode(this.signingIn),
+				form.get("scope") ?? ""
+			);
 			return json({
 				device_code: deviceCode(this.signingIn),
 				expires_in: 900,
@@ -774,7 +812,10 @@ export class FakeMicrosoft {
 				(mailbox) => deviceCode(mailbox) === form.get("device_code")
 			);
 			if (Option.isSome(signedIn)) {
-				return this.issue(signedIn.value);
+				return this.issue(
+					signedIn.value,
+					this.deviceScopes.get(deviceCode(signedIn.value)) ?? ""
+				);
 			}
 		}
 		if (grant === "refresh_token" && !this.refuseRefresh) {
@@ -785,7 +826,7 @@ export class FakeMicrosoft {
 					mailbox.refreshTokens.includes(form.get("refresh_token") ?? "")
 			);
 			if (Option.isSome(refreshed)) {
-				return this.issue(refreshed.value);
+				return this.issue(refreshed.value, form.get("scope") ?? "");
 			}
 		}
 		return json(

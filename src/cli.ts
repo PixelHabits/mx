@@ -2,7 +2,6 @@ import {
 	Array as Arr,
 	Cause,
 	Clock,
-	Config,
 	Console,
 	Duration,
 	Effect,
@@ -10,24 +9,41 @@ import {
 	Logger,
 	Option,
 	Schema,
+	String as Str,
 	Stream,
 	Terminal,
 } from "effect";
 import {
+	Argument,
 	CliError,
 	Command,
 	Flag,
 	Prompt,
 	TerminalCapabilities,
 } from "effect/cli";
-import { ChildProcessSpawner } from "effect/process";
 import packageJson from "../package.json" with { type: "json" };
 import { agentFlag } from "./agents.ts";
-import { Auth, signIn } from "./auth/auth.ts";
 import {
+	Accounts,
+	aliasProblem,
+	described,
+	notAnAlias,
+	type Target,
+} from "./auth/accounts.ts";
+import {
+	type Account,
+	AccountId,
+	AccountsFile,
+	Alias,
+	accountFlag,
+	ask,
+	askClientId,
+	askTenant,
 	clientIdConfig,
 	clientIdFlag,
-	organizations,
+	defaultAlias,
+	listed,
+	type SignInConfig,
 	tenantConfig,
 	tenantFlag,
 } from "./auth/config.ts";
@@ -40,6 +56,7 @@ import {
 	LoginRequired,
 	MicrosoftUnavailable,
 	NewerStore,
+	Refused,
 	SignInFailed,
 	SyncUnhealthy,
 	UpdateFailed,
@@ -57,27 +74,199 @@ import { Updater } from "./update.ts";
 import { Watch } from "./watch.ts";
 import { ownsConsole } from "./windows.ts";
 
+/** The client id and the tenant `mx login` or `mx install` is given, when it is. */
+interface Given {
+	readonly clientId: Option.Option<string>;
+	readonly tenant: Option.Option<string>;
+}
+
+/** An account config.json names, signed in with the client id and the tenant given, or else its own. */
+const existing = (account: Account, given: Given): Target => {
+	const clientId = Option.getOrElse(given.clientId, () => account.clientId);
+	const tenant = Option.getOrElse(given.tenant, () => account.tenant);
+	const changed = clientId !== account.clientId || tenant !== account.tenant;
+	return {
+		account: changed
+			? { alias: account.alias, clientId, id: account.id, tenant }
+			: account,
+		added: false,
+		changed,
+	};
+};
+
+/**
+ * What a new account signs in with: the client id and the tenant given, or else `MX_CLIENT_ID` and `MX_TENANT`, or else
+ * mx asks on a terminal, where Enter keeps the first account's client id. Without a terminal a new account signs in with
+ * the first account's client id.
+ */
+const newSettings = Effect.fnUntraced(function* (
+	saved: readonly Account[],
+	given: Given
+) {
+	const { canPrompt } = yield* TerminalCapabilities.TerminalCapabilities;
+	const kept = Option.map(Arr.head(saved), (first) => first.clientId);
+	const clientId = Option.isSome(given.clientId)
+		? given.clientId.value
+		: yield* Option.match(yield* clientIdConfig, {
+				onNone: () =>
+					!canPrompt && Option.isSome(kept)
+						? Effect.succeed(kept.value)
+						: askClientId(kept),
+				onSome: Effect.succeed,
+			});
+	const tenant = Option.isSome(given.tenant)
+		? given.tenant.value
+		: yield* Option.match(yield* tenantConfig, {
+				onNone: () => askTenant,
+				onSome: Effect.succeed,
+			});
+	return { clientId, tenant } satisfies SignInConfig;
+});
+
+/** Asks for a new account's alias, refusing one that breaks the rules or that an account in `saved` has; Enter keeps `offered`. */
+const askAlias = (saved: readonly Account[], offered: Option.Option<string>) =>
+	ask(
+		Prompt.String({
+			message: Option.match(offered, {
+				onNone: () => "Alias for the new account, such as work",
+				onSome: (free) =>
+					`Alias for the new account, such as work. Enter keeps ${free}.`,
+			}),
+			validate: (value) => {
+				const answer = Str.trim(value) || Option.getOrElse(offered, () => "");
+				return Option.match(aliasProblem(saved, answer), {
+					onNone: () => Effect.succeed(answer),
+					onSome: Effect.fail,
+				});
+			},
+		}),
+		"mx can't ask for the new account's alias here. Run mx login --account <alias>."
+	);
+
+/**
+ * A new account at `settings`, next after the accounts `saved`, aliased `alias`, or else what the user answers on a
+ * terminal, where Enter keeps the alias of its tenant while that is free, or else without a terminal the alias of its
+ * tenant.
+ */
+const newAccount = Effect.fnUntraced(function* (
+	saved: readonly Account[],
+	settings: SignInConfig,
+	alias: Option.Option<string>
+) {
+	const { canPrompt } = yield* TerminalCapabilities.TerminalCapabilities;
+	const offered = Option.liftPredicate(defaultAlias(settings.tenant), (free) =>
+		Option.isNone(aliasProblem(saved, free))
+	);
+	const chosen = yield* Option.match(alias, {
+		onNone: () =>
+			!canPrompt && Option.isSome(offered)
+				? Effect.succeed(offered.value)
+				: askAlias(saved, offered),
+		onSome: Effect.succeed,
+	});
+	const id =
+		Arr.reduce(saved, 0, (last, account) => Math.max(last, account.id)) + 1;
+	return {
+		account: { alias: chosen, id, ...settings },
+		added: true,
+		changed: false,
+	} satisfies Target;
+});
+
+/**
+ * What `mx login` signs in to: the account `--account` names, or a new one by that alias; without it, the one account,
+ * a new one aliased after its tenant when there is none, or else the one the user picks on a terminal.
+ */
+const loginTarget = Effect.fnUntraced(function* (
+	saved: readonly Account[],
+	{ account, ...given }: Given & { readonly account: Option.Option<string> }
+) {
+	if (Option.isSome(account)) {
+		const named = Arr.findFirst(saved, ({ alias }) => alias === account.value);
+		if (Option.isSome(named)) {
+			return existing(named.value, given);
+		}
+		if (!Schema.is(Alias)(account.value)) {
+			return yield* notAnAlias(account.value);
+		}
+		return yield* newAccount(saved, yield* newSettings(saved, given), account);
+	}
+	if (!Arr.isReadonlyArrayNonEmpty(saved)) {
+		const settings = yield* newSettings(saved, given);
+		return yield* newAccount(
+			saved,
+			settings,
+			Option.some(defaultAlias(settings.tenant))
+		);
+	}
+	const [first, ...others] = saved;
+	if (!Arr.isReadonlyArrayNonEmpty(others)) {
+		return existing(first, given);
+	}
+	const chosen = yield* ask(
+		Prompt.Select({
+			choices: [
+				...Arr.map(saved, (each) => ({
+					title: described(each),
+					value: Option.some(each),
+				})),
+				{ title: "Add an account", value: Option.none<Account>() },
+			],
+			message: "Which account do you want to sign in to?",
+		}),
+		`mx can't ask which account to sign in to here. Run mx login --account <alias>. The accounts are ${listed.format(Arr.map(saved, ({ alias }) => alias))}.`
+	);
+	return Option.isSome(chosen)
+		? existing(chosen.value, given)
+		: yield* newAccount(saved, yield* newSettings(saved, given), Option.none());
+});
+
 const login = Command.make(
 	"login",
-	{ clientId: clientIdFlag, tenant: tenantFlag },
-	(config) =>
+	{ account: accountFlag, clientId: clientIdFlag, tenant: tenantFlag },
+	(flags) =>
 		Effect.gen(function* () {
-			yield* signIn(
-				{
-					auth: yield* Auth,
-					spawner: yield* ChildProcessSpawner.ChildProcessSpawner,
-					terminal: yield* Terminal.Terminal,
-				},
-				config
-			);
+			const file = yield* AccountsFile;
+			const target = yield* loginTarget(yield* file.read, flags);
+			yield* (yield* Accounts).signIn(target);
+			const accounts = yield* file.read;
+			if (target.added && accounts.length > 1) {
+				yield* Console.log(
+					`The accounts are ${listed.format(Arr.map(accounts, described))}. To rename one, run mx rename <alias> <new alias>.`
+				);
+			}
 			yield* (yield* Installer).resumeSync;
 		})
 ).pipe(
 	Command.provide(
-		Layer.mergeAll(Auth.layer, Installer.layer).pipe(Layer.provide(Paths.layer))
+		Layer.mergeAll(Accounts.layer, AccountsFile.layer, Installer.layer).pipe(
+			Layer.provide(Paths.layer)
+		)
 	),
 	Command.withDescription(
-		"Sign in to Microsoft with a device code, save the refresh token in the system's secret store, and restart mx sync with the new sign-in. mx login asks for a client id and a tenant once, or takes --client-id and --tenant, and saves them."
+		"Sign in to Microsoft with a device code, save the refresh token in the system's secret store, and restart mx sync with the new sign-in. mx login asks for a client id and a tenant once for each account, or takes --client-id and --tenant, and saves them. --account names the account: an alias mx has signs it in again, and a new alias adds an account. Without --account, mx signs in to the one account, or asks which when there are several."
+	)
+);
+
+const rename = Command.make(
+	"rename",
+	{
+		from: Argument.String("alias").pipe(
+			Argument.withDescription("The alias the account has.")
+		),
+		to: Argument.String("new-alias").pipe(
+			Argument.withDescription("The alias to give it.")
+		),
+	},
+	({ from, to }) =>
+		Effect.gen(function* () {
+			yield* (yield* Accounts).rename(from, to);
+			yield* Console.log(`Renamed ${from} to ${to}.`);
+		})
+).pipe(
+	Command.provide(Accounts.layer.pipe(Layer.provide(Paths.layer))),
+	Command.withDescription(
+		"Give an account another alias. An alias is up to 20 lowercase letters, digits and hyphens, and starts with a letter."
 	)
 );
 
@@ -140,7 +329,7 @@ const sync = Command.make(
 			Installer.layer,
 			Updater.layer,
 			syncLog
-		).pipe(Layer.provide(Paths.layer))
+		).pipe(Layer.provide(Layer.mergeAll(Paths.layer, AccountId.first)))
 	),
 	Command.withDescription(
 		"Keep the local store in step with the mailbox: Graph push notifications through a cloudflared quick tunnel, and a delta pass of every folder every 5 minutes, or every 60 seconds while push is down."
@@ -173,9 +362,20 @@ const update = Command.make("update", {}, () =>
 const install = Command.make(
 	"install",
 	{ agent: agentFlag, clientId: clientIdFlag, tenant: tenantFlag },
-	({ agent, clientId, tenant }) =>
+	({ agent, ...given }) =>
 		Effect.gen(function* () {
 			const { finishedFirstPass, passWithProgress } = yield* Sync;
+			const accounts = yield* Accounts;
+			const saved = yield* (yield* AccountsFile).read;
+			// A new first account's client id and tenant are settled before anything changes, and its alias as it signs in.
+			const first = yield* Option.match(Arr.head(saved), {
+				onNone: () =>
+					Effect.map(newSettings(saved, given), (settings) =>
+						newAccount(saved, settings, Option.none())
+					),
+				onSome: (account) =>
+					Effect.succeed(Effect.succeed(existing(account, given))),
+			});
 			const show = yield* showProgress;
 			yield* (yield* Installer).install({
 				agents: agent,
@@ -184,15 +384,29 @@ const install = Command.make(
 						yield* show(passWithProgress);
 					}
 				}),
-				login: { clientId, tenant },
+				login: Effect.gen(function* () {
+					const target = yield* first;
+					if (
+						target.added ||
+						target.changed ||
+						!(yield* accounts.signedIn(target.account.id))
+					) {
+						yield* accounts.signIn(target);
+					}
+				}),
 			});
 		})
 ).pipe(
 	Command.provide(
-		Layer.mergeAll(Installer.layer, Sync.layer).pipe(Layer.provide(Paths.layer))
+		Layer.mergeAll(
+			Installer.layer,
+			Sync.layer,
+			Accounts.layer,
+			AccountsFile.layer
+		).pipe(Layer.provide(Layer.mergeAll(Paths.layer, AccountId.first)))
 	),
 	Command.withDescription(
-		"Install this binary for the signed-in user, start mx sync at sign-in, add mx mcp to the MCP config of each agent chosen, and sign in when there is no saved sign-in. Until mail has synced once, it syncs in the foreground with its progress before it starts mx sync; stopped, it resumes on the next run. Run it again to reinstall."
+		"Install this binary for the signed-in user, start mx sync at sign-in, add mx mcp to the MCP config of each agent chosen, and sign in to the first account when it has no saved sign-in, asking on a terminal for the alias of a new one. Until mail has synced once, it syncs in the foreground with its progress before it starts mx sync; stopped, it resumes on the next run. Run it again to reinstall."
 	)
 );
 
@@ -240,7 +454,7 @@ const uninstall = Command.make(
 ).pipe(
 	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
 	Command.withDescription(
-		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, the installed binary, the client id and the tenant, the mail store, the saved sign-in, the attachment cache, and the state folder with the tool call log. It lists them and asks first; --yes removes them without asking."
+		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, the installed binary, the mail store, each account's saved sign-in, the attachment cache, the state folder with the tool call log, and the accounts with their client ids and tenants. It lists them and asks first; --yes removes them without asking."
 	)
 );
 
@@ -255,35 +469,34 @@ const mcp = Command.make("mcp", {}, () =>
 const status = Command.make("status", {}, () =>
 	Effect.gen(function* () {
 		const heartbeat = yield* (yield* Store).heartbeat;
-		const saved = yield* (yield* Credentials).read.pipe(
-			Effect.as({ line: "saved", problem: Option.none<string>() }),
-			Effect.catchTags({
-				CredentialFailed: (error) =>
-					Effect.succeed({
-						line: `unknown. ${error.message}`,
-						problem: Option.some(error.message),
+		const credentials = yield* Credentials;
+		const accounts = yield* Effect.forEach(
+			yield* (yield* AccountsFile).read,
+			(account) =>
+				credentials.read(account.id).pipe(
+					Effect.as({ line: "saved", problem: Option.none<string>() }),
+					Effect.catchTags({
+						CredentialFailed: (error) =>
+							Effect.succeed({
+								line: `unknown. ${error.message}`,
+								problem: Option.some(error.message),
+							}),
+						LoginRequired: () =>
+							Effect.succeed({
+								line: `none saved. Run mx login --account ${account.alias}.`,
+								problem: Option.none<string>(),
+							}),
 					}),
-				LoginRequired: () =>
-					Effect.succeed({
-						line: "none saved. Run mx login.",
-						problem: Option.none<string>(),
-					}),
-			})
+					Effect.map((signIn) => ({ account, signIn }))
+				)
 		);
 		const now = Temporal.Instant.fromEpochMilliseconds(
 			yield* Clock.currentTimeMillis
 		);
 		const report = statusReport({
-			clientId: Option.isSome(
-				yield* Config.option(clientIdConfig).pipe(Effect.orDie)
-			),
+			accounts,
 			heartbeat,
 			now,
-			signIn: saved,
-			tenant: yield* tenantConfig.pipe(
-				Config.withDefault(organizations),
-				Effect.orDie
-			),
 			version: packageJson.version,
 		});
 		yield* Console.log(report.text);
@@ -293,12 +506,12 @@ const status = Command.make("status", {}, () =>
 	})
 ).pipe(
 	Command.provide(
-		Layer.mergeAll(Store.layer, Credentials.layer).pipe(
+		Layer.mergeAll(Store.layer, Credentials.layer, AccountsFile.layer).pipe(
 			Layer.provide(Paths.layer)
 		)
 	),
 	Command.withDescription(
-		"Say whether mx sync is running, when it last synced, its mode and version, whether a sign-in is saved and a client id is set, the tenant, and its last error. Exits non-zero when sync is not running, mail is out of date, or sync reports an error."
+		"Say whether mx sync is running, when it last synced, its mode and version, and its last error, and for each account who signed in to it, whether a sign-in is saved, its client id and its tenant. Exits non-zero when sync is not running, mail is out of date, or sync reports an error."
 	)
 );
 
@@ -423,6 +636,7 @@ export const mx = Command.make("mx", {}, () =>
 	),
 	Command.withSubcommands([
 		login,
+		rename,
 		sync,
 		status,
 		mcp,
@@ -443,6 +657,7 @@ const isExplained = Schema.is(
 		LoginRequired,
 		MicrosoftUnavailable,
 		NewerStore,
+		Refused,
 		SignInFailed,
 		SyncUnhealthy,
 		UpdateFailed,
