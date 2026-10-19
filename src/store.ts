@@ -12,6 +12,7 @@ import {
 } from "effect";
 import { SqlClient, type SqlError, type Statement } from "effect/sql";
 import type { Folder, Message, Recipient } from "./graph/api.ts";
+import { outlookLink } from "./outlook.ts";
 import { Paths } from "./paths.ts";
 import { migrate, migrations } from "./store/migrations.ts";
 
@@ -23,6 +24,9 @@ const columnWeights = { body: 1, sender: 2, subject: 10 };
 
 /** FTS5's bm25 relevance of a row, lower for a better match; it takes the weights in column order. */
 const relevance = `bm25(search, ${columnWeights.subject}, ${columnWeights.sender}, ${columnWeights.body})`;
+
+/** The link that opens a message of `messages m` in Outlook on the web. */
+const messageLink = outlookLink("m.graph_id");
 
 const Address = Schema.Struct({ address: Schema.String, name: Schema.String });
 export type Address = typeof Address.Type;
@@ -48,6 +52,7 @@ const Row = Schema.Struct({
 	importance: Schema.Literals(["low", "normal", "high"]),
 	is_draft: Flag,
 	is_read: Flag,
+	link: Schema.String,
 	received_at: Schema.NullOr(Schema.Int),
 	sent_at: Schema.NullOr(Schema.Int),
 	subject: Schema.String,
@@ -107,6 +112,8 @@ export interface Stored {
 	readonly id: number;
 	/** Whether the message sits in Sent Items. */
 	readonly inSentItems: boolean;
+	/** The link that opens the message in Outlook on the web. */
+	readonly link: string;
 	readonly read: boolean;
 	/** When Graph received the message, or for a draft when it was saved. */
 	readonly received: Option.Option<Temporal.Instant>;
@@ -160,6 +167,7 @@ const stored = (row: typeof Row.Type): Stored => ({
 	graphId: row.graph_id,
 	id: row.id,
 	inSentItems: row.folder_sent === 1,
+	link: row.link,
 	read: row.is_read === 1,
 	received: instant(row.received_at),
 	sent: instant(row.sent_at),
@@ -335,7 +343,7 @@ export class Store extends Context.Service<
 			yield* run(sql`PRAGMA foreign_keys = ON`);
 			yield* migrate(migrations);
 
-			const select = sql`SELECT m.*, f.path AS folder_path, f.sent AS folder_sent FROM messages m JOIN folders f ON f.id = m.folder_id`;
+			const select = sql`SELECT m.*, f.path AS folder_path, f.sent AS folder_sent, ${sql.literal(messageLink)} AS link FROM messages m JOIN folders f ON f.id = m.folder_id`;
 			/** When the message arrived; a draft has no received time until Graph saves it, so its sent or saved time stands in. */
 			const arrived = sql`COALESCE(m.received_at, m.sent_at)`;
 
@@ -571,7 +579,7 @@ export class Store extends Context.Service<
 						SELECT id, rank, at, row_number() OVER (PARTITION BY conversation_id ORDER BY rank, at DESC, id DESC) AS place
 						FROM matched
 					)
-					SELECT m.*, f.path AS folder_path, f.sent AS folder_sent,
+					SELECT m.*, f.path AS folder_path, f.sent AS folder_sent, ${sql.literal(messageLink)} AS link,
 						(SELECT count(*) FROM messages t WHERE t.conversation_id = m.conversation_id) - 1 AS others
 					FROM best b JOIN messages m ON m.id = b.id JOIN folders f ON f.id = m.folder_id
 					WHERE b.place = 1

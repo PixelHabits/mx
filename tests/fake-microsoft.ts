@@ -271,7 +271,8 @@ export class FakeMicrosoft {
 			body: "Lunch on Friday?",
 			conversationId: "conversation-lunch",
 			from: carol,
-			id: "message-lunch",
+			// An immutable id as Graph gives it, with - and _ where standard base64 has / and +.
+			id: "AAkALgAAAAAASyNtHeTiCmAiLbOxIdAC-EWg0ASyNtHeTiC_iD0000TeStMaIlBoX0AA",
 			parentFolderId: "folder-inbox",
 			received: "2026-10-03T11:00:00Z",
 			subject: "Lunch plans",

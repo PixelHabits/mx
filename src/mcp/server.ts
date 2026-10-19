@@ -192,11 +192,11 @@ const search = Tool.make("search", {
 	.annotate(Tool.OpenWorld, false);
 
 const sqlQuery = Tool.make("query", {
-	description: `Runs one read-only SQLite SELECT over the local copy of the mailbox, to count, group, join and filter mail instead of reading many search lines. Answers a tab-separated table with a header row: at most 200 rows and 20000 characters, each value cut at 200 characters. Times are UTC ISO 8601 text, such as 2026-10-01T14:00:00Z; is_ and has_ columns and from_me are 1 or 0.
+	description: `Runs one read-only SQLite SELECT over the local copy of the mailbox, to count, group, join and filter mail instead of reading many search lines. Answers a tab-separated table with a header row: at most 200 rows and 20000 characters, each value but a link cut at 200 characters. Times are UTC ISO 8601 text, such as 2026-10-01T14:00:00Z; is_ and has_ columns and from_me are 1 or 0.
 Views:
-- mail, one row per message: id (the #id), folder (a path such as Inbox/Projects), conversation_id, received_at, sent_at, from_name, from_address, to_addresses, cc_addresses, bcc_addresses, subject, is_read, flag (notFlagged, flagged or complete), categories, importance (low, normal or high), has_attachments, is_draft, from_me (the user sent it). to_addresses, cc_addresses, bcc_addresses and categories are JSON arrays; split them with json_each.
+- mail, one row per message: id (the #id), folder (a path such as Inbox/Projects), conversation_id, received_at, sent_at, from_name, from_address, to_addresses, cc_addresses, bcc_addresses, subject, is_read, flag (notFlagged, flagged or complete), categories, importance (low, normal or high), has_attachments, is_draft, from_me (the user sent it), link (opens the message in Outlook on the web). to_addresses, cc_addresses, bcc_addresses and categories are JSON arrays; split them with json_each.
 - folders: path, total (messages), unread.
-- conversations, one row per conversation: conversation_id, messages, unread, mine (messages the user sent), last_id (the id of its newest message).
+- conversations, one row per conversation: conversation_id, messages, unread, mine (messages the user sent), last_id (the id of its newest message), last_link (the link of its newest message).
 Message bodies are not here: search finds words in them, and message reads one.
 Examples:
 SELECT from_address, count(*) AS n FROM mail WHERE folder = 'Inbox' AND received_at >= '2026-10-01' GROUP BY from_address ORDER BY n DESC
@@ -1221,6 +1221,8 @@ Reading mail costs context:
 - Open a conversation with thread. It includes the user's own replies, marked (me), so you don't need Sent Items to see whether the user answered.
 - Use message for a single message. Use full only when the new text isn't enough, such as for quoted history or a forwarded original.
 - update and delete take many ids at once.
+
+thread, message and query's link column give a link that opens the message in Outlook on the web. Give it to the user when they want to open or answer the message themselves.
 
 If the user has saved mail preferences in your memory or instructions, follow them. If they have none and ask you to triage, offer once to interview them first about how they handle mail.`;
 

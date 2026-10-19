@@ -8,6 +8,7 @@ mx gives Claude Desktop, Claude Code and Codex your mail through the Model Conte
 
 - Search your mail and read whole threads across folders, including your own replies.
 - Read attachments and inline images.
+- Give you a link that opens a message in Outlook on the web.
 - Draft new messages, replies, reply-alls and forwards, with attachments.
 - Send mail. By default your agent asks you first, every time.
 - Mark mail read, flag it, categorize it and move it between folders.

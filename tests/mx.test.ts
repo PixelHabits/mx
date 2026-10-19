@@ -1147,6 +1147,10 @@ const trellisWireLine =
 const timeLeft = /, (about \d+ min|less than a minute) left/u;
 const cutAtCharacters =
 	/^\(first \d+ rows, cut at 20000 characters; refine the query\)$/u;
+/** The link that opens Carol's lunch message in Outlook on the web, as Graph's webLink gives it. */
+const lunchLink =
+	"https://outlook.cloud.microsoft/mail/deeplink?ItemID=AAkALgAAAAAASyNtHeTiCmAiLbOxIdAC%2FEWg0ASyNtHeTiC%2BiD0000TeStMaIlBoX0AA&exvsurl=1&viewmodel=ReadMessageItem";
+const outlookLine = /^Open in Outlook: https:\/\/\S+$/gmu;
 const lineIn = (id: number, folder: string) =>
 	new RegExp(`^#${id} .* ${folder} \\|`, "u");
 
@@ -2303,9 +2307,9 @@ describe("mx", () => {
 	test("search finds by words in the subject, the sender and the new text, with folder, from and since filters", () =>
 		Effect.gen(function* () {
 			expect(lines(yield* tool("search", { query: "travel" }))).toHaveLength(1);
-			expect(yield* tool("search", { query: "carol" })).toContain(
-				"Lunch plans"
-			);
+			const lunch = yield* tool("search", { query: "carol" });
+			expect(lunch).toContain("Lunch plans");
+			expect(lunch).not.toContain("https://");
 			const inbox = yield* tool("search", { folder: "Inbox", query: "budget" });
 			expect(lines(inbox)).toHaveLength(1);
 			expect(inbox).not.toContain("Sent Items");
@@ -2437,6 +2441,21 @@ describe("mx", () => {
 			expect(thread).toContain("[img 1]");
 		}));
 
+	test("thread and message show, below each message's headers, the link that opens it in Outlook on the web", () =>
+		Effect.gen(function* () {
+			const id = idOf(yield* tool("search", { query: "lunch" }), "Lunch plans");
+			expect(yield* tool("message", { id })).toContain(
+				`Subject:Lunch plans\nOpen in Outlook: ${lunchLink}\n\nLunch on Friday?`
+			);
+			expect(yield* tool("thread", { id })).toContain(
+				`To: Sam Example <sam@example.test>\nOpen in Outlook: ${lunchLink}\nLunch on Friday?`
+			);
+			const budget = yield* tool("thread", {
+				id: idOf(yield* tool("search", { query: "travel cap" }), "RE:"),
+			});
+			expect(budget.match(outlookLine)).toHaveLength(3);
+		}));
+
 	test("query answers a GROUP BY over mail as a tab-separated table with a header: messages per sender", () =>
 		Effect.gen(function* () {
 			microsoft.addFolder("folder-clubs", "Clubs", "folder-root");
@@ -2516,6 +2535,26 @@ describe("mx", () => {
 				})
 			).toBe(
 				"messages\tunread\tmine\tsubject\tfrom_me\n3\t2\t1\tRE: Quarterly budget\t0"
+			);
+		}));
+
+	test("query gives each message's Outlook link in mail and each conversation's newest in conversations, and never cuts a link", () =>
+		Effect.gen(function* () {
+			expect(
+				yield* tool("query", {
+					sql: "SELECT m.link, c.last_link FROM mail m JOIN conversations c USING (conversation_id) WHERE m.subject = 'Lunch plans'",
+				})
+			).toBe(`link\tlast_link\n${lunchLink}\t${lunchLink}`);
+			expect(
+				yield* tool("query", {
+					sql: "SELECT last_link FROM conversations WHERE conversation_id = 'conversation-budget'",
+				})
+			).toBe(
+				"last_link\nhttps://outlook.cloud.microsoft/mail/deeplink?ItemID=message%2Fanswer&exvsurl=1&viewmodel=ReadMessageItem"
+			);
+			const longer = lunchLink.replace("ItemID=", `ItemID=${"A".repeat(100)}`);
+			expect(yield* tool("query", { sql: `SELECT '${longer}' AS link` })).toBe(
+				`link\n${longer}`
 			);
 		}));
 

@@ -11,6 +11,7 @@ import {
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { Refused } from "./errors.ts";
+import { isOutlookLink } from "./outlook.ts";
 import { Paths } from "./paths.ts";
 import { views } from "./store/views.ts";
 
@@ -23,7 +24,7 @@ export const queryWorker = "query-worker";
  */
 const queryTimeout = Duration.seconds(10);
 
-/** The most rows an answer holds, the most characters it holds, and the most characters of one value. */
+/** The most rows an answer holds, the most characters it holds, and the most characters of one value but an Outlook link. */
 const maxRows = 200;
 const maxCharacters = 20_000;
 const maxValueLength = 200;
@@ -43,7 +44,7 @@ const Answer = Schema.fromJsonString(
 
 const lineBreaks = /[\t\r\n]+/gu;
 
-/** A value as one cell of the table: NULL, a blob's size, or text on one line, cut at `maxValueLength`. */
+/** A value as one cell of the table: NULL, a blob's size, or text on one line, cut at `maxValueLength` unless it is an Outlook link. */
 const cell = (value: unknown) => {
 	if (value === null) {
 		return "NULL";
@@ -52,7 +53,7 @@ const cell = (value: unknown) => {
 		return `(blob, ${value.byteLength} bytes)`;
 	}
 	const text = String(value).replaceAll(lineBreaks, " ");
-	return text.length > maxValueLength
+	return text.length > maxValueLength && !isOutlookLink(text)
 		? `${text.slice(0, maxValueLength - 1)}…`
 		: text;
 };

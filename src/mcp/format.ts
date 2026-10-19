@@ -79,7 +79,7 @@ export const listing = (found: readonly Found[]) =>
 				"\n"
 			);
 
-/** Headers, then `body`: the new text from the store, or the whole body Graph returned. */
+/** Headers and the Outlook link, then `body`: the new text from the store, or the whole body Graph returned. */
 export const messageText = (stored: Stored, body: string) => {
 	const flags = markers(stored);
 	return Arr.join(
@@ -96,6 +96,7 @@ export const messageText = (stored: Stored, body: string) => {
 			...(stored.categories.length === 0
 				? []
 				: [`Categories: ${Arr.join(stored.categories, ", ")}`]),
+			`Open in Outlook: ${stored.link}`,
 			"",
 			bodyText(body),
 		],
@@ -103,7 +104,7 @@ export const messageText = (stored: Stored, body: string) => {
 	);
 };
 
-/** The conversation oldest first; the user's own messages say `(me)` in place of a From line. */
+/** The conversation oldest first, each message with its Outlook link; the user's own messages say `(me)` in place of a From line. */
 export const threadText = (
 	messages: readonly Stored[],
 	own: ReadonlySet<string>
@@ -126,6 +127,7 @@ export const threadText = (
 				`To: ${people(stored.to)}`,
 				...(stored.cc.length === 0 ? [] : [`Cc: ${people(stored.cc)}`]),
 				...(stored.bcc.length === 0 ? [] : [`Bcc: ${people(stored.bcc)}`]),
+				`Open in Outlook: ${stored.link}`,
 				bodyText(stored.body),
 			],
 			"\n"

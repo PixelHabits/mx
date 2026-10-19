@@ -37,7 +37,7 @@ When a tool's request to Graph, including a draft tool's, answers 404 for a stor
 
 - **Views:** the SQL reads three views. `mail` has one row per message, `folders` has each folder's path with its message and unread counts, and `conversations` has one row per conversation with its newest message. Times are UTC ISO 8601 text. Message bodies aren't in the views; `search` finds words in them.
 - **Read-only:** each query runs in a process of its own, `mx query-worker`, which opens the store read-only, so SQLite refuses every write. mx wraps the SQL in its own `SELECT * FROM (…)`, so SQLite accepts nothing but one SELECT: no `INSERT`, `ATTACH`, `PRAGMA` or second statement. The tool returns SQLite's error as it is.
-- **Limits:** an answer has at most 200 rows and 20,000 characters, and each value is cut at 200 characters. Its last line says when a limit cut it short. mx stops a query that runs longer than 10 seconds.
+- **Limits:** an answer has at most 200 rows and 20,000 characters, and each value but an Outlook link is cut at 200 characters. Its last line says when a limit cut it short. mx stops a query that runs longer than 10 seconds.
 - **Schema:** the query process creates the views each time it starts, so the store's tables can change while the views stay the same.
 
 ## Sign-in
