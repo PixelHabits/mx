@@ -77,7 +77,26 @@ const HeartbeatRow = Schema.Struct({
 	written_at: Schema.Int,
 });
 
-/** What mx sync last wrote about itself, after a pass or when its mode changed. */
+const AccountSyncRow = Schema.Struct({
+	id: Schema.Int,
+	last_error: Schema.NullOr(Schema.String),
+	last_success_at: Schema.NullOr(Schema.Int),
+	mode: SyncMode,
+});
+
+/** How mx sync follows one account, as it last wrote after a pass or a check of the account, or when its mode changed. */
+export interface AccountSync {
+	/** The account's last error as a one-line message for the user; none once a pass of it succeeds. */
+	readonly error: Option.Option<string>;
+	/** When a pass of the account last succeeded. */
+	readonly lastSuccess: Option.Option<Temporal.Instant>;
+	readonly mode: SyncMode;
+}
+
+/**
+ * What mx sync last wrote about itself, after a pass or when its mode changed. With several accounts, its mode, last
+ * success and last error sum up theirs, so an mx mcp of an earlier release reads mx sync as a whole.
+ */
 export interface Heartbeat {
 	/** When mx sync wrote it. */
 	readonly at: Temporal.Instant;
@@ -339,6 +358,13 @@ export class Store extends Context.Service<
 		readonly heartbeat: Effect.Effect<Option.Option<Heartbeat>>;
 		/** Replaces the heartbeat. */
 		readonly beat: (heartbeat: Heartbeat) => Effect.Effect<void>;
+		/** How mx sync last followed each account it wrote about, by account id. */
+		readonly accountSyncs: Effect.Effect<ReadonlyMap<number, AccountSync>>;
+		/** Replaces how mx sync follows the account. */
+		readonly saveAccountSync: (
+			accountId: number,
+			sync: AccountSync
+		) => Effect.Effect<void>;
 	}
 >()("mx/store") {
 	static readonly layer = Layer.effect(
@@ -678,7 +704,33 @@ export class Store extends Context.Service<
 					ON CONFLICT (id) DO UPDATE SET written_at = excluded.written_at, last_success_at = excluded.last_success_at, mode = excluded.mode, version = excluded.version, last_error = excluded.last_error`
 				);
 
+			const accountSyncs = all(
+				AccountSyncRow,
+				sql`SELECT id, mode, last_success_at, last_error FROM accounts`
+			).pipe(
+				Effect.map(
+					(rows): ReadonlyMap<number, AccountSync> =>
+						new Map(
+							Arr.map(rows, (row) => [
+								row.id,
+								{
+									error: Option.fromNullishOr(row.last_error),
+									lastSuccess: instant(row.last_success_at),
+									mode: row.mode,
+								},
+							])
+						)
+				)
+			);
+
+			const saveAccountSync = (accountId: number, followed: AccountSync) =>
+				run(
+					sql`INSERT INTO accounts (id, mode, last_success_at, last_error) VALUES (${accountId}, ${followed.mode}, ${Option.getOrNull(Option.map(followed.lastSuccess, (at) => at.epochMilliseconds))}, ${Option.getOrNull(followed.error)})
+					ON CONFLICT (id) DO UPDATE SET mode = excluded.mode, last_success_at = excluded.last_success_at, last_error = excluded.last_error`
+				);
+
 			return Store.of({
+				accountSyncs,
 				beat,
 				byGraphId,
 				byId,
@@ -693,6 +745,7 @@ export class Store extends Context.Service<
 				placements,
 				reindex,
 				remove,
+				saveAccountSync,
 				saveFolder,
 				saveFolders,
 				saveInPlace,

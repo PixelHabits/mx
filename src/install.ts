@@ -194,9 +194,9 @@ export class Installer extends Context.Service<
 		readonly restartSync: Effect.Effect<void, InstallFailed>;
 		/**
 		 * Restarts the background `mx sync` when `mx install` registered it to start at sign-in, as after `mx login`, so
-		 * it runs with the new sign-in; does nothing elsewhere, as for mx run from source.
+		 * it runs with the new sign-in; does nothing elsewhere, as for mx run from source. Answers whether it restarted it.
 		 */
-		readonly resumeSync: Effect.Effect<void, InstallFailed>;
+		readonly resumeSync: Effect.Effect<boolean, InstallFailed>;
 		/**
 		 * Deletes the copies of mx.exe and mxw.exe that a reinstall or an update on Windows moved aside. A copy that still
 		 * runs, as the mx mcp an agent started, stays; the next install, update or start of mx sync tries again.
@@ -610,10 +610,11 @@ export class Installer extends Context.Service<
 
 			const resumeSync = Effect.gen(function* () {
 				if (!(yield* syncAtSignIn.registered)) {
-					return;
+					return false;
 				}
 				yield* syncAtSignIn.restart;
 				yield* Console.log("Restarted mx sync.");
+				return true;
 			});
 
 			/** The user's own PATH on Windows, as stored. A PATH mx could not read fails, so mx never writes over one. */

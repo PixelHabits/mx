@@ -131,6 +131,14 @@ export class NewerStore extends Schema.TaggedError<
 	}
 }
 
+/** `mx sync --once` could not sync some of several accounts; `message` names each, a line apiece, and why. */
+export class SyncFailed extends Schema.TaggedError<
+	SyncFailed,
+	{ readonly brand: unique symbol }
+>("mx/errors/SyncFailed")("SyncFailed", {
+	message: Schema.String,
+}) {}
+
 /** `mx status` found mx sync stopped or reporting an error; `message` says which. */
 export class SyncUnhealthy extends Schema.TaggedError<
 	SyncUnhealthy,

@@ -58,17 +58,19 @@ import {
 	NewerStore,
 	Refused,
 	SignInFailed,
+	SyncFailed,
 	SyncUnhealthy,
 	UpdateFailed,
 } from "./errors.ts";
 import { Installer, type Removal } from "./install.ts";
 import { entryJson, entryText, Log, type Logged } from "./log.ts";
+import { Mailboxes, mailbox } from "./mailboxes.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
 import { showProgress } from "./progress.ts";
-import { statusReport } from "./status.ts";
+import { accountSignInExpired, statusReport } from "./status.ts";
 import { Store } from "./store.ts";
-import { Sync, summary } from "./sync.ts";
+import { aboutAccount, Sync, summary } from "./sync.ts";
 import { InstantFromString, PlainDateFromString } from "./temporal.ts";
 import { Updater } from "./update.ts";
 import { Watch } from "./watch.ts";
@@ -230,12 +232,20 @@ const login = Command.make(
 			const target = yield* loginTarget(yield* file.read, flags);
 			yield* (yield* Accounts).signIn(target);
 			const accounts = yield* file.read;
-			if (target.added && accounts.length > 1) {
+			const joined = target.added && accounts.length > 1;
+			if (joined) {
 				yield* Console.log(
 					`The accounts are ${listed.format(Arr.map(accounts, described))}. To rename one, run mx rename <alias> <new alias>.`
 				);
 			}
-			yield* (yield* Installer).resumeSync;
+			const resumed = yield* (yield* Installer).resumeSync;
+			if (joined) {
+				yield* Console.log(
+					resumed
+						? `Added ${target.account.alias}. mx sync copies its mail in the background. Run mx status to see how far it has got.`
+						: `Added ${target.account.alias}. mx sync is not set up here, so nothing copies its mail yet. Run mx install to start it.`
+				);
+			}
 		})
 ).pipe(
 	Command.provide(
@@ -244,7 +254,7 @@ const login = Command.make(
 		)
 	),
 	Command.withDescription(
-		"Sign in to Microsoft with a device code, save the refresh token in the system's secret store, and restart mx sync with the new sign-in. mx login asks for a client id and a tenant once for each account, or takes --client-id and --tenant, and saves them. --account names the account: an alias mx has signs it in again, and a new alias adds an account. Without --account, mx signs in to the one account, or asks which when there are several."
+		"Sign in to Microsoft with a device code, save the refresh token in the system's secret store, and restart mx sync with the new sign-in. mx login asks for a client id and a tenant once for each account, or takes --client-id and --tenant, and saves them. --account names the account: an alias mx has signs it in again, and a new alias adds an account. mx sync then copies the new account's mail in the background, and mx status shows how far it has got; where mx install has not set up mx sync, mx login says to run mx install. Without --account, mx signs in to the one account, or asks which when there are several."
 	)
 );
 
@@ -295,8 +305,44 @@ const sync = Command.make(
 	({ once }) =>
 		Effect.gen(function* () {
 			if (once) {
-				yield* Console.log(summary(yield* (yield* Sync).pass));
-				return;
+				const accounts = yield* (yield* AccountsFile).read;
+				if (!Arr.isReadonlyArrayNonEmpty(accounts)) {
+					return yield* LoginRequired.make({ reason: "mx has no account." });
+				}
+				const several = accounts.length > 1;
+				// Every account gets its pass, so one account's failure stops only that account.
+				return yield* Effect.validate(
+					accounts,
+					(account) => {
+						const about = aboutAccount(several, account.alias);
+						return Effect.gen(function* () {
+							const { pass } = (yield* mailbox(account.id)).sync;
+							yield* Console.log(about(summary(yield* pass)));
+						}).pipe(
+							Effect.scoped,
+							Effect.mapError((error) => ({
+								error,
+								line: about(
+									error._tag === "LoginRequired"
+										? accountSignInExpired(account.alias)
+										: error.message
+								),
+							}))
+						);
+					},
+					{ discard: true }
+				).pipe(
+					Effect.mapError((failures) =>
+						several
+							? SyncFailed.make({
+									message: Arr.join(
+										Arr.map(failures, ({ line }) => line),
+										"\n"
+									),
+								})
+							: Arr.headNonEmpty(failures).error
+					)
+				);
 			}
 			const installer = yield* Installer;
 			const updater = yield* Updater;
@@ -324,15 +370,16 @@ const sync = Command.make(
 ).pipe(
 	Command.provide(
 		Layer.mergeAll(
-			Sync.layer,
+			Mailboxes.layer,
+			AccountsFile.layer,
 			Watch.layer,
 			Installer.layer,
 			Updater.layer,
 			syncLog
-		).pipe(Layer.provide(Layer.mergeAll(Paths.layer, AccountId.first)))
+		).pipe(Layer.provide(Paths.layer))
 	),
 	Command.withDescription(
-		"Keep the local store in step with the mailbox: Graph push notifications through a cloudflared quick tunnel, and a delta pass of every folder every 5 minutes, or every 60 seconds while push is down."
+		"Keep the local store in step with every account's mailbox: Graph push notifications through one cloudflared quick tunnel, and a delta pass of every folder every 5 minutes, or every 60 seconds while push is down. An account whose sign-in expires stops, and the others go on."
 	)
 );
 
@@ -468,7 +515,9 @@ const mcp = Command.make("mcp", {}, () =>
 
 const status = Command.make("status", {}, () =>
 	Effect.gen(function* () {
-		const heartbeat = yield* (yield* Store).heartbeat;
+		const store = yield* Store;
+		const heartbeat = yield* store.heartbeat;
+		const syncs = yield* store.accountSyncs;
 		const credentials = yield* Credentials;
 		const accounts = yield* Effect.forEach(
 			yield* (yield* AccountsFile).read,
@@ -487,7 +536,19 @@ const status = Command.make("status", {}, () =>
 								problem: Option.none<string>(),
 							}),
 					}),
-					Effect.map((signIn) => ({ account, signIn }))
+					Effect.flatMap((signIn) =>
+						Effect.map(store.folders(account.id), (folders) => ({
+							account,
+							folders: {
+								done: Arr.filter(folders, ({ deltaLink }) =>
+									Option.isSome(deltaLink)
+								).length,
+								listed: folders.length,
+							},
+							signIn,
+							sync: Option.fromUndefinedOr(syncs.get(account.id)),
+						}))
+					)
 				)
 		);
 		const now = Temporal.Instant.fromEpochMilliseconds(
@@ -511,7 +572,7 @@ const status = Command.make("status", {}, () =>
 		)
 	),
 	Command.withDescription(
-		"Say whether mx sync is running, when it last synced, its mode and version, and its last error, and for each account who signed in to it, whether a sign-in is saved, its client id and its tenant. Exits non-zero when sync is not running, mail is out of date, or sync reports an error."
+		"Say whether mx sync is running and its version; when mail last synced, how far a first sync has got while it runs, its mode and its last error, for each account when there are several; and for each account who signed in to it, whether a sign-in is saved, its client id and its tenant. Exits non-zero when sync is not running, an account's mail is out of date, or sync reports an error."
 	)
 );
 
@@ -659,6 +720,7 @@ const isExplained = Schema.is(
 		NewerStore,
 		Refused,
 		SignInFailed,
+		SyncFailed,
 		SyncUnhealthy,
 		UpdateFailed,
 	])

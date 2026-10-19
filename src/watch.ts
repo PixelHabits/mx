@@ -2,6 +2,7 @@ import {
 	Array as Arr,
 	Clock,
 	Context,
+	Deferred,
 	Duration,
 	Effect,
 	Latch,
@@ -11,26 +12,35 @@ import {
 	Ref,
 	Schedule,
 	Schema,
+	SynchronizedRef,
 } from "effect";
 import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import packageJson from "../package.json" with { type: "json" };
+import { type Account, AccountsFile } from "./auth/config.ts";
 import {
 	type CredentialFailed,
-	type LoginRequired,
+	LoginRequired,
 	PushUnavailable,
 } from "./errors.ts";
 import type { Subscription } from "./graph/api.ts";
-import { Graph, type GraphError } from "./graph/graph.ts";
+import type { Graph, GraphError } from "./graph/graph.ts";
 import { policy } from "./http-policy.ts";
+import { Mailboxes, mailbox } from "./mailboxes.ts";
 import { Cloudflared } from "./push/cloudflared.ts";
-import { beatInterval, signInExpired } from "./status.ts";
-import { Store, type SyncMode } from "./store.ts";
+import { accountSignInExpired, beatInterval, signInExpired } from "./status.ts";
 import {
+	type AccountSync,
+	type Heartbeat,
+	Store,
+	type SyncMode,
+} from "./store.ts";
+import {
+	aboutAccount,
 	type Pass,
 	reconcileSummary,
 	type Skipped,
-	Sync,
+	type Sync,
 	skippedLine,
 	summary,
 } from "./sync.ts";
@@ -132,21 +142,96 @@ const webhook =
 const randomHex = (bytes: number) =>
 	Hex.encode(crypto.getRandomValues(new Uint8Array(bytes)));
 
+/** How mx sync follows an account in this run: as the store keeps it, and when its last error happened. */
+interface Status extends AccountSync {
+	/** When the last error happened, on this run's clock; 0 for an error an earlier mx sync recorded. */
+	readonly errorAt: number;
+}
+
+/** An account mx sync follows: its mailbox, and how this run's passes, checks and push go for it. */
+interface Followed {
+	/** A line mx sync logs about the account. */
+	readonly about: (text: string) => string;
+	readonly account: Account;
+	/** What mx sync records when Microsoft refuses the account's saved sign-in or it has none. */
+	readonly expired: string;
+	/** Opens once a pass of the account has succeeded, which its first check against Graph waits for. */
+	readonly firstPass: Latch.Latch;
+	readonly graph: Graph["Service"];
+	readonly lastPoll: Ref.Ref<number>;
+	/** The notifications of the account's subscriptions, which its push takes in batches. */
+	readonly notifications: Queue.Queue<Notification>;
+	readonly status: SynchronizedRef.SynchronizedRef<Status>;
+	/** Fails once the account stops: its sign-in expired or the secret store failed. */
+	readonly stopped: Deferred.Deferred<never, LoginRequired | CredentialFailed>;
+	/** The account's subscription ids on this run's current tunnel by folder, which renewals keep and shutdown deletes. */
+	readonly subscribed: Ref.Ref<ReadonlyMap<Watched, string>>;
+	readonly sync: Sync["Service"];
+}
+
+/** The earlier of two instants. */
+const earlier = (a: Temporal.Instant, b: Temporal.Instant) =>
+	Temporal.Instant.compare(a, b) <= 0 ? a : b;
+
 /**
- * `mx sync` as a service: Graph push notifications first, polling as the fallback. Push runs a cloudflared quick tunnel
- * to a local webhook and two Graph subscriptions, on Inbox and Sent Items; each notification runs a delta pass for its
- * folder. Every folder is also polled, every 5 minutes while push is up and every 60 seconds while it is down, and push
- * tries again every 10 minutes. After the first pass and then once a day, it checks the store against Graph and repairs
- * what the deltas missed. A folder or a message Graph refuses is skipped and named in the heartbeat, and Graph's other
- * failures wait for the next pass or check, so only a failure the user must fix stops mx sync. The heartbeat row in the
- * store says how it goes: mx sync writes it every minute, and after every pass and check and on every change of mode.
+ * What the heartbeat says of the accounts, for an mx mcp of an earlier release that reads it alone: push while any
+ * account has push, the oldest of their last successes, and the newest of their errors, named by `about`.
+ */
+const summed = (
+	statuses: readonly (readonly [Followed, Status])[]
+): Pick<Heartbeat, "error" | "lastSuccess" | "mode"> => {
+	const modes = new Set(Arr.map(statuses, ([, status]) => status.mode));
+	const mode = Option.getOrElse(
+		Arr.findFirst(["push", "poll"] as const, (each) => modes.has(each)),
+		(): SyncMode => "starting"
+	);
+	const lastSuccess = Option.flatMap(
+		Option.all(Arr.map(statuses, ([, status]) => status.lastSuccess)),
+		Arr.match({
+			onEmpty: () => Option.none<Temporal.Instant>(),
+			onNonEmpty: ([first, ...rest]) =>
+				Option.some(Arr.reduce(rest, first, earlier)),
+		})
+	);
+	const error = Arr.reduce(
+		statuses,
+		Option.none<{ readonly at: number; readonly message: string }>(),
+		(newest, [followed, status]) =>
+			Option.match(status.error, {
+				onNone: () => newest,
+				onSome: (message) =>
+					Option.exists(newest, ({ at }) => at >= status.errorAt)
+						? newest
+						: Option.some({
+								at: status.errorAt,
+								message: followed.about(message),
+							}),
+			})
+	);
+	return {
+		error: Option.map(error, ({ message }) => message),
+		lastSuccess,
+		mode,
+	};
+};
+
+/**
+ * `mx sync` as a service: every account that config.json names, in one process, through one cloudflared quick tunnel to
+ * a local webhook. Each account has two Graph subscriptions, on Inbox and Sent Items, and each notification runs a delta
+ * pass of its folder in its own account. Every folder of each account is also polled, every 5 minutes while the account
+ * has push and every 60 seconds while it does not, and push tries again every 10 minutes. After an account's first pass
+ * and then once a day, mx sync checks its part of the store against Graph and repairs what the deltas missed. A folder
+ * or a message Graph refuses is skipped and named in the account's status, and Graph's other failures wait for the next
+ * pass or check, so only a failure the user must fix stops an account, and the others go on. The store keeps each
+ * account's status, written as mx sync starts, after every pass and check of it and on every change of its mode, and
+ * the heartbeat, which mx sync writes every minute and with each status, and which sums up the accounts'.
  */
 export class Watch extends Context.Service<
 	Watch,
 	{
 		/**
-		 * Runs until the sign-in expires or the secret store fails, and records that failure in the heartbeat first; ending
-		 * it deletes this run's subscriptions.
+		 * Runs until every account has stopped. An account stops when its sign-in expires or the secret store fails, and
+		 * records that failure first; ending it deletes this run's subscriptions.
 		 */
 		readonly run: Effect.Effect<never, LoginRequired | CredentialFailed>;
 	}
@@ -154,25 +239,47 @@ export class Watch extends Context.Service<
 	static readonly layerNoDeps = Layer.effect(
 		Watch,
 		Effect.gen(function* () {
-			const graph = yield* Graph;
-			const sync = yield* Sync;
 			const cloudflared = yield* Cloudflared;
 			const store = yield* Store;
 			const http = policy(yield* HttpClient.HttpClient);
 			/** Graph sends it back on every notification; at most 128 characters. */
 			const clientState = randomHex(32);
-			/** The subscription ids of this run's current tunnel by folder, which renewals keep and shutdown deletes. */
-			const subscribed = yield* Ref.make(new Map<Watched, string>());
-			const mode = yield* Ref.make<SyncMode>("starting");
-			const lastPoll = yield* Ref.make(0);
-			/** How the passes went, carried over from the heartbeat an earlier mx sync wrote. */
-			const outcome = yield* Ref.make(
-				Option.match(yield* store.heartbeat, {
-					onNone: () => ({
-						error: Option.none<string>(),
-						lastSuccess: Option.none<Temporal.Instant>(),
-					}),
-					onSome: ({ error, lastSuccess }) => ({ error, lastSuccess }),
+			const accounts = yield* (yield* AccountsFile).read;
+			const several = accounts.length > 1;
+			const saved = yield* store.accountSyncs;
+			const following = yield* Effect.forEach(accounts, (account) =>
+				Effect.gen(function* () {
+					const { graph, sync } = yield* mailbox(account.id);
+					/** How the account's passes went, carried over from what an earlier mx sync wrote. */
+					const before = Option.fromUndefinedOr(saved.get(account.id));
+					return {
+						about: aboutAccount(several, account.alias),
+						account,
+						expired: several
+							? accountSignInExpired(account.alias)
+							: signInExpired,
+						firstPass: yield* Latch.make(),
+						graph,
+						lastPoll: yield* Ref.make(0),
+						notifications: yield* Queue.unbounded<Notification>(),
+						status: yield* SynchronizedRef.make<Status>({
+							error: Option.flatMap(before, ({ error }) => error),
+							errorAt: 0,
+							lastSuccess: Option.flatMap(
+								before,
+								({ lastSuccess }) => lastSuccess
+							),
+							mode: "starting",
+						}),
+						stopped: yield* Deferred.make<
+							never,
+							LoginRequired | CredentialFailed
+						>(),
+						subscribed: yield* Ref.make<ReadonlyMap<Watched, string>>(
+							new Map()
+						),
+						sync,
+					} satisfies Followed;
 				})
 			);
 
@@ -181,72 +288,102 @@ export class Watch extends Context.Service<
 			);
 
 			const beat = Effect.gen(function* () {
-				const { error, lastSuccess } = yield* Ref.get(outcome);
+				const statuses = yield* Effect.forEach(following, (followed) =>
+					Effect.map(
+						SynchronizedRef.get(followed.status),
+						(status) => [followed, status] as const
+					)
+				);
 				yield* store.beat({
 					at: yield* currentInstant,
-					error,
-					lastSuccess,
-					mode: yield* Ref.get(mode),
+					...summed(statuses),
 					version: packageJson.version,
 				});
 			});
 
-			const recordError = (message: string) =>
-				Ref.update(outcome, (current) => ({
-					...current,
-					error: Option.some(message),
-				})).pipe(Effect.andThen(beat));
+			/** Changes how mx sync follows the account, writes that and the heartbeat, and answers how it followed it before. */
+			const record = (followed: Followed, change: (status: Status) => Status) =>
+				SynchronizedRef.modifyEffect(followed.status, (before) => {
+					const after = change(before);
+					return Effect.as(store.saveAccountSync(followed.account.id, after), [
+						before,
+						after,
+					] as const);
+				}).pipe(Effect.tap(() => beat));
 
-			/** Opens once a pass has succeeded, which the first check against Graph waits for. */
-			const firstPass = yield* Latch.make();
+			const recordError = (followed: Followed, message: string) =>
+				Effect.flatMap(Clock.currentTimeMillis, (now) =>
+					record(followed, (status) => ({
+						...status,
+						error: Option.some(message),
+						errorAt: now,
+					}))
+				);
 
 			/**
-			 * Records how a pass or a check went in the heartbeat, with what it skipped, and answers whether it succeeded. A
+			 * Records how a pass or a check of the account went, with what it skipped, and answers whether it succeeded. A
 			 * refusal or an outage that stops it is logged and waits for the next one.
 			 */
-			const recorded = (work: Effect.Effect<readonly Skipped[], GraphError>) =>
+			const recorded = (
+				followed: Followed,
+				work: Effect.Effect<readonly Skipped[], GraphError>
+			) =>
 				Effect.gen(function* () {
 					const skipped = yield* work;
 					const error = Arr.isReadonlyArrayNonEmpty(skipped)
 						? Option.some(skippedLine(skipped))
 						: Option.none<string>();
 					if (Option.isSome(error)) {
-						yield* Effect.logWarning(error.value);
+						yield* Effect.logWarning(followed.about(error.value));
 					}
-					yield* Ref.set(outcome, {
+					const now = yield* Clock.currentTimeMillis;
+					yield* record(followed, (status) => ({
+						...status,
 						error,
-						lastSuccess: Option.some(yield* currentInstant),
-					});
-					yield* beat;
+						errorAt: now,
+						lastSuccess: Option.some(
+							Temporal.Instant.fromEpochMilliseconds(now)
+						),
+					}));
 					return true;
 				}).pipe(
 					Effect.catchTag(["GraphRefused", "MicrosoftUnavailable"], (error) =>
 						Effect.andThen(
-							Effect.logWarning(error.message),
-							recordError(error.message)
+							Effect.logWarning(followed.about(error.message)),
+							recordError(followed, error.message)
 						).pipe(Effect.as(false))
 					)
 				);
 
-			/** A pass that logs what it changed and records how it went. */
-			const logged = (pass: Effect.Effect<Pass, GraphError>) =>
+			/** A pass of the account that logs what it changed and records how it went. */
+			const logged = (
+				followed: Followed,
+				pass: Effect.Effect<Pass, GraphError>
+			) =>
 				recorded(
+					followed,
 					pass.pipe(
 						Effect.tap((done) =>
 							done.saved + done.removed > 0
-								? Effect.logInfo(summary(done))
+								? Effect.logInfo(followed.about(summary(done)))
 								: Effect.void
 						),
-						Effect.tap(firstPass.open),
+						Effect.tap(followed.firstPass.open),
 						Effect.map((done) => done.skipped)
 					)
 				);
 
-			const changeMode = (next: "push" | "poll", line: string) =>
-				Effect.flatMap(Ref.getAndSet(mode, next), (previous) =>
-					previous === next
-						? Effect.void
-						: Effect.andThen(Effect.logInfo(line), beat)
+			const changeMode = (
+				followed: Followed,
+				next: "push" | "poll",
+				line: string
+			) =>
+				Effect.flatMap(
+					record(followed, (status) => ({ ...status, mode: next })),
+					(before) =>
+						before.mode === next
+							? Effect.void
+							: Effect.logInfo(followed.about(line))
 				);
 
 			const unavailable = (message: string) =>
@@ -282,8 +419,9 @@ export class Watch extends Context.Service<
 					})
 				);
 
-			/** Renews the folder's subscription, or subscribes it through `url` when the tunnel has none or Graph lost it. */
+			/** Renews the account's subscription of the folder, or subscribes it through `url` when it has none or Graph lost it. */
 			const keepSubscribed = Effect.fnUntraced(function* (
+				followed: Followed,
 				folder: Watched,
 				url: string
 			) {
@@ -291,19 +429,23 @@ export class Watch extends Context.Service<
 					(yield* Clock.currentTimeMillis) +
 						Duration.toMillis(subscriptionLifetime)
 				);
-				const existing = (yield* Ref.get(subscribed)).get(folder);
+				const existing = (yield* Ref.get(followed.subscribed)).get(folder);
 				if (existing !== undefined) {
-					const renewed = yield* graph.renew(existing, expiration).pipe(
-						Effect.asSome,
-						Effect.catchTag("GraphRefused", (refused) =>
-							refused.status === 404 ? Effect.succeedNone : Effect.fail(refused)
-						)
-					);
+					const renewed = yield* followed.graph
+						.renew(existing, expiration)
+						.pipe(
+							Effect.asSome,
+							Effect.catchTag("GraphRefused", (refused) =>
+								refused.status === 404
+									? Effect.succeedNone
+									: Effect.fail(refused)
+							)
+						);
 					if (Option.isSome(renewed)) {
 						return renewed.value;
 					}
 				}
-				const created = yield* graph.subscribe({
+				const created = yield* followed.graph.subscribe({
 					changeType,
 					clientState,
 					expiration,
@@ -311,46 +453,53 @@ export class Watch extends Context.Service<
 					notificationUrl: url,
 					resource: `me/mailFolders('${folder}')/messages`,
 				});
-				yield* Ref.update(subscribed, (current) =>
+				yield* Ref.update(followed.subscribed, (current) =>
 					new Map(current).set(folder, created.id)
 				);
 				return created;
 			});
 
 			/**
-			 * Deletes the quick-tunnel subscriptions that are not the current tunnel's: those an earlier `mx sync` left behind,
-			 * and this run's on a tunnel that ended.
+			 * Deletes the account's quick-tunnel subscriptions that are not its current ones: those an earlier `mx sync` left
+			 * behind, and this run's on a tunnel that ended.
 			 */
-			const clearStale = Effect.gen(function* () {
-				const ours = new Set((yield* Ref.get(subscribed)).values());
-				const stale = Arr.filter(
-					yield* graph.subscriptions,
-					(subscription: Subscription) =>
-						quickTunnelUrl.test(subscription.notificationUrl) &&
-						!ours.has(subscription.id)
-				);
-				yield* Effect.forEach(stale, ({ id }) => graph.unsubscribe(id), {
-					discard: true,
+			const clearStale = (followed: Followed) =>
+				Effect.gen(function* () {
+					const ours = new Set((yield* Ref.get(followed.subscribed)).values());
+					const stale = Arr.filter(
+						yield* followed.graph.subscriptions,
+						(subscription: Subscription) =>
+							quickTunnelUrl.test(subscription.notificationUrl) &&
+							!ours.has(subscription.id)
+					);
+					yield* Effect.forEach(
+						stale,
+						({ id }) => followed.graph.unsubscribe(id),
+						{ discard: true }
+					);
 				});
-			});
 
 			/**
-			 * Handles notifications in batches: each changed folder gets one delta pass, `missed` gets one too, and
-			 * `reauthorizationRequired` reauthorizes. Graph removing a subscription ends push, so the next start subscribes again.
+			 * Handles the account's notifications in batches: each changed folder gets one delta pass, `missed` gets one too,
+			 * and `reauthorizationRequired` reauthorizes. Graph removing a subscription ends the account's push, so it
+			 * subscribes again.
 			 */
 			const consume = (
-				queue: Queue.Dequeue<Notification>,
+				followed: Followed,
 				folderIds: ReadonlyMap<Watched, string>
 			) =>
 				Effect.gen(function* () {
-					const first = yield* Queue.takeAll(queue);
+					const first = yield* Queue.takeAll(followed.notifications);
 					yield* Effect.sleep(notificationDebounce);
-					const batch = [...first, ...(yield* Queue.clear(queue))];
+					const batch = [
+						...first,
+						...(yield* Queue.clear(followed.notifications)),
+					];
 					const bySubscription = new Map(
-						Arr.map([...(yield* Ref.get(subscribed))], ([folder, id]) => [
-							id,
-							folderIds.get(folder),
-						])
+						Arr.map(
+							[...(yield* Ref.get(followed.subscribed))],
+							([folder, id]) => [id, folderIds.get(folder)]
+						)
 					);
 					const changed = new Set<string>();
 					for (const { lifecycleEvent, subscriptionId } of batch) {
@@ -362,25 +511,122 @@ export class Watch extends Context.Service<
 							return yield* unavailable("Graph removed a subscription.");
 						}
 						if (lifecycleEvent === "reauthorizationRequired") {
-							yield* graph.reauthorize(subscriptionId);
+							yield* followed.graph.reauthorize(subscriptionId);
 						} else {
 							changed.add(folderId);
 						}
 					}
 					yield* Effect.forEach(
 						changed,
-						(folderId) => logged(sync.folderPass(folderId)),
+						(folderId) => logged(followed, followed.sync.folderPass(folderId)),
 						{ discard: true }
 					);
 				}).pipe(Effect.forever);
 
-			const renew = (url: string) =>
+			const renew = (followed: Followed, url: string) =>
 				Effect.sleep(renewalInterval).pipe(
 					Effect.andThen(
-						Effect.forEach(watched, (folder) => keepSubscribed(folder, url))
+						Effect.forEach(watched, (folder) =>
+							keepSubscribed(followed, folder, url)
+						)
 					),
 					Effect.forever
 				);
+
+			/** The account's push through the tunnel at `url`: subscribed and in step until anything of its own fails. */
+			const joined = (followed: Followed, url: string) =>
+				Effect.gen(function* () {
+					// Graph cannot move a subscription's lifecycle notifications to a new URL, so each start subscribes afresh.
+					yield* Ref.set(followed.subscribed, new Map());
+					yield* clearStale(followed);
+					yield* Effect.forEach(watched, (folder) =>
+						keepSubscribed(followed, folder, url)
+					);
+					const folderIds = new Map(
+						yield* Effect.forEach(watched, (folder) =>
+							Effect.map(
+								followed.graph.folder(folder),
+								({ id }) => [folder, id] as const
+							)
+						)
+					);
+					yield* logged(followed, followed.sync.pass);
+					yield* changeMode(
+						followed,
+						"push",
+						`Push is up through ${url}; polling every ${Duration.format(healthyPollInterval)}.`
+					);
+					return yield* Effect.raceFirst(
+						renew(followed, url),
+						consume(followed, folderIds)
+					);
+				});
+
+			/**
+			 * The account's push for as long as the tunnel at `url` lives. A failure of the account's own puts it on polling:
+			 * it subscribes again at once when it had push, and after a wait when it never got it.
+			 */
+			const pushThrough = (followed: Followed, url: string) =>
+				joined(followed, url).pipe(
+					Effect.catchTag(
+						["PushUnavailable", "GraphRefused", "MicrosoftUnavailable"],
+						(failure) =>
+							Effect.gen(function* () {
+								if (
+									(yield* SynchronizedRef.get(followed.status)).mode === "push"
+								) {
+									yield* changeMode(
+										followed,
+										"poll",
+										`Push is down: ${failure.message} Polling every ${Duration.format(fallbackPollInterval)} while mx subscribes again.`
+									);
+									return;
+								}
+								yield* changeMode(
+									followed,
+									"poll",
+									`Push is unavailable: ${failure.message} Polling every ${Duration.format(fallbackPollInterval)}; push tries again every ${Duration.format(pushRetryInterval)}.`
+								);
+								yield* Effect.sleep(pushRetryInterval);
+							})
+					),
+					Effect.forever
+				);
+
+			/** Runs `work` of the account until the account stops, unless it has; a failure of `work` stops it. */
+			const untilStopped = (
+				followed: Followed,
+				work: Effect.Effect<never, LoginRequired | CredentialFailed>
+			) =>
+				Effect.flatMap(Deferred.isDone(followed.stopped), (done) =>
+					done
+						? Effect.void
+						: work.pipe(
+								Effect.raceFirst(Deferred.await(followed.stopped)),
+								Effect.catch((error) => Deferred.fail(followed.stopped, error)),
+								Effect.asVoid
+							)
+				);
+
+			/** Hands each notification to the account whose subscription it names; one that no account holds is dropped. */
+			const dispatch = (queue: Queue.Dequeue<Notification>) =>
+				Effect.gen(function* () {
+					const batch = yield* Queue.takeAll(queue);
+					const owners = yield* Effect.forEach(following, (followed) =>
+						Effect.map(
+							Ref.get(followed.subscribed),
+							(current) => [followed, new Set(current.values())] as const
+						)
+					);
+					for (const notification of batch) {
+						const owner = Arr.findFirst(owners, ([, ids]) =>
+							ids.has(notification.subscriptionId)
+						);
+						if (Option.isSome(owner)) {
+							yield* Queue.offer(owner.value[0].notifications, notification);
+						}
+					}
+				}).pipe(Effect.forever);
 
 			const checkTunnel = (url: string) =>
 				Effect.sleep(tunnelCheckInterval).pipe(
@@ -388,7 +634,7 @@ export class Watch extends Context.Service<
 					Effect.forever
 				);
 
-			/** One tunnel's life: up, subscribed and in step, until anything fails. */
+			/** One tunnel's life: up, with each account's push through it, until the tunnel fails. */
 			const session = Effect.gen(function* () {
 				const queue = yield* Queue.unbounded<Notification>();
 				const server = yield* Effect.acquireRelease(
@@ -407,97 +653,155 @@ export class Watch extends Context.Service<
 				const tunnel = yield* cloudflared.open(server.port);
 				const url = `https://${tunnel.host}/graph`;
 				yield* reachable(url).pipe(Effect.raceFirst(tunnel.exited));
-				// Graph cannot move a subscription's lifecycle notifications to a new URL, so each tunnel subscribes afresh.
-				yield* Ref.set(subscribed, new Map());
-				yield* clearStale;
-				yield* Effect.forEach(watched, (folder) => keepSubscribed(folder, url));
-				const folderIds = new Map(
-					yield* Effect.forEach(watched, (folder) =>
-						Effect.map(graph.folder(folder), ({ id }) => [folder, id] as const)
-					)
-				);
-				yield* logged(sync.pass);
-				yield* changeMode(
-					"push",
-					`Push is up through ${url}; polling every ${Duration.format(healthyPollInterval)}.`
-				);
 				return yield* Effect.raceAllFirst([
 					tunnel.exited,
 					checkTunnel(url),
-					renew(url),
-					consume(queue, folderIds),
+					dispatch(queue),
+					Effect.forEach(
+						following,
+						(followed) => untilStopped(followed, pushThrough(followed, url)),
+						{ concurrency: "unbounded", discard: true }
+					).pipe(Effect.andThen(Effect.never)),
 				]);
 			}).pipe(Effect.scoped);
 
-			/** Deletes this run's subscriptions, as far as Graph answers in time. */
-			const unsubscribeAll = Effect.flatMap(Ref.get(subscribed), (current) =>
-				Effect.forEach(current.values(), (id) =>
-					Effect.ignore(graph.unsubscribe(id))
-				)
+			/** Deletes this run's subscriptions of every account, as far as Graph answers in time. */
+			const unsubscribeAll = Effect.forEach(
+				following,
+				(followed) =>
+					Effect.flatMap(Ref.get(followed.subscribed), (current) =>
+						Effect.forEach(
+							current.values(),
+							(id) => Effect.ignore(followed.graph.unsubscribe(id)),
+							{ discard: true }
+						)
+					),
+				{ concurrency: "unbounded", discard: true }
 			).pipe(Effect.timeoutOption(shutdownWait), Effect.asVoid);
 
-			/** A tunnel that ends after it came up is replaced at once; a start that fails waits before the next one. */
+			/**
+			 * A tunnel that ends after an account had push through it is replaced at once; a start that fails waits before the
+			 * next one. Either puts every account that goes on on polling.
+			 */
 			const push = Effect.gen(function* () {
 				const failure = yield* Effect.flip(session);
-				if ((yield* Ref.get(mode)) === "push") {
-					yield* changeMode(
-						"poll",
-						`Push is down: ${failure.message} Polling every ${Duration.format(fallbackPollInterval)} while a new tunnel starts.`
-					);
-					return;
-				}
-				yield* changeMode(
-					"poll",
-					`Push is unavailable: ${failure.message} Polling every ${Duration.format(fallbackPollInterval)}; push tries again every ${Duration.format(pushRetryInterval)}.`
+				const going = yield* Effect.filter(following, (followed) =>
+					Effect.map(Deferred.isDone(followed.stopped), (done) => !done)
 				);
-				yield* Effect.sleep(pushRetryInterval);
+				const hadPush = Arr.some(
+					yield* Effect.forEach(going, (followed) =>
+						SynchronizedRef.get(followed.status)
+					),
+					({ mode }) => mode === "push"
+				);
+				const line = hadPush
+					? `Push is down: ${failure.message} Polling every ${Duration.format(fallbackPollInterval)} while a new tunnel starts.`
+					: `Push is unavailable: ${failure.message} Polling every ${Duration.format(fallbackPollInterval)}; push tries again every ${Duration.format(pushRetryInterval)}.`;
+				yield* Effect.forEach(
+					going,
+					(followed) => changeMode(followed, "poll", line),
+					{ discard: true }
+				);
+				if (!hadPush) {
+					yield* Effect.sleep(pushRetryInterval);
+				}
 			}).pipe(Effect.forever, Effect.ensuring(unsubscribeAll));
 
-			/** A pass of every folder, every 60 seconds while push is down and every 5 minutes while it is up. */
-			const poll = Effect.gen(function* () {
-				const now = yield* Clock.currentTimeMillis;
-				const due =
-					(yield* Ref.get(mode)) !== "push" ||
-					now - (yield* Ref.get(lastPoll)) >=
-						Duration.toMillis(healthyPollInterval);
-				if (!due) {
-					return;
-				}
-				yield* Ref.set(lastPoll, now);
-				yield* logged(sync.pass);
-			}).pipe(Effect.repeat(Schedule.spaced(fallbackPollInterval)));
+			/** A pass of the account every 60 seconds while it has no push, and every 5 minutes while it has. */
+			const poll = (followed: Followed) =>
+				Effect.gen(function* () {
+					const now = yield* Clock.currentTimeMillis;
+					const due =
+						(yield* SynchronizedRef.get(followed.status)).mode !== "push" ||
+						now - (yield* Ref.get(followed.lastPoll)) >=
+							Duration.toMillis(healthyPollInterval);
+					if (!due) {
+						return;
+					}
+					yield* Ref.set(followed.lastPoll, now);
+					yield* logged(followed, followed.sync.pass);
+				}).pipe(Effect.repeat(Schedule.spaced(fallbackPollInterval)));
 
 			/**
-			 * The check against Graph, once the first pass succeeded, then every day, or an hour after a check that failed; it
-			 * logs what it repaired.
+			 * The account's check against Graph, once its first pass succeeded, then every day, or an hour after a check that
+			 * failed; it logs what it repaired.
 			 */
-			const reconcile = firstPass.await.pipe(
-				Effect.andThen(
-					recorded(
-						Effect.tap(sync.reconcile, (done) =>
-							Effect.logInfo(reconcileSummary(done))
-						).pipe(Effect.map((done) => done.skipped))
-					).pipe(
-						Effect.flatMap((succeeded) =>
-							Effect.sleep(
-								succeeded ? reconcileInterval : reconcileRetryInterval
-							)
-						),
-						Effect.forever
+			const reconcile = (followed: Followed) =>
+				followed.firstPass.await.pipe(
+					Effect.andThen(
+						recorded(
+							followed,
+							Effect.tap(followed.sync.reconcile, (done) =>
+								Effect.logInfo(followed.about(reconcileSummary(done)))
+							).pipe(Effect.map((done) => done.skipped))
+						).pipe(
+							Effect.flatMap((succeeded) =>
+								Effect.sleep(
+									succeeded ? reconcileInterval : reconcileRetryInterval
+								)
+							),
+							Effect.forever
+						)
 					)
+				);
+
+			/**
+			 * The account's polls and checks until it stops, through them or through its push. It records why, and logs it
+			 * when mx sync goes on with other accounts.
+			 */
+			const life = (followed: Followed) =>
+				Effect.raceAllFirst([
+					poll(followed),
+					reconcile(followed),
+					Deferred.await(followed.stopped),
+				]).pipe(
+					Effect.andThen(Effect.never),
+					Effect.tapError((error) =>
+						Effect.gen(function* () {
+							yield* Deferred.fail(followed.stopped, error);
+							const message =
+								error._tag === "LoginRequired"
+									? followed.expired
+									: error.message;
+							if (several) {
+								yield* Effect.logError(followed.about(message));
+							}
+							yield* recordError(followed, message);
+						})
+					)
+				);
+
+			/** Fails with the first account's failure once every account has stopped, and at once when there is none. */
+			const lives = Effect.forEach(
+				following,
+				(followed) => Effect.flip(life(followed)),
+				{ concurrency: "unbounded" }
+			).pipe(
+				Effect.flatMap(
+					Arr.match({
+						onEmpty: () =>
+							Effect.fail(LoginRequired.make({ reason: "mx has no account." })),
+						onNonEmpty: ([first]) => Effect.fail(first),
+					})
 				)
 			);
 
 			/** The heartbeat from start to stop, so mx sync looks alive however long a pass takes. */
 			const heartbeat = beat.pipe(Effect.repeat(Schedule.spaced(beatInterval)));
 
-			const run = Effect.raceAllFirst([heartbeat, push, poll, reconcile]).pipe(
+			/** Each account's status as this run starts, so the store holds no mode that an earlier mx sync left. */
+			const started = Effect.forEach(
+				following,
+				(followed) =>
+					Effect.flatMap(SynchronizedRef.get(followed.status), (status) =>
+						store.saveAccountSync(followed.account.id, status)
+					),
+				{ discard: true }
+			);
+
+			const run = started.pipe(
+				Effect.andThen(Effect.raceAllFirst([heartbeat, push, lives])),
 				Effect.andThen(Effect.never),
-				Effect.tapError((error) =>
-					recordError(
-						error._tag === "LoginRequired" ? signInExpired : error.message
-					)
-				),
 				Effect.withSpan("Watch.run")
 			);
 
@@ -507,7 +811,12 @@ export class Watch extends Context.Service<
 
 	static readonly layer = Watch.layerNoDeps.pipe(
 		Layer.provide(
-			Layer.mergeAll(Sync.layer, Graph.layer, Cloudflared.layer, Store.layer)
+			Layer.mergeAll(
+				Mailboxes.layer,
+				AccountsFile.layer,
+				Cloudflared.layer,
+				Store.layer
+			)
 		)
 	);
 }

@@ -1143,6 +1143,7 @@ const replyDraftLine = /^#\d+ .* Drafts \| to Carol Example/u;
 const permanent = /permanentDelete/u;
 const runningLine = /^mx sync: running, last heard from \d+ s ago$/u;
 const lastSyncLine = /^Last sync: \d{4}-\d{2}-\d{2} \d{2}:\d{2}, \d+ s ago$/u;
+const modeLine = /^Mode: /u;
 /** The line mx sync logs as it starts, when push comes up or cannot. */
 const pushModeLine = /^Push is (up through|unavailable:) /u;
 const loopbackUrl = /^http:\/\/127\.0\.0\.1:\d+$/u;
@@ -2213,9 +2214,23 @@ describe("mx", () => {
 			expect(lines(output).at(-1)).toBe("Restarted mx sync.");
 		}));
 
-	test("mx sync records a heartbeat after its first pass, and mx status reports it running with its mode, both versions, a saved sign-in, the client id and the tenant, and no error", () =>
+	test("mx status shows how far the first sync has got while it runs, and once mx sync records a heartbeat after its first pass, reports it running with its mode, both versions, a saved sign-in, the client id and the tenant, and no error", () =>
 		Effect.gen(function* () {
+			const firstSync = `First sync: ${allFolders.length - 1} of ${allFolders.length} folders done`;
+			microsoft.hold("folder-inbox");
 			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"mx status to show every folder but Inbox synced",
+				Effect.map(status, ({ output: report }) =>
+					lines(report).includes(firstSync)
+				)
+			);
+			expect(lines((yield* status).output).slice(1, 4)).toEqual([
+				"Last sync: never",
+				firstSync,
+				expect.stringMatching(modeLine),
+			]);
+			microsoft.release("folder-inbox");
 			yield* eventually(
 				"a heartbeat after the first pass",
 				Effect.map(
@@ -2239,7 +2254,13 @@ describe("mx", () => {
 				`Tenant: ${tenant}`,
 				"Last error: none",
 			]);
-		}));
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release("folder-inbox");
+				})
+			)
+		));
 
 	test("mx sync writes each line it logs to the log as it logs it, where mx log --sync shows it, and on Windows it writes no sync.log", () =>
 		onWindows(

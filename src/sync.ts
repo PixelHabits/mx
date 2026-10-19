@@ -57,6 +57,11 @@ export interface Pass {
 export const summary = ({ folders, removed, saved }: Pass) =>
 	`Synced ${folders} folders: ${saved} messages saved, ${removed} removed.`;
 
+/** A line about the account aliased `alias`: after the alias when mx syncs several accounts, and as it is with one. */
+export const aboutAccount =
+	(several: boolean, alias: string) => (text: string) =>
+		several ? `${alias}: ${text}` : text;
+
 /** What a check of the store against Graph repaired, and what it skipped. */
 export interface Reconciled {
 	/** Messages Graph holds that the store lacked. */

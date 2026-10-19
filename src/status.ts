@@ -1,6 +1,6 @@
 import { Array as Arr, Duration, Option } from "effect";
 import type { Account } from "./auth/config.ts";
-import type { Heartbeat } from "./store.ts";
+import type { AccountSync, Heartbeat } from "./store.ts";
 import { localTime } from "./temporal.ts";
 
 /** How often mx sync writes its heartbeat while it runs, however long a pass takes. */
@@ -14,6 +14,10 @@ const staleAfter = Duration.minutes(15);
 
 /** The last error mx sync records when Microsoft refuses the saved sign-in or there is none. */
 export const signInExpired = "Sign-in expired. Run mx login.";
+
+/** What mx says of the account aliased `alias` when Microsoft refuses its saved sign-in or it has none, among several. */
+export const accountSignInExpired = (alias: string) =>
+	`Sign-in expired. Run mx login --account ${alias}.`;
 
 /** How long before `now` the instant was, rounded down: `45 s`, `12 min`, `3 h` or `2 d`. */
 export const ago = (then: Temporal.Instant, now: Temporal.Instant) => {
@@ -83,29 +87,73 @@ export const syncWarning = (
 	);
 };
 
-/** An account as `mx status` shows it: its sign-in line, and the problem when the secret store could not be read. */
+/**
+ * An account as `mx status` shows it: its sign-in line, the problem when the secret store could not be read, how mx
+ * sync last followed it, when it wrote that, and how many of the folders the store knows have finished their first
+ * sync.
+ */
 export interface AccountStatus {
 	readonly account: Account;
+	readonly folders: { readonly done: number; readonly listed: number };
 	readonly signIn: {
 		readonly line: string;
 		readonly problem: Option.Option<string>;
 	};
+	readonly sync: Option.Option<AccountSync>;
 }
 
-/** An account's lines: its alias with who signed in to it once mx knows, its sign-in, its client id and its tenant. */
-const accountLines = ({
-	account: { address, alias, clientId, tenant },
+const lastSyncLine = (
+	lastSuccess: Option.Option<Temporal.Instant>,
+	now: Temporal.Instant
+) =>
+	`Last sync: ${Option.match(lastSuccess, {
+		onNone: () => "never",
+		onSome: (at) => `${localTime(at)}, ${ago(at, now)} ago`,
+	})}`;
+
+/** How far the account's first sync has got, while the store knows folders that have not finished it. */
+const firstSyncLine = ({
+	folders: { done, listed },
+}: AccountStatus): readonly string[] =>
+	done < listed ? [`First sync: ${done} of ${listed} folders done`] : [];
+
+const modeLine = (mode: Option.Option<string>) =>
+	`Mode: ${Option.getOrElse(mode, () => "unknown")}`;
+
+const errorLine = (error: Option.Option<string>) =>
+	`Last error: ${Option.getOrElse(error, () => "none")}`;
+
+/** The line that names an account: its alias, with who signed in to it once mx knows. */
+const accountLine = ({ address, alias }: Account) =>
+	address === undefined ? `Account ${alias}` : `Account ${alias}: ${address}`;
+
+/** An account's sign-in, client id and tenant. */
+const signInLines = ({
+	account: { clientId, tenant },
 	signIn,
 }: AccountStatus) => [
-	address === undefined ? `Account ${alias}` : `Account ${alias}: ${address}`,
 	`Sign-in: ${signIn.line}`,
 	`Client id: ${clientId}`,
 	`Tenant: ${tenant}`,
 ];
 
+/** What is wrong with mail that last synced at `lastSuccess` while mx sync reports `error`: out of date, and the error. */
+const syncProblems = (
+	lastSuccess: Option.Option<Temporal.Instant>,
+	error: Option.Option<string>,
+	now: Temporal.Instant
+) => [
+	isFresh(lastSuccess, now)
+		? Option.none()
+		: Option.some(`${synced(lastSuccess, now)}.`),
+	Option.map(error, (message) => `mx sync reports an error: ${message}`),
+];
+
 /**
  * What `mx status` prints, one fact per line with the lines of each account, and the first problem, which makes it exit
- * non-zero: sync not running, mail out of date, its last error, or a secret store that cannot be read.
+ * non-zero: sync not running, mail out of date, its last error, or a secret store that cannot be read. While an
+ * account's first sync runs, it says how far that has got. With several accounts, each account's lines say when its mail
+ * last synced, its mode and its last error, and its problems name it.
  */
 export const statusReport = ({
 	accounts,
@@ -124,28 +172,70 @@ export const statusReport = ({
 		onSome: (beat) =>
 			`${alive ? "running" : "not running"}, last heard from ${ago(beat.at, now)} ago`,
 	});
+	const versionLine = `Version: mx sync ${Option.match(heartbeat, { onNone: () => "unknown", onSome: (beat) => beat.version })}, this binary ${version}`;
+	const notRunning = alive
+		? Option.none()
+		: Option.some("mx sync is not running.");
+	const report = (
+		lines: readonly string[],
+		problems: readonly Option.Option<string>[]
+	) => ({
+		problem: Arr.head(Arr.getSomes(problems)),
+		text: Arr.join(lines, "\n"),
+	});
+	if (accounts.length > 1) {
+		const followed = Arr.map(accounts, (status) => ({
+			error: Option.flatMap(status.sync, (sync) => sync.error),
+			lastSuccess: Option.flatMap(status.sync, (sync) => sync.lastSuccess),
+			mode: Option.map(status.sync, (sync) => sync.mode),
+			status,
+		}));
+		return report(
+			[
+				`mx sync: ${running}`,
+				versionLine,
+				...Arr.flatMap(followed, (each) => [
+					accountLine(each.status.account),
+					lastSyncLine(each.lastSuccess, now),
+					...firstSyncLine(each.status),
+					modeLine(each.mode),
+					...signInLines(each.status),
+					errorLine(each.error),
+				]),
+			],
+			[
+				notRunning,
+				...Arr.flatMap(followed, (each) => [
+					...Arr.map(
+						syncProblems(each.lastSuccess, each.error, now),
+						Option.map((problem) => `${each.status.account.alias}: ${problem}`)
+					),
+					each.status.signIn.problem,
+				]),
+			]
+		);
+	}
 	const lastSuccess = Option.flatMap(heartbeat, (beat) => beat.lastSuccess);
 	const error = Option.flatMap(heartbeat, (beat) => beat.error);
-	const lines = [
-		`mx sync: ${running}`,
-		`Last sync: ${Option.match(lastSuccess, {
-			onNone: () => "never",
-			onSome: (at) => `${localTime(at)}, ${ago(at, now)} ago`,
-		})}`,
-		`Mode: ${Option.match(heartbeat, { onNone: () => "unknown", onSome: (beat) => beat.mode })}`,
-		`Version: mx sync ${Option.match(heartbeat, { onNone: () => "unknown", onSome: (beat) => beat.version })}, this binary ${version}`,
-		...(Arr.isReadonlyArrayNonEmpty(accounts)
-			? Arr.flatMap(accounts, accountLines)
-			: ["Accounts: none. Run mx login."]),
-		`Last error: ${Option.getOrElse(error, () => "none")}`,
-	];
-	const problem = Arr.getSomes([
-		alive ? Option.none() : Option.some("mx sync is not running."),
-		isFresh(lastSuccess, now)
-			? Option.none()
-			: Option.some(`${synced(lastSuccess, now)}.`),
-		Option.map(error, (message) => `mx sync reports an error: ${message}`),
-		...Arr.map(accounts, ({ signIn }) => signIn.problem),
-	]);
-	return { problem: Arr.head(problem), text: Arr.join(lines, "\n") };
+	return report(
+		[
+			`mx sync: ${running}`,
+			lastSyncLine(lastSuccess, now),
+			...Arr.flatMap(accounts, firstSyncLine),
+			modeLine(Option.map(heartbeat, (beat) => beat.mode)),
+			versionLine,
+			...(Arr.isReadonlyArrayNonEmpty(accounts)
+				? Arr.flatMap(accounts, (status) => [
+						accountLine(status.account),
+						...signInLines(status),
+					])
+				: ["Accounts: none. Run mx login."]),
+			errorLine(error),
+		],
+		[
+			notRunning,
+			...syncProblems(lastSuccess, error, now),
+			...Arr.map(accounts, ({ signIn }) => signIn.problem),
+		]
+	);
 };

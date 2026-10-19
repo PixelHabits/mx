@@ -9,6 +9,7 @@ import {
 	Duration,
 	Effect,
 	Exit,
+	Fiber,
 	FileSystem,
 	Layer,
 	ManagedRuntime,
@@ -24,7 +25,11 @@ import { Command, TerminalCapabilities } from "effect/cli";
 import { TestConsole } from "effect/testing";
 import { mx, run as runMx } from "../src/cli.ts";
 import { Paths } from "../src/paths.ts";
-import { FakeMicrosoft, loginHost } from "./fake-microsoft.ts";
+import {
+	type FakeMailbox,
+	FakeMicrosoft,
+	loginHost,
+} from "./fake-microsoft.ts";
 import { FakeProcesses } from "./fake-processes.ts";
 import { FakeReleases } from "./fake-releases.ts";
 import { FakeSecrets } from "./fake-secrets.ts";
@@ -45,24 +50,6 @@ const machine = ManagedRuntime.make(
 );
 const home = await machine.runPromise(Home);
 const { join } = await machine.runPromise(Path.Path);
-
-/** The environment of every mx process here: its folders under the test home, and no client id or tenant. */
-const environment = {
-	APPDATA: join(home, "AppData", "Roaming"),
-	HOME: home,
-	LOCALAPPDATA: join(home, "AppData", "Local"),
-	PATH: join(home, "path"),
-	USERPROFILE: home,
-	XDG_CACHE_HOME: join(home, "cache"),
-	XDG_CONFIG_HOME: join(home, "config"),
-	XDG_DATA_HOME: join(home, "data"),
-	XDG_STATE_HOME: join(home, "state"),
-};
-const config = ConfigProvider.layer(ConfigProvider.fromUnknown(environment));
-const { configFile, database } = await machine.runPromise(
-	// @effect-diagnostics-next-line strictEffectProvide:off - where mx keeps its files on this machine.
-	Effect.provide(Paths.make, config)
-);
 
 const microsoft = new FakeMicrosoft(await FakeReleases.make());
 const processes = new FakeProcesses(microsoft.tunnels);
@@ -97,18 +84,91 @@ const aliasRule =
 	"An alias is up to 20 lowercase letters, digits and hyphens, and starts with a letter, such as work.";
 
 /**
- * What every mx process runs on: Microsoft, Bun with faked child processes, a console that keeps its lines, and the
- * terminal's capabilities from the TTY state of stdin and stdout.
+ * What every mx process runs on: Microsoft, Bun with faked child processes, a console that keeps its lines, Config
+ * over `env`, and the terminal's capabilities from `env` and the TTY state of stdin and stdout.
  */
-const platform = Layer.mergeAll(
-	microsoft.layer,
-	BunServices.layer,
-	processes.layer(environment),
-	TestConsole.layer,
-	config,
-	TerminalCapabilities.layer.pipe(
-		Layer.provide(Layer.merge(BunServices.layer, config))
-	)
+const platformWith = (env: Record<string, string>) => {
+	const config = ConfigProvider.layer(ConfigProvider.fromUnknown(env));
+	return Layer.mergeAll(
+		microsoft.layer,
+		BunServices.layer,
+		processes.layer(env),
+		TestConsole.layer,
+		config,
+		TerminalCapabilities.layer.pipe(
+			Layer.provide(Layer.merge(BunServices.layer, config))
+		)
+	);
+};
+type Platform = ReturnType<typeof platformWith>;
+
+/** Runs `mx <args>` as a process of its own on `system`: how it exited, and what it printed to stdout and stderr. */
+const runOn =
+	(system: Platform) =>
+	(...args: string[]) =>
+		Effect.exit(runMx(args)).pipe(
+			Effect.flatMap((exit) =>
+				Effect.map(
+					Effect.all({
+						errors: TestConsole.errorLines,
+						output: TestConsole.logLines,
+					}),
+					({ errors, output }) => ({
+						errors: Arr.join(Arr.map(errors, String), "\n"),
+						exit,
+						output: Arr.join(Arr.map(output, String), "\n"),
+					})
+				)
+			),
+			// @effect-diagnostics-next-line strictEffectProvide:off - each call is the entry point of one mx process.
+			Effect.provide(system, { local: true })
+		);
+
+/** Runs `mx <args>` and answers what it printed to stdout; when mx fails, this fails with mx's error. */
+const cliOn =
+	(system: Platform) =>
+	(...args: string[]) =>
+		Effect.flatMap(runOn(system)(...args), ({ exit, output }) =>
+			Effect.as(exit, { output })
+		);
+
+/**
+ * A machine whose home is `root`: the environment of its mx processes, with their folders below it and no client id or
+ * tenant, what they run on, `run` and `cli` there, and where mx keeps config.json and the store.
+ */
+const machineAt = (root: string) =>
+	Effect.gen(function* () {
+		const environment = {
+			APPDATA: join(root, "AppData", "Roaming"),
+			HOME: root,
+			LOCALAPPDATA: join(root, "AppData", "Local"),
+			PATH: join(root, "path"),
+			USERPROFILE: root,
+			XDG_CACHE_HOME: join(root, "cache"),
+			XDG_CONFIG_HOME: join(root, "config"),
+			XDG_DATA_HOME: join(root, "data"),
+			XDG_STATE_HOME: join(root, "state"),
+		};
+		const platform = platformWith(environment);
+		// @effect-diagnostics-next-line strictEffectProvide:off - where mx keeps its files on this machine.
+		const { configFile, database } = yield* Effect.provide(
+			Paths.make,
+			ConfigProvider.layer(ConfigProvider.fromUnknown(environment))
+		);
+		return {
+			cli: cliOn(platform),
+			configFile,
+			database,
+			environment,
+			home: root,
+			platform,
+			run: runOn(platform),
+		};
+	});
+
+/** The machine of the tests about accounts and their sign-ins. */
+const { cli, configFile, database, platform, run } = await machine.runPromise(
+	machineAt(home)
 );
 
 /** `mx mcp` as an agent starts it, one process for every test, with a client on its stdio. */
@@ -136,45 +196,13 @@ const testTimeout = Duration.seconds(30);
 /** One test, on mx's own runtime, which interrupts it at `testTimeout`. */
 const test = <E>(
 	name: string,
-	body: () => Effect.Effect<void, E, Layer.Success<typeof platform> | McpClient>
+	body: () => Effect.Effect<void, E, Layer.Success<Platform> | McpClient>
 ) =>
 	it(
 		name,
 		() => server.runPromise(Effect.timeout(body(), testTimeout)),
 		Duration.toMillis(Duration.times(testTimeout, 2))
 	);
-
-/** Runs `mx <args>` as a process of its own on `system`: how it exited, and what it printed to stdout and stderr. */
-const runOn =
-	(system: typeof platform) =>
-	(...args: string[]) =>
-		Effect.exit(runMx(args)).pipe(
-			Effect.flatMap((exit) =>
-				Effect.map(
-					Effect.all({
-						errors: TestConsole.errorLines,
-						output: TestConsole.logLines,
-					}),
-					({ errors, output }) => ({
-						errors: Arr.join(Arr.map(errors, String), "\n"),
-						exit,
-						output: Arr.join(Arr.map(output, String), "\n"),
-					})
-				)
-			),
-			// @effect-diagnostics-next-line strictEffectProvide:off - each call is the entry point of one mx process.
-			Effect.provide(system, { local: true })
-		);
-
-/** Runs `mx <args>` and answers what it printed to stdout; when mx fails, this fails with mx's error. */
-const cliOn =
-	(system: typeof platform) =>
-	(...args: string[]) =>
-		Effect.flatMap(runOn(system)(...args), ({ exit, output }) =>
-			Effect.as(exit, { output })
-		);
-const run = runOn(platform);
-const cli = cliOn(platform);
 
 /** Sets whether mx's stdin and stdout are terminals. */
 const setTerminal = (isTTY: boolean) =>
@@ -343,6 +371,12 @@ const patAccount = {
 	tid: pat.tid,
 };
 
+/**
+ * The program mx asks whether mx install registered mx sync to start at sign-in, which answers that it did unless it
+ * fails; on macOS mx looks for the LaunchAgent's plist instead, which a machine here has only once a test writes it.
+ */
+const asksRegistered = process.platform === "win32" ? "reg" : "systemctl";
+
 describe("accounts", () => {
 	test("a config.json and a sign-in that the release before saved go on working with no new sign-in: mx sync and mx mcp refresh the sign-in with the Graph scopes alone, query shows the account by the first label of its tenant, and nothing rewrites config.json", () =>
 		Effect.gen(function* () {
@@ -375,10 +409,12 @@ describe("accounts", () => {
 			expect(yield* readJson(configFile)).toEqual({ clientId, tenant });
 		}));
 
-	test("mx login --account adds an account with its own client id and tenant, saves its sign-in as refresh-token-2 and who signed in, learns who the first account is with one refresh under that account's client id, and names the accounts and mx rename", () =>
+	test("mx login --account adds an account with its own client id and tenant, saves its sign-in as refresh-token-2 and who signed in, learns who the first account is with one refresh under that account's client id, names the accounts and mx rename, and where mx install never set up mx sync, syncs none of its mail and says to run mx install", () =>
 		Effect.gen(function* () {
+			processes.failing.add(asksRegistered);
 			microsoft.signingIn = pat;
 			const before = signInRequests().length;
+			const asked = microsoft.graphRequests().length;
 			const { output } = yield* cli(
 				"login",
 				"--account",
@@ -387,6 +423,14 @@ describe("accounts", () => {
 				otherClientId,
 				"--tenant",
 				"example.org"
+			);
+			expect(
+				Arr.filter(microsoft.graphRequests().slice(asked), ({ url }) =>
+					pipe(url.pathname, Str.endsWith("/messages/delta"))
+				)
+			).toEqual([]);
+			expect(lines(output).at(-1)).toBe(
+				"Added personal. mx sync is not set up here, so nothing copies its mail yet. Run mx install to start it."
 			);
 			expect(refreshes(before)).toEqual([
 				{
@@ -437,7 +481,13 @@ describe("accounts", () => {
 					tenant,
 				},
 			]);
-		}));
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					processes.failing.delete(asksRegistered);
+				})
+			)
+		));
 
 	test("mx login refuses to add a mailbox that is already an account, and saves nothing", () =>
 		Effect.gen(function* () {
@@ -577,7 +627,7 @@ describe("accounts", () => {
 			).toEqual(["account\tsubject", "account 9\tLibrary loan reminder"]);
 			expect(
 				yield* oneRow(
-					"SELECT account, path, total FROM folders WHERE account != 'work'"
+					"SELECT account, path, total FROM folders WHERE account NOT IN ('work', 'personal', 'travel')"
 				)
 			).toEqual(["account\tpath\ttotal", "account 9\tInbox\t1"]);
 		}));
@@ -586,23 +636,29 @@ describe("accounts", () => {
 		Effect.gen(function* () {
 			const report = lines((yield* run("status")).output);
 			expect(
-				report.slice(
-					report.indexOf("Account work: sam@example.test"),
-					report.indexOf("Last error: none")
-				)
+				report.slice(report.indexOf("Account work: sam@example.test"))
 			).toEqual([
 				"Account work: sam@example.test",
+				"Last sync: never",
+				"Mode: starting",
 				"Sign-in: saved",
 				`Client id: ${clientId}`,
 				`Tenant: ${tenant}`,
+				"Last error: none",
 				"Account personal: pat@example.org",
+				"Last sync: never",
+				"Mode: unknown",
 				"Sign-in: saved",
 				`Client id: ${otherClientId}`,
 				"Tenant: example.org",
+				"Last error: none",
 				"Account travel: ana@example.net",
+				"Last sync: never",
+				"Mode: unknown",
 				"Sign-in: saved",
 				`Client id: ${thirdClientId}`,
 				"Tenant: example.net",
+				"Last error: none",
 			]);
 			const { output } = yield* cli("uninstall", "--yes");
 			for (const alias of ["work", "personal", "travel"]) {
@@ -661,6 +717,458 @@ describe("accounts", () => {
 			Effect.ensuring(
 				Effect.sync(() => {
 					secrets.machine = "store";
+				})
+			)
+		));
+});
+
+/**
+ * The machine of the tests from here on, with a home of its own, so they start where mx never synced: on Windows, mx
+ * uninstall keeps the store while an mx mcp holds it open, as this file's mx mcp does.
+ */
+const second = await machine.runPromise(machineAt(join(home, "second")));
+
+/** Someone who writes to Pat. */
+const rosa = { address: "rosa@example.com", name: "Rosa Example" };
+
+/**
+ * The cloudflared `MX_CLOUDFLARED` names on `pushing`; the fake processes run it as a quick tunnel, and it reports
+ * 2026.10.3.
+ */
+const cloudflared = join(home, "bin", "cloudflared");
+processes.versions.set(cloudflared, "2026.10.3");
+
+/** The second machine's platform with cloudflared, so mx sync runs push. */
+const pushing = platformWith({
+	...second.environment,
+	MX_CLOUDFLARED: cloudflared,
+});
+
+/** The mx sync processes that run on from one test into the next. */
+const services: Fiber.Fiber<unknown, unknown>[] = [];
+
+/** Rows of the store, read as `sql` with `values` answers them. */
+const rowsOf = <Row>(sql: string, ...values: number[]): Row[] => {
+	const db = new Database(second.database, { strict: true });
+	try {
+		return db.query<Row, number[]>(sql).all(...values);
+	} finally {
+		db.close();
+	}
+};
+
+interface Mail {
+	readonly folder_id: string;
+	readonly graph_id: string;
+	readonly subject: string;
+}
+
+const byGraphId = (rows: readonly Mail[]) =>
+	[...rows].sort((a, b) => pipe(a.graph_id, Str.localeCompare(b.graph_id)));
+
+/** The mail the store files under the account, by Graph id. */
+const mailOf = (account: number) =>
+	byGraphId(
+		rowsOf<Mail>(
+			"SELECT m.graph_id, m.folder_id, m.subject FROM messages m JOIN folders f ON f.id = m.folder_id WHERE f.account_id = ?",
+			account
+		)
+	);
+
+/** The mail Graph holds in `mailbox`, as the store files it. */
+const mailIn = (mailbox: FakeMailbox) =>
+	byGraphId(
+		Arr.map([...mailbox.messages.values()], (message) => ({
+			folder_id: message.parentFolderId,
+			graph_id: message.id,
+			subject: message.subject,
+		}))
+	);
+
+/** The folders the store files under the account, with their delta links, by id. */
+const foldersOf = (account: number) =>
+	rowsOf<{ readonly delta_link: string | null; readonly id: string }>(
+		"SELECT id, delta_link FROM folders WHERE account_id = ? ORDER BY id",
+		account
+	);
+
+/** The ids of the folders Graph holds in `mailbox`, in the order `foldersOf` lists them. */
+const folderIdsIn = (mailbox: FakeMailbox) =>
+	[...mailbox.folders.keys()].sort((a, b) => (a < b ? -1 : 1));
+
+/** What the store holds of the account: its folders with their delta links, and its mail. */
+const accountRows = (account: number) => ({
+	folders: foldersOf(account),
+	mail: mailOf(account),
+});
+
+/** How mx sync last recorded that it follows the account. */
+const followed = (account: number) =>
+	Arr.head(
+		rowsOf<{ readonly last_error: string | null; readonly mode: string }>(
+			"SELECT mode, last_error FROM accounts WHERE id = ?",
+			account
+		)
+	);
+
+/** The delta requests Graph had for the folder. */
+const deltaRequests = (folderId: string) =>
+	Arr.filter(microsoft.graphRequests(), ({ url }) =>
+		pipe(url.pathname, Str.endsWith(`/${folderId}/messages/delta`))
+	).length;
+
+/** The subscriptions of `mailbox` on a quick tunnel. */
+const tunnelSubscriptions = (mailbox: FakeMailbox) =>
+	Arr.filter([...mailbox.subscriptions.byId.values()], (subscription) =>
+		pipe(subscription.notificationUrl, Str.endsWith(".trycloudflare.com/graph"))
+	);
+
+/** The lines mx sync logged, oldest first. */
+const syncLines = Effect.flatMap(
+	second.cli("log", "--sync", "--json", "--limit", "500"),
+	({ output }) =>
+		Effect.forEach(
+			Arr.filter(lines(output), (line) => line !== ""),
+			(line) =>
+				Effect.flatMap(parseJson(line), (row) =>
+					Schema.decodeUnknownEffect(
+						Schema.Struct({ message: Schema.optionalKey(Schema.String) })
+					)(row).pipe(Effect.orDie)
+				)
+		).pipe(
+			Effect.map(
+				Arr.flatMap(({ message }) => (message === undefined ? [] : [message]))
+			)
+		)
+);
+
+/** Waits until `check` holds, for up to 10 seconds. */
+const eventually = <E = never, R = never>(
+	what: string,
+	check: Effect.Effect<boolean, E, R> | (() => boolean)
+) =>
+	Effect.gen(function* () {
+		const holds = typeof check === "function" ? Effect.sync(check) : check;
+		for (let attempt = 0; attempt < 200; attempt += 1) {
+			if (yield* holds) {
+				return;
+			}
+			yield* Effect.promise(() => Bun.sleep(50));
+		}
+		return yield* Effect.die(`Timed out waiting for ${what}.`);
+	});
+
+/** Long enough for a notification and the pass it runs to land. */
+const settle = Effect.promise(() => Bun.sleep(1500));
+
+/**
+ * Makes mx sync count as registered to start at sign-in, as mx install leaves it: on macOS that is the LaunchAgent's
+ * plist; elsewhere the fake programs that ask already answer that it is.
+ */
+const registerSync = Effect.gen(function* () {
+	if (process.platform !== "darwin") {
+		return;
+	}
+	const fs = yield* FileSystem.FileSystem;
+	const agents = join(second.home, "Library", "LaunchAgents");
+	yield* fs.makeDirectory(agents, { recursive: true });
+	yield* fs.writeFileString(
+		join(agents, "io.github.pixelhabits.mx.sync.plist"),
+		""
+	);
+});
+
+const lastSyncLine =
+	/^Last sync: \d{4}-\d{2}-\d{2} \d{2}:\d{2}, \d+ (s|min) ago$/u;
+const modeLine = /^Mode: (starting|push|poll)$/u;
+
+describe("mx sync with several accounts", () => {
+	test("mx login --account that adds an account next to others syncs none of its mail: it restarts mx sync, which copies the mail in the background, and mx status shows how far that first sync has got", () =>
+		Effect.gen(function* () {
+			microsoft.signingIn = sam;
+			yield* second.cli(
+				"login",
+				"--account",
+				"work",
+				"--client-id",
+				clientId,
+				"--tenant",
+				tenant
+			);
+			yield* registerSync;
+			microsoft.deliver({
+				body: "You are next on the list for a plot.",
+				conversationId: "pat-conversation-allotment",
+				from: rosa,
+				parentFolderId: pat.resolve("inbox"),
+				received: "2026-10-05T08:00:00Z",
+				subject: "Allotment waiting list",
+			});
+			microsoft.deliver({
+				body: "The spring catalogue is in the post.",
+				conversationId: "pat-conversation-seeds",
+				from: rosa,
+				parentFolderId: pat.resolve("archive"),
+				received: "2026-10-04T08:00:00Z",
+				subject: "Seed catalogue",
+			});
+			microsoft.signingIn = pat;
+			const asked = microsoft.graphRequests().length;
+			const { output } = yield* second.cli(
+				"login",
+				"--account",
+				"personal",
+				"--client-id",
+				otherClientId,
+				"--tenant",
+				"example.org"
+			);
+			expect(
+				Arr.filter(microsoft.graphRequests().slice(asked), ({ url }) =>
+					pipe(url.pathname, Str.endsWith("/messages/delta"))
+				)
+			).toEqual([]);
+			expect(lines(output).slice(-2)).toEqual([
+				"Restarted mx sync.",
+				"Added personal. mx sync copies its mail in the background. Run mx status to see how far it has got.",
+			]);
+			// The mx sync that mx login restarted, whose first sync of Pat's mailbox waits in its Inbox.
+			const inbox = pat.resolve("inbox");
+			microsoft.hold(inbox);
+			const service = yield* Effect.forkChild(second.cli("sync"));
+			/** How many of the account's folders in the store have a delta link; none while mx sync creates the store. */
+			const linked = (account: number) =>
+				Effect.try(
+					() =>
+						Arr.filter(
+							foldersOf(account),
+							({ delta_link }) => delta_link !== null
+						).length
+				).pipe(Effect.orElseSucceed(() => 0));
+			yield* eventually(
+				"every folder of Pat's but Inbox synced",
+				Effect.map(linked(2), (count) => count === pat.folders.size - 1)
+			);
+			const report = lines((yield* second.run("status")).output);
+			const personal = report.indexOf("Account personal: pat@example.org");
+			expect(report.slice(personal, personal + 3)).toEqual([
+				"Account personal: pat@example.org",
+				"Last sync: never",
+				`First sync: ${pat.folders.size - 1} of ${pat.folders.size} folders done`,
+			]);
+			microsoft.release(inbox);
+			yield* eventually(
+				"the first sync of both accounts",
+				Effect.map(
+					Effect.all([linked(1), linked(2)]),
+					([samFolders, patFolders]) =>
+						samFolders === sam.folders.size && patFolders === pat.folders.size
+				)
+			);
+			yield* Fiber.interrupt(service);
+			expect(mailOf(2)).toEqual(mailIn(pat));
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release(pat.resolve("inbox"));
+				})
+			)
+		));
+
+	test("mx sync --once syncs every account into the one store, each mailbox's folders and mail under its own account, and says how each went", () =>
+		Effect.gen(function* () {
+			const { output } = yield* second.cli("sync", "--once");
+			expect(lines(output)).toEqual([
+				`work: Synced ${sam.folders.size} folders: 0 messages saved, 0 removed.`,
+				`personal: Synced ${pat.folders.size} folders: 0 messages saved, 0 removed.`,
+			]);
+			expect(Arr.map(foldersOf(1), ({ id }) => id)).toEqual(folderIdsIn(sam));
+			expect(Arr.map(foldersOf(2), ({ id }) => id)).toEqual(folderIdsIn(pat));
+			expect(mailOf(1)).toEqual(mailIn(sam));
+			expect(mailOf(2)).toEqual(mailIn(pat));
+		}));
+
+	test("one account's folder listing drops that account's deleted folder with its mail, and keeps every folder, delta link and message of the other account", () =>
+		Effect.gen(function* () {
+			const before = accountRows(2);
+			microsoft.removeFolder(microsoft.folderId("Projects"));
+			// Pat's pass waits in its Inbox's delta round, so nothing Pat's own pass does restores what Sam's listing dropped.
+			const inbox = pat.resolve("inbox");
+			const asked = deltaRequests(inbox);
+			microsoft.hold(inbox, { answered: true });
+			const pass = yield* Effect.forkChild(second.cli("sync", "--once"));
+			yield* eventually(
+				"Pat's Inbox delta round",
+				() => deltaRequests(inbox) > asked
+			);
+			expect(Arr.map(foldersOf(1), ({ id }) => id)).toEqual(folderIdsIn(sam));
+			expect(mailOf(1)).toEqual(mailIn(sam));
+			expect(accountRows(2)).toEqual(before);
+			microsoft.release(inbox);
+			yield* Fiber.join(pass);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release(pat.resolve("inbox"));
+				})
+			)
+		));
+
+	test("one account's check against Graph never removes the other account's mail", () =>
+		Effect.gen(function* () {
+			const before = accountRows(2);
+			// Pat's check waits on the ids of Pat's Inbox, so nothing Pat's own check does restores what Sam's check removed.
+			const inbox = pat.resolve("inbox");
+			const samChecks = Effect.map(
+				syncLines,
+				Arr.filter(Str.startsWith("work: Reconciled "))
+			);
+			const checked = (yield* samChecks).length;
+			microsoft.hold(inbox, { ids: true });
+			const service = yield* Effect.forkChild(second.cli("sync"));
+			yield* eventually(
+				"Sam's check against Graph",
+				Effect.map(samChecks, (checks) => checks.length > checked)
+			);
+			expect((yield* samChecks).slice(checked)).toEqual([
+				`work: Reconciled ${sam.folders.size} folders: 0 added, 0 refiled, 0 removed.`,
+			]);
+			expect(accountRows(2)).toEqual(before);
+			microsoft.release(inbox, { ids: true });
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release(pat.resolve("inbox"), { ids: true });
+				})
+			)
+		));
+
+	test("a change notification for one account's Inbox runs a delta round of that Inbox alone, and no pass of the other account", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			yield* fs.makeDirectory(join(home, "bin"), { recursive: true });
+			yield* fs.writeFileString(cloudflared, "");
+			services.push(yield* Effect.forkDetach(cliOn(pushing)("sync")));
+			yield* eventually(
+				"push for both accounts",
+				() =>
+					Arr.every(
+						[sam, pat],
+						(mailbox) => tunnelSubscriptions(mailbox).length === 2
+					) &&
+					Arr.every([1, 2], (account) =>
+						Option.exists(followed(account), ({ mode }) => mode === "push")
+					)
+			);
+			const inbox = pat.resolve("inbox");
+			/** The delta requests of every folder but Pat's Inbox, in both mailboxes. */
+			const others = () =>
+				Arr.map(
+					Arr.filter(
+						[...folderIdsIn(sam), ...folderIdsIn(pat)],
+						(folder) => folder !== inbox
+					),
+					(folder) => [folder, deltaRequests(folder)] as const
+				);
+			const before = others();
+			const inboxBefore = deltaRequests(inbox);
+			yield* Effect.promise(() => microsoft.receive("Allotment rota", pat));
+			yield* eventually("the pushed message in Pat's account", () =>
+				Arr.some(mailOf(2), ({ subject }) => subject === "Allotment rota")
+			);
+			yield* settle;
+			expect(others()).toEqual(before);
+			expect(deltaRequests(inbox)).toBeGreaterThan(inboxBefore);
+		}));
+
+	test("stopping mx sync deletes the subscriptions of every account", () =>
+		Effect.gen(function* () {
+			expect(
+				Arr.map([sam, pat], (mailbox) => tunnelSubscriptions(mailbox).length)
+			).toEqual([2, 2]);
+			yield* Effect.forEach(services.splice(0), Fiber.interrupt, {
+				discard: true,
+			});
+			expect(
+				Arr.map([sam, pat], (mailbox) => [...mailbox.subscriptions.byId.keys()])
+			).toEqual([[], []]);
+		}));
+
+	test("a refused sign-in stops only its own account: mx sync goes on syncing the other account, and mx status names the account that stopped", () =>
+		Effect.gen(function* () {
+			pat.refuseRefresh = true;
+			const service = yield* Effect.forkChild(cliOn(pushing)("sync"));
+			const expired = "Sign-in expired. Run mx login --account personal.";
+			yield* eventually("Pat's account stopped", () =>
+				Option.exists(followed(2), (row) => row.last_error === expired)
+			);
+			yield* eventually("push for Sam's account", () =>
+				Option.exists(followed(1), ({ mode }) => mode === "push")
+			);
+			yield* Effect.promise(() => microsoft.receive("Compost delivery", sam));
+			yield* eventually("the pushed message in Sam's account", () =>
+				Arr.some(mailOf(1), ({ subject }) => subject === "Compost delivery")
+			);
+			expect(service.pollUnsafe()).toBeUndefined();
+			const { errors, exit, output } = yield* second.run("status");
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(errors).toBe(`mx: personal: mx sync reports an error: ${expired}`);
+			const report = lines(output);
+			expect(
+				report.slice(report.indexOf("Account work: sam@example.test"))
+			).toEqual([
+				"Account work: sam@example.test",
+				expect.stringMatching(lastSyncLine),
+				"Mode: push",
+				"Sign-in: saved",
+				`Client id: ${clientId}`,
+				`Tenant: ${tenant}`,
+				"Last error: none",
+				"Account personal: pat@example.org",
+				expect.stringMatching(lastSyncLine),
+				expect.stringMatching(modeLine),
+				"Sign-in: saved",
+				`Client id: ${otherClientId}`,
+				"Tenant: example.org",
+				`Last error: ${expired}`,
+			]);
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					pat.refuseRefresh = false;
+				})
+			)
+		));
+
+	test("mx sync --once syncs every account when the first account's sign-in is refused, names that account, and fails", () =>
+		Effect.gen(function* () {
+			sam.refuseRefresh = true;
+			microsoft.deliver({
+				body: "The bean poles go up on Saturday.",
+				conversationId: "pat-conversation-bean-poles",
+				from: rosa,
+				parentFolderId: pat.resolve("inbox"),
+				received: "2026-10-06T08:00:00Z",
+				subject: "Bean poles",
+			});
+			const { errors, exit, output } = yield* second.run("sync", "--once");
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(lines(output)).toEqual([
+				`personal: Synced ${pat.folders.size} folders: 1 messages saved, 0 removed.`,
+			]);
+			expect(errors).toBe(
+				"mx: work: Sign-in expired. Run mx login --account work."
+			);
+			expect(mailOf(2)).toEqual(mailIn(pat));
+			expect(
+				Arr.some(mailOf(2), ({ subject }) => subject === "Bean poles")
+			).toBe(true);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					sam.refuseRefresh = false;
 				})
 			)
 		));
