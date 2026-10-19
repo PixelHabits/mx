@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.1](https://github.com/PixelHabits/mx/compare/v0.1.0...v0.1.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **banner:** draw the sent and reply arrows one row lower ([aa16115](https://github.com/PixelHabits/mx/commit/aa1611551bac9adfb56031a310c795c1f3693a70))
+* **banner:** put the reply arrow on the row under the sent one ([afc4cd3](https://github.com/PixelHabits/mx/commit/afc4cd3c95fdf83c54e301597bf1ed2f89e84bf7))
+* **install:** find Claude Desktop's config in its Microsoft Store package on Windows ([9161957](https://github.com/PixelHabits/mx/commit/91619575a85eeef826e98aebb34d909fd0c1d971))
+* **install:** say under the agent question what Space and Enter do ([e7181c3](https://github.com/PixelHabits/mx/commit/e7181c3730cfdc0c9b14362c54ed3927a8d56e01))
+* **mcp:** speak the 2025-11-25 handshake too, because big sad, Anthropic's own Claude Desktop doesn't speak MCP 2026-07-28 yet ([4e4bd1e](https://github.com/PixelHabits/mx/commit/4e4bd1ea5fd35294094fdc721887674fa8256fea))
+* **windows:** decide that mx sync stopped by whether its mxw.exe still runs ([c8be1e0](https://github.com/PixelHabits/mx/commit/c8be1e0908c8f3723e8faf5290f3eef332c74615))
+* **windows:** install and wait for Enter when mx.exe is double-clicked ([5e58e55](https://github.com/PixelHabits/mx/commit/5e58e55390ded03221035009c2f7f179fa24b2e9))
+* **windows:** reinstall and update while an agent runs a copy an earlier one moved aside ([353d41f](https://github.com/PixelHabits/mx/commit/353d41fca0fe8433ccb180b89162b59821dd414d))
+* **windows:** set raw mode before readline reads, so one Enter closes the window ([4175aaa](https://github.com/PixelHabits/mx/commit/4175aaa6ad2cbc617c4d97421d0c72579c045227))
+
 ## [0.1.0](https://github.com/PixelHabits/mx/compare/v0.1.0...v0.1.0) (2026-10-18)
 
 
