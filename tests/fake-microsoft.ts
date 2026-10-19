@@ -24,7 +24,7 @@ const alice = { address: "alice@example.test", name: "Alice Example" };
 const bob = { address: "bob@example.test", name: "Bob Example" };
 const carol = { address: "carol@example.test", name: "Carol Example" };
 
-/** The folder ids Graph answers for the well-known names mx sends. */
+/** The folder ids Graph answers for the well-known names mx sends, in the default mailbox; another's start with its prefix. */
 const wellKnown: Record<string, string> = {
 	archive: "folder-archive",
 	deleteditems: "folder-deleted",
@@ -33,6 +33,15 @@ const wellKnown: Record<string, string> = {
 	msgfolderroot: "folder-root",
 	sentitems: "folder-sent",
 };
+
+/** The folders below the root that every mailbox starts with, by their ids in the default mailbox. */
+const startingFolders = [
+	["folder-inbox", "Inbox"],
+	["folder-sent", "Sent Items"],
+	["folder-drafts", "Drafts"],
+	["folder-deleted", "Deleted Items"],
+	["folder-archive", "Archive"],
+] as const;
 
 interface Address {
 	readonly address: string;
@@ -114,15 +123,132 @@ const parseRecipients = (value: unknown): Address[] =>
 const content = (value: unknown) => (value as { content: string }).content;
 
 /**
- * Microsoft's token endpoint and Graph for one synthetic mailbox, in memory. Each issued access and refresh token
- * carries a counter; a refresh token stays valid after it is used, as Entra's do. Graph answers only the newest access
- * token, honours `Prefer: outlook.body-content-type="text"` and keeps a change log per folder that its delta links
- * replay. Upload URLs refuse a bearer token, as Graph's do.
+ * One synthetic user's mailbox as Graph holds it: its folders and messages, the change log its delta links replay, its
+ * push subscriptions and the user's sign-in. Every folder, message and subscription id starts with `prefix`, so no id
+ * is in two mailboxes; the default mailbox's prefix is empty.
+ */
+export class FakeMailbox {
+	/** The newest access token Microsoft issued for this mailbox, the only one Graph answers for it. */
+	accessToken = "";
+	/** The refresh tokens Microsoft issued for this mailbox, oldest first. */
+	readonly refreshTokens: string[] = [];
+	/** When set, a refresh of this mailbox's sign-in answers `invalid_grant`. */
+	refuseRefresh = false;
+	readonly subscriptions: FakeSubscriptions;
+	readonly folders = new Map<
+		string,
+		{ readonly displayName: string; readonly parentFolderId: string }
+	>();
+	readonly messages = new Map<string, FakeMessage>();
+	/**
+	 * Each change names the folder it touched, in order; a change Graph reports with only the properties that changed is
+	 * `partial`.
+	 */
+	readonly changes: {
+		readonly folderId: string;
+		readonly id: string;
+		readonly partial?: true;
+	}[] = [];
+	private nextId = 100;
+
+	readonly prefix: string;
+	readonly user: Address;
+
+	constructor(prefix: string, user: Address, tunnels: FakeTunnels) {
+		this.prefix = prefix;
+		this.user = user;
+		this.subscriptions = new FakeSubscriptions(tunnels, prefix);
+		for (const [id, displayName] of startingFolders) {
+			this.folders.set(`${prefix}${id}`, {
+				displayName,
+				parentFolderId: this.resolve("msgfolderroot"),
+			});
+		}
+	}
+
+	/** The folder id Graph reads `name` as here: this mailbox's folder for a well-known name such as `inbox`, else `name`. */
+	resolve(name: string) {
+		const id = wellKnown[name];
+		return id === undefined ? name : `${this.prefix}${id}`;
+	}
+
+	/** Whether `id` is this mailbox's root folder, or a folder or message in it. */
+	holds(id: string) {
+		return (
+			id === this.resolve("msgfolderroot") ||
+			this.folders.has(id) ||
+			this.messages.has(id)
+		);
+	}
+
+	newId(kind: string) {
+		this.nextId += 1;
+		return `${this.prefix}${kind}-${this.nextId}`;
+	}
+
+	/** The messages in a folder as Graph holds them now. */
+	inFolder(folderId: string): readonly FakeMessage[] {
+		return Arr.filter(
+			[...this.messages.values()],
+			(message) => message.parentFolderId === folderId
+		);
+	}
+
+	/** Adds a message to its folder and logs the change. */
+	add(
+		message: Partial<FakeMessage> &
+			Pick<
+				FakeMessage,
+				| "body"
+				| "conversationId"
+				| "from"
+				| "id"
+				| "parentFolderId"
+				| "received"
+				| "subject"
+				| "to"
+			>
+	) {
+		const added: FakeMessage = {
+			attachments: [],
+			bcc: [],
+			categories: [],
+			cc: [],
+			flag: "notFlagged",
+			isDraft: false,
+			isRead: false,
+			sent: message.received,
+			uniqueBody: message.body,
+			...message,
+		};
+		this.messages.set(added.id, added);
+		this.changes.push({ folderId: added.parentFolderId, id: added.id });
+		return added;
+	}
+}
+
+/** The device code Microsoft issues when the user of `mailbox` signs in. */
+const deviceCode = (mailbox: FakeMailbox) =>
+	`${mailbox.prefix}synthetic-device-code`;
+
+/**
+ * Microsoft's token endpoint and Graph for synthetic mailboxes, in memory: the default mailbox, and any that
+ * `addMailbox` adds. Each issued access and refresh token carries a counter and belongs to one mailbox; a refresh token
+ * stays valid after it is used, as Entra's do. Graph answers a request from the mailbox whose newest access token it
+ * bears, honours `Prefer: outlook.body-content-type="text"` and keeps a change log per folder that its delta links
+ * replay. Upload URLs refuse a bearer token, as Graph's do. A method that takes a folder or message id acts in the
+ * mailbox that holds it.
  */
 export class FakeMicrosoft {
 	readonly received: Received[] = [];
 	readonly tunnels = new FakeTunnels();
-	readonly subscriptions = new FakeSubscriptions(this.tunnels);
+	/** The mailbox the tests use unless they add another: Sam's, with folder ids such as `folder-inbox`. */
+	readonly mailbox = new FakeMailbox("", owner, this.tunnels);
+	/** The default mailbox's push subscriptions. */
+	readonly subscriptions = this.mailbox.subscriptions;
+	/** The mailbox whose user enters the code at the verification URI: each device code issued from now on signs it in. */
+	signingIn = this.mailbox;
+	private readonly mailboxes = [this.mailbox];
 	/** Device-code polls still to answer `authorization_pending`. */
 	pendingPolls = 1;
 	/** When set, every refresh answers `invalid_grant`. */
@@ -161,49 +287,16 @@ export class FakeMicrosoft {
 		string,
 		{ readonly gate: PromiseWithResolvers<void>; taken: boolean }
 	>();
+	/** The refresh tokens Microsoft issued for every mailbox, oldest first. */
 	readonly refreshTokens: string[] = [];
 	private issued = 0;
-	private accessToken = "";
-	private readonly folders = new Map<
-		string,
-		{ readonly displayName: string; readonly parentFolderId: string }
-	>([
-		["folder-inbox", { displayName: "Inbox", parentFolderId: "folder-root" }],
-		[
-			"folder-projects",
-			{ displayName: "Projects", parentFolderId: "folder-inbox" },
-		],
-		[
-			"folder-sent",
-			{ displayName: "Sent Items", parentFolderId: "folder-root" },
-		],
-		["folder-drafts", { displayName: "Drafts", parentFolderId: "folder-root" }],
-		[
-			"folder-deleted",
-			{ displayName: "Deleted Items", parentFolderId: "folder-root" },
-		],
-		[
-			"folder-archive",
-			{ displayName: "Archive", parentFolderId: "folder-root" },
-		],
-	]);
-	private readonly messages = new Map<string, FakeMessage>();
-	/**
-	 * Each change names the folder it touched, in order; a change Graph reports with only the properties that changed is
-	 * `partial`.
-	 */
-	private readonly changes: {
-		readonly folderId: string;
-		readonly id: string;
-		readonly partial?: true;
-	}[] = [];
 	/** The reads of a folder, its delta pages or the listing of its message ids, that Graph answers in a form mx cannot read. */
 	private readonly unreadables = new Set<string>();
-	private nextId = 100;
 	private readonly uploads = new Map<
 		string,
 		{
 			chunks: Uint8Array[];
+			readonly mailbox: FakeMailbox;
 			readonly messageId: string;
 			readonly name: string;
 			readonly size: number;
@@ -214,7 +307,8 @@ export class FakeMicrosoft {
 
 	constructor(releases: FakeReleases) {
 		this.releases = releases;
-		this.add({
+		this.addFolder("folder-projects", "Projects", "folder-inbox");
+		this.mailbox.add({
 			attachments: [
 				{
 					bytes: inlineImage,
@@ -242,7 +336,7 @@ export class FakeMicrosoft {
 			subject: "Quarterly budget",
 			to: [owner],
 		});
-		this.add({
+		this.mailbox.add({
 			body: "Looks fine. One question about travel.\r\n\r\nFrom: Alice Example\r\nPlease review the quarterly budget.",
 			conversationId: "conversation-budget",
 			from: owner,
@@ -254,7 +348,7 @@ export class FakeMicrosoft {
 			to: [alice],
 			uniqueBody: "Looks fine. One question about travel.",
 		});
-		this.add({
+		this.mailbox.add({
 			body: "Travel stays under the cap.\r\n\r\nFrom: Sam Example\r\nLooks fine.",
 			conversationId: "conversation-budget",
 			from: alice,
@@ -265,7 +359,7 @@ export class FakeMicrosoft {
 			to: [owner],
 			uniqueBody: "Travel stays under the cap.",
 		});
-		this.add({
+		this.mailbox.add({
 			body: "Kickoff is on Thursday.",
 			conversationId: "conversation-kickoff",
 			from: bob,
@@ -275,7 +369,7 @@ export class FakeMicrosoft {
 			subject: "Kickoff notes",
 			to: [owner],
 		});
-		this.add({
+		this.mailbox.add({
 			body: "Lunch on Friday?",
 			conversationId: "conversation-lunch",
 			from: carol,
@@ -307,6 +401,24 @@ export class FakeMicrosoft {
 			)
 		)
 	);
+
+	/**
+	 * Adds the mailbox of another user, with the folders every mailbox starts with and no mail. Its folder, message and
+	 * subscription ids start with `name`, so none is in another mailbox. A test signs in to it through `signingIn`.
+	 */
+	addMailbox(name: string, user: Address) {
+		const mailbox = new FakeMailbox(`${name}-`, user, this.tunnels);
+		this.mailboxes.push(mailbox);
+		return mailbox;
+	}
+
+	/** The mailbox that holds `id`, a folder or message id, or the default mailbox when none does. */
+	private mailboxOf(id: string) {
+		return Option.getOrElse(
+			Arr.findFirst(this.mailboxes, (mailbox) => mailbox.holds(id)),
+			() => this.mailbox
+		);
+	}
 
 	/**
 	 * Makes the requests that read `folderId` wait until `release`: its delta pages, or with `ids` the listing of its
@@ -393,29 +505,32 @@ export class FakeMicrosoft {
 
 	/** Removes a message the way a permanent delete in Outlook does, so the next delta reports it removed. */
 	purge(id: string) {
-		const message = this.messages.get(id);
+		const mailbox = this.mailboxOf(id);
+		const message = mailbox.messages.get(id);
 		if (message !== undefined) {
-			this.messages.delete(id);
-			this.changes.push({ folderId: message.parentFolderId, id });
+			mailbox.messages.delete(id);
+			mailbox.changes.push({ folderId: message.parentFolderId, id });
 		}
 	}
 
 	/** Moves a message the way Outlook does, so the next delta reports it removed from its folder and added to `folderId`. */
 	move(id: string, folderId: string) {
-		const message = this.messages.get(id);
+		const mailbox = this.mailboxOf(id);
+		const message = mailbox.messages.get(id);
 		if (message !== undefined) {
-			this.changes.push({ folderId: message.parentFolderId, id });
+			mailbox.changes.push({ folderId: message.parentFolderId, id });
 			message.parentFolderId = folderId;
-			this.changes.push({ folderId, id });
+			mailbox.changes.push({ folderId, id });
 		}
 	}
 
 	/** Marks a message read the way Outlook does, so the next delta reports only its `isRead` and `parentFolderId`. */
 	readInOutlook(id: string) {
-		const message = this.messages.get(id);
+		const mailbox = this.mailboxOf(id);
+		const message = mailbox.messages.get(id);
 		if (message !== undefined) {
 			message.isRead = true;
-			this.changes.push({
+			mailbox.changes.push({
 				folderId: message.parentFolderId,
 				id,
 				partial: true,
@@ -447,29 +562,33 @@ export class FakeMicrosoft {
 		this.vanishing.add(id);
 	}
 
-	/** Adds a mail folder below `parentFolderId`, as the user makes one in Outlook. */
+	/** Adds a mail folder below `parentFolderId`, in its mailbox, as the user makes one in Outlook. */
 	addFolder(id: string, displayName: string, parentFolderId: string) {
-		this.folders.set(id, { displayName, parentFolderId });
+		this.mailboxOf(parentFolderId).folders.set(id, {
+			displayName,
+			parentFolderId,
+		});
 	}
 
 	/** Deletes a mail folder, the folders in it and their messages for good. */
 	removeFolder(id: string) {
-		for (const [child, { parentFolderId }] of [...this.folders]) {
+		const mailbox = this.mailboxOf(id);
+		for (const [child, { parentFolderId }] of [...mailbox.folders]) {
 			if (parentFolderId === id) {
 				this.removeFolder(child);
 			}
 		}
-		this.folders.delete(id);
-		for (const message of this.inFolder(id)) {
-			this.messages.delete(message.id);
+		mailbox.folders.delete(id);
+		for (const message of mailbox.inFolder(id)) {
+			mailbox.messages.delete(message.id);
 		}
 	}
 
-	/** The id of the one folder named `displayName`. */
+	/** The id of the one folder named `displayName`, in any mailbox. */
 	folderId(displayName: string) {
 		const [id, ...others] = Arr.map(
 			Arr.filter(
-				[...this.folders],
+				Arr.flatMap(this.mailboxes, (mailbox) => [...mailbox.folders]),
 				([, folder]) => folder.displayName === displayName
 			),
 			([folderId]) => folderId
@@ -480,19 +599,19 @@ export class FakeMicrosoft {
 		return id;
 	}
 
-	/** A message from Bob arrives in Inbox, and Graph notifies Inbox's subscriptions. */
-	receive(subject: string) {
-		const added = this.add({
+	/** A message from Bob arrives in the Inbox of `mailbox`, and Graph notifies that Inbox's subscriptions. */
+	receive(subject: string, mailbox = this.mailbox) {
+		const added = mailbox.add({
 			body: `${subject}, in the body.`,
-			conversationId: this.newId("conversation"),
+			conversationId: mailbox.newId("conversation"),
 			from: bob,
-			id: this.newId("message"),
-			parentFolderId: "folder-inbox",
+			id: mailbox.newId("message"),
+			parentFolderId: mailbox.resolve("inbox"),
 			received: "2026-10-06T08:00:00Z",
 			subject,
-			to: [owner],
+			to: [mailbox.user],
 		});
-		return this.subscriptions.notify("inbox", added.id);
+		return mailbox.subscriptions.notify("inbox", added.id);
 	}
 
 	/** A message to the user arrives in a folder without a notification, so the next pass brings it in. */
@@ -502,15 +621,17 @@ export class FakeMicrosoft {
 			"body" | "conversationId" | "parentFolderId" | "received" | "subject"
 		> & { readonly from: Address }
 	) {
-		return this.add({ ...message, id: this.newId("message"), to: [owner] });
+		const mailbox = this.mailboxOf(message.parentFolderId);
+		return mailbox.add({
+			...message,
+			id: mailbox.newId("message"),
+			to: [mailbox.user],
+		});
 	}
 
 	/** The messages in a folder as Graph holds them now. */
 	inFolder(folderId: string): readonly FakeMessage[] {
-		return Arr.filter(
-			[...this.messages.values()],
-			(message) => message.parentFolderId === folderId
-		);
+		return this.mailboxOf(folderId).inFolder(folderId);
 	}
 
 	graphRequests() {
@@ -520,59 +641,30 @@ export class FakeMicrosoft {
 		);
 	}
 
-	private add(
-		message: Partial<FakeMessage> &
-			Pick<
-				FakeMessage,
-				| "body"
-				| "conversationId"
-				| "from"
-				| "id"
-				| "parentFolderId"
-				| "received"
-				| "subject"
-				| "to"
-			>
-	) {
-		const added: FakeMessage = {
-			attachments: [],
-			bcc: [],
-			categories: [],
-			cc: [],
-			flag: "notFlagged",
-			isDraft: false,
-			isRead: false,
-			sent: message.received,
-			uniqueBody: message.body,
-			...message,
-		};
-		this.messages.set(added.id, added);
-		this.changes.push({ folderId: added.parentFolderId, id: added.id });
-		return added;
-	}
-
 	/**
 	 * Makes the changes `change` makes to messages leave no trace in any delta, as changes Graph's delta misses. No delta
 	 * link is issued while it runs, so dropping the changes it logged moves no link.
 	 */
 	missedByDelta(change: () => void) {
-		const logged = this.changes.length;
+		const logged = Arr.map(
+			this.mailboxes,
+			(mailbox) => [mailbox, mailbox.changes.length] as const
+		);
 		change();
-		this.changes.splice(logged);
+		for (const [mailbox, length] of logged) {
+			mailbox.changes.splice(length);
+		}
 	}
 
-	private newId(prefix: string) {
-		this.nextId += 1;
-		return `${prefix}-${this.nextId}`;
-	}
-
-	private issue() {
+	/** Signs in `mailbox` with a new access token, which Graph answers in place of its last, and a refresh token. */
+	private issue(mailbox: FakeMailbox) {
 		this.issued += 1;
-		this.accessToken = `synthetic-access-token-${this.issued}`;
+		mailbox.accessToken = `synthetic-access-token-${this.issued}`;
 		const refreshToken = `synthetic-refresh-token-${this.issued}`;
 		this.refreshTokens.push(refreshToken);
+		mailbox.refreshTokens.push(refreshToken);
 		return json({
-			access_token: this.accessToken,
+			access_token: mailbox.accessToken,
 			expires_in: 3599,
 			refresh_token: refreshToken,
 			scope:
@@ -590,8 +682,9 @@ export class FakeMicrosoft {
 			return this.tunnels.forward(request, url, bytes);
 		}
 		const body = new TextDecoder().decode(bytes);
+		const authorization = request.headers.get("authorization");
 		this.received.push({
-			authorization: request.headers.get("authorization"),
+			authorization,
 			body,
 			method: request.method,
 			prefer: request.headers.get("prefer"),
@@ -606,7 +699,11 @@ export class FakeMicrosoft {
 		if (url.origin === uploadOrigin) {
 			return this.upload(url, request, bytes);
 		}
-		if (request.headers.get("authorization") !== `Bearer ${this.accessToken}`) {
+		const mailbox = Arr.findFirst(
+			this.mailboxes,
+			(candidate) => authorization === `Bearer ${candidate.accessToken}`
+		);
+		if (Option.isNone(mailbox)) {
 			return graphError(
 				401,
 				"InvalidAuthenticationToken",
@@ -640,6 +737,7 @@ export class FakeMicrosoft {
 			Str.includes('outlook.body-content-type="text"')
 		);
 		return this.graph(
+			mailbox.value,
 			request.method,
 			url,
 			body === "" ? {} : (JSON.parse(body) as Json),
@@ -647,10 +745,11 @@ export class FakeMicrosoft {
 		);
 	}
 
+	/** Answers the token endpoint: a device code redeems for its mailbox, and a refresh token for the mailbox it belongs to. */
 	private login(url: URL, form: URLSearchParams) {
 		if (pipe(url.pathname, Str.endsWith("/oauth2/v2.0/devicecode"))) {
 			return json({
-				device_code: "synthetic-device-code",
+				device_code: deviceCode(this.signingIn),
 				expires_in: 900,
 				interval: 1,
 				message: `To sign in, open ${verificationUri} and enter the code ${userCode}.`,
@@ -670,14 +769,24 @@ export class FakeMicrosoft {
 					400
 				);
 			}
-			return this.issue();
+			const signedIn = Arr.findFirst(
+				this.mailboxes,
+				(mailbox) => deviceCode(mailbox) === form.get("device_code")
+			);
+			if (Option.isSome(signedIn)) {
+				return this.issue(signedIn.value);
+			}
 		}
-		if (
-			grant === "refresh_token" &&
-			!this.refuseRefresh &&
-			this.refreshTokens.includes(form.get("refresh_token") ?? "")
-		) {
-			return this.issue();
+		if (grant === "refresh_token" && !this.refuseRefresh) {
+			const refreshed = Arr.findFirst(
+				this.mailboxes,
+				(mailbox) =>
+					!mailbox.refuseRefresh &&
+					mailbox.refreshTokens.includes(form.get("refresh_token") ?? "")
+			);
+			if (Option.isSome(refreshed)) {
+				return this.issue(refreshed.value);
+			}
 		}
 		return json(
 			{
@@ -688,27 +797,27 @@ export class FakeMicrosoft {
 		);
 	}
 
-	private folderJson(id: string) {
-		const folder = this.folders.get(id);
+	private folderJson(mailbox: FakeMailbox, id: string) {
+		const folder = mailbox.folders.get(id);
 		return {
 			childFolderCount: Arr.filter(
-				[...this.folders.values()],
+				[...mailbox.folders.values()],
 				(child) => child.parentFolderId === id
 			).length,
 			displayName: folder?.displayName,
 			id,
 			parentFolderId: folder?.parentFolderId,
-			totalItemCount: this.inFolder(id).length,
+			totalItemCount: mailbox.inFolder(id).length,
 		};
 	}
 
-	private foldersUnder(parentFolderId: string) {
+	private foldersUnder(mailbox: FakeMailbox, parentFolderId: string) {
 		return Arr.map(
 			Arr.filter(
-				[...this.folders.entries()],
+				[...mailbox.folders.entries()],
 				([, folder]) => folder.parentFolderId === parentFolderId
 			),
-			([id]) => this.folderJson(id)
+			([id]) => this.folderJson(mailbox, id)
 		);
 	}
 
@@ -740,14 +849,16 @@ export class FakeMicrosoft {
 		};
 	}
 
-	private delta(folderId: string, url: URL, asText: boolean) {
+	private delta(
+		mailbox: FakeMailbox,
+		folderId: string,
+		url: URL,
+		asText: boolean
+	) {
 		const self = `https://graph.microsoft.com/v1.0/me/mailFolders/${folderId}/messages/delta`;
 		const token = url.searchParams.get("$deltatoken");
 		if (token === null) {
-			const all = Arr.filter(
-				[...this.messages.values()],
-				(message) => message.parentFolderId === folderId
-			);
+			const all = mailbox.inFolder(folderId);
 			const offset = Number(url.searchParams.get("$skiptoken") ?? "0");
 			const more = offset + 2 < all.length;
 			if (!more) {
@@ -764,23 +875,23 @@ export class FakeMicrosoft {
 				...(more
 					? { "@odata.nextLink": `${self}?$skiptoken=${offset + 2}` }
 					: {
-							"@odata.deltaLink": `${self}?$deltatoken=${this.changes.length}`,
+							"@odata.deltaLink": `${self}?$deltatoken=${mailbox.changes.length}`,
 						}),
 			});
 		}
 		const changes = Arr.filter(
-			this.changes.slice(Number(token)),
+			mailbox.changes.slice(Number(token)),
 			(change) => change.folderId === folderId
 		);
 		const ids = Arr.dedupe(Arr.map(changes, (change) => change.id));
 		this.roundsEnded.push(folderId);
 		return json({
-			"@odata.deltaLink": `${self}?$deltatoken=${this.changes.length}`,
+			"@odata.deltaLink": `${self}?$deltatoken=${mailbox.changes.length}`,
 			value: this.entries(
 				folderId,
 				false,
 				Arr.map(ids, (id) => {
-					const message = this.messages.get(id);
+					const message = mailbox.messages.get(id);
 					if (message === undefined || message.parentFolderId !== folderId) {
 						return {
 							"@odata.type": "#microsoft.graph.message",
@@ -808,7 +919,7 @@ export class FakeMicrosoft {
 	 * The ids of the folder's messages, for `$select=id`. Graph serves up to `$top` per page; here a page holds 2, so a
 	 * listing takes several pages, as a large folder does.
 	 */
-	private messageIds(folderId: string, url: URL) {
+	private messageIds(mailbox: FakeMailbox, folderId: string, url: URL) {
 		if (url.searchParams.get("$select") !== "id") {
 			return graphError(
 				400,
@@ -816,7 +927,7 @@ export class FakeMicrosoft {
 				"The fake lists messages only with $select=id."
 			);
 		}
-		const all = this.inFolder(folderId);
+		const all = mailbox.inFolder(folderId);
 		const offset = Number(url.searchParams.get("$skip") ?? "0");
 		const next = new URL(url);
 		next.searchParams.set("$skip", String(offset + 2));
@@ -831,20 +942,21 @@ export class FakeMicrosoft {
 	}
 
 	private draft(
+		mailbox: FakeMailbox,
 		input: Pick<
 			FakeMessage,
 			"bcc" | "body" | "cc" | "conversationId" | "subject" | "to"
 		> & { uniqueBody: string },
-		folder: "folder-drafts" | "folder-sent" = "folder-drafts"
+		folder: "drafts" | "sentitems" = "drafts"
 	) {
-		const sent = folder === "folder-sent";
-		return this.add({
+		const sent = folder === "sentitems";
+		return mailbox.add({
 			...input,
-			from: sent ? owner : null,
-			id: this.newId("message"),
+			from: sent ? mailbox.user : null,
+			id: mailbox.newId("message"),
 			isDraft: !sent,
 			isRead: true,
-			parentFolderId: folder,
+			parentFolderId: mailbox.resolve(folder),
 			received: "2026-10-05T10:00:00Z",
 			sent: sent ? "2026-10-05T10:00:00Z" : null,
 		});
@@ -855,10 +967,11 @@ export class FakeMicrosoft {
 	 * recipients, and any `message` properties the request gives in their place.
 	 */
 	private reaction(
+		mailbox: FakeMailbox,
 		action: string,
 		message: FakeMessage,
 		body: Json,
-		folder: "folder-drafts" | "folder-sent"
+		folder: "drafts" | "sentitems"
 	) {
 		const forward = pipe(action, Str.toLowerCase, Str.includes("forward"));
 		const all = pipe(action, Str.toLowerCase, Str.includes("replyall"));
@@ -867,12 +980,13 @@ export class FakeMicrosoft {
 		const from = Option.toArray(Option.fromNullishOr(message.from));
 		const others = Arr.filter(
 			message.to,
-			(address) => address.address !== owner.address
+			(address) => address.address !== mailbox.user.address
 		);
 		const replyTo = all ? [...from, ...others] : from;
 		const defaultTo = forward ? parseRecipients(body.toRecipients) : replyTo;
 		const defaultCc = all ? message.cc : [];
 		return this.draft(
+			mailbox,
 			{
 				bcc: parseRecipients(changes.bccRecipients),
 				body: `${comment}\r\n\r\nFrom: ${message.from?.name}\r\n${message.body}`,
@@ -895,13 +1009,18 @@ export class FakeMicrosoft {
 		);
 	}
 
-	private newMessage(body: Json, folder: "folder-drafts" | "folder-sent") {
+	private newMessage(
+		mailbox: FakeMailbox,
+		body: Json,
+		folder: "drafts" | "sentitems"
+	) {
 		return this.draft(
+			mailbox,
 			{
 				bcc: parseRecipients(body.bccRecipients),
 				body: content(body.body),
 				cc: parseRecipients(body.ccRecipients),
-				conversationId: this.newId("conversation"),
+				conversationId: mailbox.newId("conversation"),
 				subject: String(body.subject),
 				to: parseRecipients(body.toRecipients),
 				uniqueBody: content(body.body),
@@ -910,7 +1029,9 @@ export class FakeMicrosoft {
 		);
 	}
 
+	/** Graph's answer to a request from `mailbox`, which sees only its own folders, messages and subscriptions. */
 	private graph(
+		mailbox: FakeMailbox,
 		method: string,
 		url: URL,
 		body: Json,
@@ -918,11 +1039,12 @@ export class FakeMicrosoft {
 	): Response | Promise<Response> {
 		const parts = pipe(decodeURIComponent(url.pathname), Str.split("/"));
 		if (parts[2] === "subscriptions") {
-			return this.subscriptions.answer(method, parts[3], parts[4], body);
+			return mailbox.subscriptions.answer(method, parts[3], parts[4], body);
 		}
 		const [, , , collection, id, action, attachmentId, value] = parts;
 		if (collection === "mailFolders") {
 			return this.folderRequest(
+				mailbox,
 				{ body, method, url },
 				asText,
 				id,
@@ -931,73 +1053,89 @@ export class FakeMicrosoft {
 			);
 		}
 		if (collection === "sendMail") {
-			this.newMessage(body.message as Json, "folder-sent");
+			this.newMessage(mailbox, body.message as Json, "sentitems");
 			return new Response(null, { status: 202 });
 		}
 		if (id === undefined) {
 			return json(
-				this.messageJson(this.newMessage(body, "folder-drafts"), asText),
+				this.messageJson(this.newMessage(mailbox, body, "drafts"), asText),
 				201
 			);
 		}
-		const message = this.messages.get(id);
+		const message = mailbox.messages.get(id);
 		if (message === undefined) {
 			return notFound();
 		}
 		if (action === "attachments") {
-			return this.attachmentRequest(method, message, body, attachmentId, value);
+			return this.attachmentRequest(
+				mailbox,
+				method,
+				message,
+				body,
+				attachmentId,
+				value
+			);
 		}
-		return this.messageRequest(method, message, body, asText, action);
+		return this.messageRequest(mailbox, method, message, body, asText, action);
 	}
 
 	private folderRequest(
+		mailbox: FakeMailbox,
 		{ body, method, url }: { body: Json; method: string; url: URL },
 		asText: boolean,
 		id: string | undefined,
 		action: string | undefined,
 		messagesAction: string | undefined
 	) {
+		const root = mailbox.resolve("msgfolderroot");
 		if (id === undefined) {
 			return method === "POST"
 				? this.placeFolder(
-						this.newId("folder"),
+						mailbox,
+						mailbox.newId("folder"),
 						String(body.displayName),
-						"folder-root",
+						root,
 						201
 					)
-				: json({ value: this.foldersUnder("folder-root") });
+				: json({ value: this.foldersUnder(mailbox, root) });
 		}
-		const folderId = wellKnown[id] ?? id;
-		const folder = this.folders.get(folderId);
+		const folderId = mailbox.resolve(id);
+		const folder = mailbox.folders.get(folderId);
 		if (folder === undefined) {
 			return notFound();
 		}
 		if (action === "childFolders") {
 			return method === "POST"
 				? this.placeFolder(
-						this.newId("folder"),
+						mailbox,
+						mailbox.newId("folder"),
 						String(body.displayName),
 						folderId,
 						201
 					)
-				: json({ value: this.foldersUnder(folderId) });
+				: json({ value: this.foldersUnder(mailbox, folderId) });
 		}
 		if (action === "move") {
-			const destination = String(body.destinationId);
-			const parentFolderId = wellKnown[destination] ?? destination;
-			return parentFolderId === "folder-root" ||
-				this.folders.has(parentFolderId)
-				? this.placeFolder(folderId, folder.displayName, parentFolderId, 201)
+			const parentFolderId = mailbox.resolve(String(body.destinationId));
+			return parentFolderId === root || mailbox.folders.has(parentFolderId)
+				? this.placeFolder(
+						mailbox,
+						folderId,
+						folder.displayName,
+						parentFolderId,
+						201
+					)
 				: notFound();
 		}
 		if (action === "messages" && messagesAction === "delta") {
-			return this.delta(folderId, url, asText);
+			return this.delta(mailbox, folderId, url, asText);
 		}
 		if (action === "messages") {
-			return this.messageIds(folderId, url);
+			return this.messageIds(mailbox, folderId, url);
 		}
 		if (method === "PATCH") {
 			return this.placeFolder(
+				mailbox,
 				folderId,
 				String(body.displayName),
 				folder.parentFolderId,
@@ -1005,7 +1143,7 @@ export class FakeMicrosoft {
 			);
 		}
 		if (method === "GET") {
-			return json(this.folderJson(folderId));
+			return json(this.folderJson(mailbox, folderId));
 		}
 		return graphError(
 			405,
@@ -1019,13 +1157,14 @@ export class FakeMicrosoft {
 	 * of a name in one parent, in any case.
 	 */
 	private placeFolder(
+		mailbox: FakeMailbox,
 		id: string,
 		displayName: string,
 		parentFolderId: string,
 		status: number
 	) {
 		const taken = Arr.some(
-			[...this.folders],
+			[...mailbox.folders],
 			([other, folder]) =>
 				other !== id &&
 				folder.parentFolderId === parentFolderId &&
@@ -1038,13 +1177,18 @@ export class FakeMicrosoft {
 				"A folder with the specified name already exists."
 			);
 		}
-		this.folders.set(id, { displayName, parentFolderId });
-		return json(this.folderJson(id), status);
+		mailbox.folders.set(id, { displayName, parentFolderId });
+		return json(this.folderJson(mailbox, id), status);
 	}
 
 	/** Logs the change and answers the message as Graph holds it now. */
-	private touched(message: FakeMessage, status: number, asText: boolean) {
-		this.changes.push({ folderId: message.parentFolderId, id: message.id });
+	private touched(
+		mailbox: FakeMailbox,
+		message: FakeMessage,
+		status: number,
+		asText: boolean
+	) {
+		mailbox.changes.push({ folderId: message.parentFolderId, id: message.id });
 		return json(this.messageJson(message, asText), status);
 	}
 
@@ -1079,6 +1223,7 @@ export class FakeMicrosoft {
 	}
 
 	private messageRequest(
+		mailbox: FakeMailbox,
 		method: string,
 		message: FakeMessage,
 		body: Json,
@@ -1094,31 +1239,39 @@ export class FakeMicrosoft {
 		}
 		if (action === undefined && method === "PATCH") {
 			this.patch(message, body);
-			return this.touched(message, 200, asText);
+			return this.touched(mailbox, message, 200, asText);
 		}
 		if (action === "move") {
-			this.changes.push({ folderId: message.parentFolderId, id: message.id });
-			const destination = String(body.destinationId);
-			message.parentFolderId = wellKnown[destination] ?? destination;
-			return this.touched(message, 201, asText);
+			mailbox.changes.push({
+				folderId: message.parentFolderId,
+				id: message.id,
+			});
+			message.parentFolderId = mailbox.resolve(String(body.destinationId));
+			return this.touched(mailbox, message, 201, asText);
 		}
 		if (
 			action === "createReply" ||
 			action === "createReplyAll" ||
 			action === "createForward"
 		) {
-			const created = this.reaction(action, message, body, "folder-drafts");
+			const created = this.reaction(mailbox, action, message, body, "drafts");
 			return json(this.messageJson(created, asText), 201);
 		}
 		if (action === "reply" || action === "replyAll" || action === "forward") {
-			this.reaction(action, message, body, "folder-sent");
+			this.reaction(mailbox, action, message, body, "sentitems");
 			return new Response(null, { status: 202 });
 		}
 		if (action === "send" && message.isDraft) {
-			this.changes.push({ folderId: message.parentFolderId, id: message.id });
+			mailbox.changes.push({
+				folderId: message.parentFolderId,
+				id: message.id,
+			});
 			message.isDraft = false;
-			message.parentFolderId = "folder-sent";
-			this.changes.push({ folderId: message.parentFolderId, id: message.id });
+			message.parentFolderId = mailbox.resolve("sentitems");
+			mailbox.changes.push({
+				folderId: message.parentFolderId,
+				id: message.id,
+			});
 			return new Response(null, { status: 202 });
 		}
 		return graphError(
@@ -1129,6 +1282,7 @@ export class FakeMicrosoft {
 	}
 
 	private attachmentRequest(
+		mailbox: FakeMailbox,
 		method: string,
 		message: FakeMessage,
 		body: Json,
@@ -1167,9 +1321,10 @@ export class FakeMicrosoft {
 		}
 		if (attachmentId === "createUploadSession") {
 			const item = body.AttachmentItem as { name: string; size: number };
-			const session = this.newId("upload");
+			const session = mailbox.newId("upload");
 			this.uploads.set(session, {
 				chunks: [],
+				mailbox,
 				messageId: message.id,
 				name: item.name,
 				size: item.size,
@@ -1179,12 +1334,12 @@ export class FakeMicrosoft {
 		message.attachments.push({
 			bytes: new TextEncoder().encode(String(body.contentBytes)),
 			contentId: null,
-			id: this.newId("attachment"),
+			id: mailbox.newId("attachment"),
 			isInline: false,
 			name: String(body.name),
 			type: "application/octet-stream",
 		});
-		return this.touched(message, 201, false);
+		return this.touched(mailbox, message, 201, false);
 	}
 
 	private upload(url: URL, request: Request, bytes: Uint8Array) {
@@ -1206,10 +1361,10 @@ export class FakeMicrosoft {
 		if (received < session.size) {
 			return json({ nextExpectedRanges: [`${received}-`] });
 		}
-		this.messages.get(session.messageId)?.attachments.push({
+		session.mailbox.messages.get(session.messageId)?.attachments.push({
 			bytes: new Uint8Array(),
 			contentId: null,
-			id: this.newId("attachment"),
+			id: session.mailbox.newId("attachment"),
 			isInline: false,
 			name: session.name,
 			type: "application/octet-stream",
