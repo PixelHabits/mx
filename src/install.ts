@@ -177,13 +177,13 @@ export class Installer extends Context.Service<
 		 * Sets up `agents`, runs `login` and `firstSync` and then starts the background `mx sync`, which it starts as well
 		 * when a step after its registration fails.
 		 */
-		readonly install: <E, R>(options: {
+		readonly install: <E, R, S>(options: {
 			readonly agents: readonly AgentId[];
 			/** The sync to run in the foreground once signed in, before mx sync starts in the background. */
-			readonly firstSync: Effect.Effect<void, GraphError>;
+			readonly firstSync: Effect.Effect<void, GraphError, S>;
 			/** Signs the first account in when it needs a sign-in. */
 			readonly login: Effect.Effect<void, E, R>;
-		}) => Effect.Effect<void, InstallFailed | GraphError | E, R>;
+		}) => Effect.Effect<void, InstallFailed | GraphError | E, R | S>;
 		/** What `mx uninstall` removes on this machine, in the order it removes them. */
 		readonly removals: Effect.Effect<readonly Removal[], InstallFailed>;
 		/** Puts `bytes` in place as the installed binary, also while it runs. */
@@ -752,13 +752,13 @@ export class Installer extends Context.Service<
 					})
 				);
 
-			const install = Effect.fn("Installer.install")(function* <E, R>({
+			const install = Effect.fn("Installer.install")(function* <E, R, S>({
 				agents: chosen,
 				firstSync,
 				login,
 			}: {
 				readonly agents: readonly AgentId[];
-				readonly firstSync: Effect.Effect<void, GraphError>;
+				readonly firstSync: Effect.Effect<void, GraphError, S>;
 				readonly login: Effect.Effect<void, E, R>;
 			}) {
 				// Every config is read and edited before anything changes, so a missing or unreadable one changes nothing.

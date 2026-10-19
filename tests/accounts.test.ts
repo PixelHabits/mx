@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, it } from "bun:test";
+// @effect-diagnostics-next-line nodeBuiltinImport:off - a spawn hook runs synchronously as the program starts, so it reads config.json synchronously.
+import { readFileSync } from "node:fs";
 import { BunServices } from "@effect/platform-bun";
 import {
 	Array as Arr,
@@ -230,12 +232,13 @@ const keyPress = (name: string): Terminal.UserInput => ({
 });
 
 /**
- * `platform` on a terminal where the user presses `keys` in turn across every prompt; `frames` keeps what mx drew, and
+ * `base` on a terminal where the user presses `keys` in turn across every prompt; `frames` keeps what mx drew, and
  * `drawn` runs on each frame as mx draws it, before the user presses the next key.
  */
 const terminalWith = (
 	keys: readonly string[],
-	drawn: (frame: string) => void = () => undefined
+	drawn: (frame: string) => void = () => undefined,
+	base: Platform = platform
 ) => {
 	const frames: string[] = [];
 	let input: Queue.Queue<Terminal.UserInput, Cause.Done> | undefined;
@@ -259,7 +262,7 @@ const terminalWith = (
 			rows: Effect.succeed(24),
 		})
 	);
-	return { frames, system: Layer.merge(platform, terminal) };
+	return { frames, system: Layer.merge(base, terminal) };
 };
 
 /** The keys that type `text`. */
@@ -748,10 +751,10 @@ const pushing = platformWith({
 const services: Fiber.Fiber<unknown, unknown>[] = [];
 
 /** Rows of the store, read as `sql` with `values` answers them. */
-const rowsOf = <Row>(sql: string, ...values: number[]): Row[] => {
+const rowsOf = <Row>(sql: string, ...values: (number | string)[]): Row[] => {
 	const db = new Database(second.database, { strict: true });
 	try {
-		return db.query<Row, number[]>(sql).all(...values);
+		return db.query<Row, (number | string)[]>(sql).all(...values);
 	} finally {
 		db.close();
 	}
@@ -1169,6 +1172,737 @@ describe("mx sync with several accounts", () => {
 			Effect.ensuring(
 				Effect.sync(() => {
 					sam.refuseRefresh = false;
+				})
+			)
+		));
+});
+
+/**
+ * An mx mcp that an agent starts now on the second machine, so it reads config.json as it is now, with a client on its
+ * stdio; the scope stops it.
+ */
+const startAgent = Effect.gen(function* () {
+	const { client, stdio } = yield* connect();
+	yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+		// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+		Effect.provide(stdio),
+		// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+		Effect.provide(second.platform, { local: true }),
+		Effect.forkScoped
+	);
+	return client;
+});
+
+/**
+ * Runs `body` with its tool calls going to an mx mcp started as it begins, since the file's first mx mcp runs on the
+ * first machine.
+ */
+const withAgent = <A, E, R>(body: Effect.Effect<A, E, R>) =>
+	body.pipe(Effect.provideServiceEffect(McpClient, startAgent), Effect.scoped);
+
+/** The lines of a read tool's answer without the warnings before them, which depend on how long ago mx sync last ran. */
+const answerLines = (text: string) =>
+	Arr.filter(lines(text), (line) => !pipe(line, Str.startsWith("⚠ ")));
+
+/** The local id of the one stored message with the subject. */
+const localIdOf = (subject: string) =>
+	Option.getOrThrow(
+		Arr.head(
+			rowsOf<{ readonly id: number }>(
+				"SELECT id FROM messages WHERE subject = ?",
+				subject
+			)
+		)
+	).id;
+
+/** The message Graph holds in `mailbox` with the subject. */
+const heldIn = (mailbox: FakeMailbox, subject: string) =>
+	Option.getOrThrow(
+		Arr.findFirst(
+			[...mailbox.messages.values()],
+			(message) => message.subject === subject
+		)
+	);
+
+/** The subjects of the messages Graph holds in the well-known folder of `mailbox`. */
+const subjectsIn = (mailbox: FakeMailbox, folder: "drafts" | "sentitems") =>
+	Arr.map(mailbox.inFolder(mailbox.resolve(folder)), ({ subject }) => subject);
+
+/** The Graph requests made since the `from`th, whose path ends with `ending`. */
+const graphRequestsSince = (from: number, ending: string) =>
+	Arr.filter(microsoft.graphRequests().slice(from), ({ url }) =>
+		pipe(url.pathname, Str.endsWith(ending))
+	);
+
+/** The search lines of the seed mail in each account. */
+const swap =
+	/^#\d+ \[work\] .* Inbox \| Rosa Example <rosa@example\.com> \| Seed swap \| unread$/u;
+const catalogue =
+	/^#\d+ \[personal\] .* Archive \| Rosa Example <rosa@example\.com> \| Seed catalogue \| unread$/u;
+/** The listing lines of the reply drafted in Pat's account and the new message drafted in Sam's. */
+const replyDraftLine =
+	/^#\d+ \[personal\] .* Drafts \| to Rosa Example <rosa@example\.com> \| RE: Allotment waiting list \| draft$/u;
+const newDraftLine =
+	/^#\d+ \[work\] .* Drafts \| to rosa@example\.com \| Plot fees \| draft$/u;
+
+describe("tools across accounts", () => {
+	test("a tool call on a message of the second account goes to Graph with that account's access token, and the message stays in the store", () =>
+		Effect.gen(function* () {
+			yield* second.cli("sync", "--once");
+			const rota = heldIn(pat, "Allotment rota");
+			const before = microsoft.graphRequests().length;
+			const answer = yield* tool("message", {
+				full: true,
+				id: localIdOf("Allotment rota"),
+			});
+			expect(answer).toContain("Allotment rota, in the body.");
+			const asked = Arr.filter(
+				microsoft.graphRequests().slice(before),
+				({ url }) => pipe(url.pathname, Str.includes(rota.id))
+			);
+			expect(Arr.isReadonlyArrayNonEmpty(asked)).toBe(true);
+			expect(Arr.map(asked, ({ authorization }) => authorization)).toEqual(
+				Arr.map(asked, () => `Bearer ${pat.accessToken}`)
+			);
+			expect(mailOf(2)).toEqual(mailIn(pat));
+		}).pipe(withAgent));
+
+	test("a message id names its account: thread, message and update act on the mail of either account, and their answers name it", () =>
+		Effect.gen(function* () {
+			const compost = localIdOf("Compost delivery");
+			const waiting = localIdOf("Allotment waiting list");
+			expect(answerLines(yield* tool("thread", { id: waiting }))[0]).toBe(
+				"[personal] Allotment waiting list, 1 messages"
+			);
+			expect(
+				answerLines(yield* tool("message", { id: compost }))[0]
+			).toStartWith(`#${compost} [work] `);
+			expect(
+				answerLines(yield* tool("message", { full: true, id: waiting }))[0]
+			).toStartWith(`#${waiting} [personal] `);
+			const updated = lines(
+				yield* tool("update", { ids: [compost, waiting], read: true })
+			);
+			expect(updated).toEqual([
+				expect.stringMatching(
+					new RegExp(`^#${compost} \\[work\\] .*Compost delivery$`)
+				),
+				expect.stringMatching(
+					new RegExp(`^#${waiting} \\[personal\\] .*Allotment waiting list$`)
+				),
+			]);
+			expect(heldIn(sam, "Compost delivery").isRead).toBe(true);
+			expect(heldIn(pat, "Allotment waiting list").isRead).toBe(true);
+		}).pipe(withAgent));
+
+	test("with two accounts folder needs account, and update refuses to move a message to a folder of the other account and sends Graph no move", () =>
+		Effect.gen(function* () {
+			expect(yield* call("folder", { create: "Allotment" })).toMatchObject({
+				isError: true,
+				text: "folder needs account with several accounts: work or personal.",
+			});
+			expect(
+				yield* tool("folder", { account: "personal", create: "Allotment" })
+			).toBe("Created personal: Allotment.");
+			const compost = heldIn(sam, "Compost delivery");
+			const before = microsoft.graphRequests().length;
+			expect(
+				yield* call("update", {
+					ids: [localIdOf("Compost delivery")],
+					move_to: "Allotment",
+				})
+			).toMatchObject({
+				isError: true,
+				text: "Allotment is in personal; mx moves mail only within an account.",
+			});
+			expect(graphRequestsSince(before, "/move")).toEqual([]);
+			expect(compost.parentFolderId).toBe(sam.resolve("inbox"));
+		}).pipe(withAgent));
+
+	test("a reply comes from the account of the message it answers, and draft refuses another account", () =>
+		Effect.gen(function* () {
+			const waiting = localIdOf("Allotment waiting list");
+			const samDrafts = subjectsIn(sam, "drafts");
+			expect(
+				yield* call("draft", {
+					account: "work",
+					body: "Yes please.",
+					kind: "reply",
+					message: waiting,
+				})
+			).toMatchObject({
+				isError: true,
+				text: `#${waiting} is in personal; a reply comes from personal.`,
+			});
+			const drafted = yield* tool("draft", {
+				body: "Yes please.",
+				kind: "reply",
+				message: waiting,
+			});
+			expect(drafted).toMatch(replyDraftLine);
+			expect(subjectsIn(pat, "drafts")).toContain("RE: Allotment waiting list");
+			expect(subjectsIn(sam, "drafts")).toEqual(samDrafts);
+		}).pipe(withAgent));
+
+	test("with two accounts a new message without account is refused, and with account it is drafted in that account", () =>
+		Effect.gen(function* () {
+			const drafts = [subjectsIn(sam, "drafts"), subjectsIn(pat, "drafts")];
+			const fields = {
+				body: "What are the plot fees this year?",
+				kind: "new",
+				subject: "Plot fees",
+				to: [rosa.address],
+			};
+			expect(yield* call("draft", fields)).toMatchObject({
+				isError: true,
+				text: "kind new needs account with several accounts: work or personal.",
+			});
+			expect([subjectsIn(sam, "drafts"), subjectsIn(pat, "drafts")]).toEqual(
+				drafts
+			);
+			expect(yield* tool("draft", { ...fields, account: "work" })).toMatch(
+				newDraftLine
+			);
+			expect(subjectsIn(sam, "drafts")).toContain("Plot fees");
+		}).pipe(withAgent));
+
+	test("send needs from with two accounts, and a from other than the draft's account or the answered message's sends nothing", () =>
+		Effect.gen(function* () {
+			const reply = localIdOf("RE: Allotment waiting list");
+			const fields = {
+				bcc: [],
+				cc: [],
+				draft: reply,
+				subject: "RE: Allotment waiting list",
+				to: [rosa.address],
+			};
+			const sent = [subjectsIn(sam, "sentitems"), subjectsIn(pat, "sentitems")];
+			const before = microsoft.graphRequests().length;
+			const refusals = yield* Effect.forEach(
+				[
+					{ ...fields, from: "work" },
+					fields,
+					{
+						body: "Count me in.",
+						from: "work",
+						kind: "reply",
+						message: localIdOf("Allotment waiting list"),
+					},
+				],
+				(args) => call("send", args)
+			);
+			expect(refusals).toMatchObject([
+				{
+					isError: true,
+					text: `Nothing was sent: #${reply} is a draft in personal.`,
+				},
+				{
+					isError: true,
+					text: "Nothing was sent: send needs from with several accounts: work or personal.",
+				},
+				{
+					isError: true,
+					text: `Nothing was sent: #${localIdOf("Allotment waiting list")} is in personal; a reply comes from personal.`,
+				},
+			]);
+			expect([
+				subjectsIn(sam, "sentitems"),
+				subjectsIn(pat, "sentitems"),
+			]).toEqual(sent);
+			expect([
+				...graphRequestsSince(before, "/send"),
+				...graphRequestsSince(before, "/sendMail"),
+				...graphRequestsSince(before, "/reply"),
+			]).toEqual([]);
+			expect(yield* tool("send", { ...fields, from: "personal" })).toBe(
+				`Sent #${reply} from personal to ${rosa.address}: RE: Allotment waiting list`
+			);
+			expect(subjectsIn(pat, "sentitems")).toContain(
+				"RE: Allotment waiting list"
+			);
+		}).pipe(withAgent));
+
+	test("search and query span both accounts, show each line's account and filter by account, and an unknown account is refused", () =>
+		Effect.gen(function* () {
+			microsoft.deliver({
+				body: "Swap my tomato seed for your bean seed?",
+				conversationId: "sam-conversation-seed-swap",
+				from: rosa,
+				parentFolderId: sam.resolve("inbox"),
+				received: "2026-10-07T08:00:00Z",
+				subject: "Seed swap",
+			});
+			yield* second.cli("sync", "--once");
+			const both = answerLines(yield* tool("search", { query: "seed" }));
+			expect(both).toHaveLength(2);
+			expect(both).toEqual(
+				expect.arrayContaining([
+					expect.stringMatching(swap),
+					expect.stringMatching(catalogue),
+				])
+			);
+			expect(
+				answerLines(
+					yield* tool("search", { account: "personal", query: "seed" })
+				)
+			).toEqual([expect.stringMatching(catalogue)]);
+			expect(
+				answerLines(yield* tool("search", { folder: "Inbox", query: "seed" }))
+			).toEqual([expect.stringMatching(swap)]);
+			const seeds =
+				"SELECT account, subject FROM mail WHERE subject LIKE 'Seed%' ORDER BY account DESC";
+			expect(answerLines(yield* tool("query", { sql: seeds }))).toEqual([
+				"account\tsubject",
+				"work\tSeed swap",
+				"personal\tSeed catalogue",
+			]);
+			expect(
+				answerLines(yield* tool("query", { account: "personal", sql: seeds }))
+			).toEqual(["account\tsubject", "personal\tSeed catalogue"]);
+			expect(
+				answerLines(
+					yield* tool("query", {
+						account: "work",
+						sql: "SELECT account FROM folders UNION SELECT account FROM conversations",
+					})
+				)
+			).toEqual(["account", "work"]);
+			const refusals = yield* Effect.forEach(
+				[
+					call("search", { account: "garden" }),
+					call("query", { account: "garden", sql: seeds }),
+				],
+				(refused) =>
+					Effect.map(refused, ({ isError, text }) => ({
+						isError,
+						lines: answerLines(text),
+					}))
+			);
+			expect(refusals).toEqual(
+				Arr.replicate(
+					{
+						isError: true,
+						lines: ["No account garden. The accounts are work and personal."],
+					},
+					2
+				)
+			);
+		}).pipe(withAgent));
+
+	test("with two accounts a read tool warns about each account by its alias, and a refused sign-in names the account to sign in to again", () =>
+		Effect.gen(function* () {
+			pat.refuseRefresh = true;
+			const service = yield* Effect.forkChild(second.cli("sync"));
+			const expired = "Sign-in expired. Run mx login --account personal.";
+			yield* eventually("Pat's account stopped", () =>
+				Option.exists(followed(2), (row) => row.last_error === expired)
+			);
+			yield* eventually("a pass of Sam's account", () =>
+				Option.exists(followed(1), (row) => row.mode !== "starting")
+			);
+			const found = lines(yield* tool("search", { query: "seed" }));
+			expect(found[0]).toBe(`⚠ personal: ${expired}`);
+			expect(found.slice(1)).toHaveLength(2);
+			const refused = yield* call("message", {
+				full: true,
+				id: localIdOf("Seed catalogue"),
+			});
+			expect(refused.isError).toBe(true);
+			expect(lines(refused.text).at(-1)).toBe(
+				"Microsoft refused the saved sign-in (invalid_grant). Run mx login --account personal."
+			);
+			yield* Fiber.interrupt(service);
+		}).pipe(
+			withAgent,
+			Effect.ensuring(
+				Effect.sync(() => {
+					pat.refuseRefresh = false;
+				})
+			)
+		));
+
+	test("with two accounts mx mcp's instructions name each account and the rules, and triage and interview take the accounts in turn; with one account the instructions are as before", () =>
+		Effect.gen(function* () {
+			const instructions = Effect.flatMap(startAgent, (agent) =>
+				Effect.map(
+					agent.request("server/discover"),
+					(found) => (found as { readonly instructions: string }).instructions
+				)
+			);
+			const block = `The user has several mail accounts:
+- work: sam@example.test
+- personal: pat@example.org
+Each message id belongs to one account, and tools act in that account. A reply, reply-all or forward always comes from the account of the message it answers. For a new message, name the account in draft, and ask the user which one if they have not said. send needs from, the alias of the account the draft is in. Mail never moves between accounts: move_to and the folder tools only see the message's own account.`;
+			const several = yield* instructions;
+			expect(several).toContain(`\n\n${block}\n\n`);
+			const client = yield* startAgent;
+			expect(yield* client.prompt("triage", {})).toContain(
+				"Report each account under its own heading."
+			);
+			expect(yield* client.prompt("interview", {})).toContain(
+				"Ask what each account is for."
+			);
+			const saved = yield* readJson(second.configFile);
+			yield* writeJson(second.configFile, { accounts: [samAccount("work")] });
+			const one = yield* instructions.pipe(
+				Effect.ensuring(Effect.orDie(writeJson(second.configFile, saved)))
+			);
+			expect(one).toStartWith(
+				"mx is a local copy of the user's Microsoft 365 mailbox, kept current by mx sync."
+			);
+			expect(one).toBe(pipe(several, Str.replace(`${block}\n\n`, "")));
+		}).pipe(Effect.scoped));
+
+	test("mx logout --account removes that account's copy of the mail, its subscriptions, its sign-in and last its entry in config.json, then restarts mx sync, leaves the other account as it was and the mailbox in Microsoft 365 untouched, and refuses the last account", () =>
+		Effect.gen(function* () {
+			const noTerminal = yield* second.run("logout", "--account", "personal");
+			expect(Exit.isFailure(noTerminal.exit)).toBe(true);
+			expect(noTerminal.errors).toContain(
+				"mx can't ask you to confirm the logout here. Run mx logout --account personal --yes."
+			);
+			expect(Arr.isReadonlyArrayNonEmpty(mailOf(2))).toBe(true);
+			const work = accountRows(1);
+			const held = [...pat.messages.keys()];
+			/** A subscription of the running mx sync in `mailbox`. */
+			const subscribe = (mailbox: FakeMailbox) =>
+				mailbox.subscriptions.seed({
+					changeType: "created,updated,deleted",
+					clientState: "this run",
+					expirationDateTime: "2026-10-09T00:00:00Z",
+					lifecycleNotificationUrl: "https://tunnel-9.trycloudflare.com/graph",
+					notificationUrl: "https://tunnel-9.trycloudflare.com/graph",
+					resource: "me/mailFolders('inbox')/messages",
+				});
+			const samSubscription = subscribe(sam);
+			subscribe(pat);
+			let atRestart:
+				| { readonly listed: boolean; readonly signedIn: boolean }
+				| undefined;
+			processes.onSpawn = () => {
+				atRestart ??= {
+					listed: pipe(
+						readFileSync(second.configFile, "utf8"),
+						Str.includes('"personal"')
+					),
+					signedIn: secrets.entries.has("mx/refresh-token-2"),
+				};
+			};
+			const { output } = yield* second
+				.cli("logout", "--account", "personal", "--yes")
+				.pipe(
+					Effect.ensuring(
+						Effect.sync(() => {
+							processes.onSpawn = undefined;
+						})
+					)
+				);
+			expect(lines(output)).toContain(
+				"Removed personal (pat@example.org): its sign-in and the copy of its mail. Its mailbox in Microsoft 365 is unchanged. Restart your agents so they see the change."
+			);
+			expect(atRestart).toEqual({ listed: false, signedIn: false });
+			expect(tunnelSubscriptions(pat)).toEqual([]);
+			expect(Arr.map(tunnelSubscriptions(sam), ({ id }) => id)).toEqual([
+				samSubscription,
+			]);
+			expect(yield* readJson(second.configFile)).toEqual({
+				accounts: [samAccount("work")],
+			});
+			expect(secrets.entries.has("mx/refresh-token-2")).toBe(false);
+			expect(secrets.entries.has("mx/refresh-token")).toBe(true);
+			expect(accountRows(2)).toEqual({ folders: [], mail: [] });
+			expect(followed(2)).toEqual(Option.none());
+			expect(accountRows(1)).toEqual(work);
+			expect([...pat.messages.keys()]).toEqual(held);
+			const last = yield* Effect.flip(
+				second.cli("logout", "--account", "work", "--yes")
+			);
+			expect(last.message).toBe(
+				"work is the only account. To remove it with the rest of mx, run mx uninstall."
+			);
+			expect(yield* readJson(second.configFile)).toEqual({
+				accounts: [samAccount("work")],
+			});
+		}));
+
+	test("mx sync drops, as it starts, the mail of an account that config.json does not name, as an mx sync that ran on through a logout can leave", () =>
+		Effect.gen(function* () {
+			microsoft.signingIn = pat;
+			yield* second.cli(
+				"login",
+				"--account",
+				"personal",
+				"--client-id",
+				otherClientId,
+				"--tenant",
+				"example.org"
+			);
+			yield* second.cli("sync", "--once");
+			expect(mailOf(2)).toEqual(mailIn(pat));
+			const work = foldersOf(1);
+			yield* writeJson(second.configFile, { accounts: [samAccount("work")] });
+			const service = yield* Effect.forkChild(second.cli("sync"));
+			yield* eventually(
+				"the dropped account's folders",
+				() => foldersOf(2).length === 0
+			);
+			expect(mailOf(2)).toEqual([]);
+			expect(Arr.map(foldersOf(1), ({ id }) => id)).toEqual(
+				Arr.map(work, ({ id }) => id)
+			);
+			yield* Fiber.interrupt(service);
+		}));
+
+	test("an mx logout that stops partway, here as the secret store goes down while the user confirms, leaves the account in config.json, and mx logout --account run again removes the rest of it", () =>
+		Effect.gen(function* () {
+			microsoft.signingIn = pat;
+			yield* second.cli(
+				"login",
+				"--account",
+				"personal",
+				"--client-id",
+				otherClientId,
+				"--tenant",
+				"example.org"
+			);
+			const { system } = terminalWith(
+				["y"],
+				() => {
+					secrets.machine = "broken";
+				},
+				second.platform
+			);
+			const { exit } = yield* onTerminal(
+				runOn(system)("logout", "--account", "personal")
+			);
+			secrets.machine = "store";
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(accountRows(2)).toEqual({ folders: [], mail: [] });
+			expect(secrets.entries.has("mx/refresh-token-2")).toBe(true);
+			expect(yield* readJson(second.configFile)).toEqual({
+				accounts: [samAccount("work"), patAccount],
+			});
+			const { output } = yield* second.cli(
+				"logout",
+				"--account",
+				"personal",
+				"--yes"
+			);
+			expect(lines(output)).toContain(
+				"Removed personal (pat@example.org): its sign-in and the copy of its mail. Its mailbox in Microsoft 365 is unchanged. Restart your agents so they see the change."
+			);
+			expect(secrets.entries.has("mx/refresh-token-2")).toBe(false);
+			expect(yield* readJson(second.configFile)).toEqual({
+				accounts: [samAccount("work")],
+			});
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					secrets.machine = "store";
+				})
+			)
+		));
+
+	test("after mx logout removes account 1, mx install signs in to no account and syncs none again, and the other account goes on syncing", () =>
+		Effect.gen(function* () {
+			microsoft.signingIn = pat;
+			yield* second.cli(
+				"login",
+				"--account",
+				"personal",
+				"--client-id",
+				otherClientId,
+				"--tenant",
+				"example.org"
+			);
+			yield* second.cli("sync", "--once");
+			yield* second.cli("logout", "--account", "work", "--yes");
+			yield* writeJson(join(second.home, ".claude.json"), {});
+			const before = microsoft.received.length;
+			const { output } = yield* second.cli("install", "--agent", "claude-code");
+			expect(microsoft.received.slice(before)).toEqual([]);
+			expect(lines(output)).toContain("Started mx sync.");
+			microsoft.deliver({
+				body: "The water butts are full again.",
+				conversationId: "pat-conversation-water",
+				from: rosa,
+				parentFolderId: pat.resolve("inbox"),
+				received: "2026-10-07T08:00:00Z",
+				subject: "Water butts",
+			});
+			const synced = yield* second.cli("sync", "--once");
+			expect(lines(synced.output)).toEqual([
+				`Synced ${pat.folders.size} folders: 1 messages saved, 0 removed.`,
+			]);
+			expect(mailOf(2)).toEqual(mailIn(pat));
+		}));
+});
+
+/** A machine for each mx install below, where mx has no account yet. */
+const third = await machine.runPromise(machineAt(join(home, "third")));
+const fourth = await machine.runPromise(machineAt(join(home, "fourth")));
+
+const addAnother = "Add another Microsoft 365 account?";
+
+/**
+ * `base` on a terminal where the user answers each of `answers` in turn: once mx draws a frame that shows the answer's
+ * prompt, `asked` runs and the user presses its keys. `frames` keeps what mx drew.
+ */
+const answering = (
+	answers: readonly {
+		readonly keys: readonly string[];
+		readonly prompt: string;
+		readonly asked?: () => void;
+	}[],
+	base: Platform
+) => {
+	const frames: string[] = [];
+	let answered = 0;
+	const terminal = Layer.effect(
+		Terminal.Terminal,
+		Effect.map(Queue.make<Terminal.UserInput, Cause.Done>(), (input) =>
+			Terminal.make({
+				columns: Effect.succeed(80),
+				display: (text) =>
+					Effect.sync(() => {
+						frames.push(text);
+						const next = answers[answered];
+						if (next !== undefined && pipe(text, Str.includes(next.prompt))) {
+							answered += 1;
+							next.asked?.();
+							Queue.offerAllUnsafe(input, Arr.map(next.keys, keyPress));
+						}
+					}),
+				readInput: Effect.succeed(input),
+				readLine: Effect.die("mx reads no lines from the terminal."),
+				rows: Effect.succeed(24),
+			})
+		)
+	);
+	return { frames, system: Layer.merge(base, terminal) };
+};
+
+/** Whether the request asks for a delta page of a folder of `mailbox`. */
+const isDeltaOf =
+	(mailbox: FakeMailbox) =>
+	({ url }: { readonly url: URL }) =>
+		Arr.some(folderIdsIn(mailbox), (folder) =>
+			pipe(url.pathname, Str.endsWith(`/${folder}/messages/delta`))
+		);
+
+describe("mx install with several accounts", () => {
+	test("on a terminal, mx install asks after each sign-in whether to add another account and signs in each one added before it reads any mail, then syncs every account in the foreground, each on a line of its own", () =>
+		Effect.gen(function* () {
+			yield* (yield* FileSystem.FileSystem).makeDirectory(third.home, {
+				recursive: true,
+			});
+			yield* writeJson(join(third.home, ".claude.json"), {});
+			microsoft.signingIn = sam;
+			const { frames, system } = answering(
+				[
+					{
+						keys: [...typing("work"), "return"],
+						prompt: "Alias for the new account",
+					},
+					{
+						asked: () => {
+							microsoft.signingIn = pat;
+						},
+						keys: ["y"],
+						prompt: addAnother,
+					},
+					{ keys: [...typing(otherClientId), "return"], prompt: "Client id" },
+					{ keys: [...typing("example.org"), "return"], prompt: "Tenant" },
+					{
+						keys: [...typing("personal"), "return"],
+						prompt: "Alias for the new account",
+					},
+					{ keys: ["return"], prompt: addAnother },
+				],
+				third.platform
+			);
+			const before = microsoft.received.length;
+			const { output } = yield* onTerminal(
+				cliOn(system)(
+					"install",
+					"--agent",
+					"claude-code",
+					"--client-id",
+					clientId,
+					"--tenant",
+					tenant
+				)
+			);
+			const requests = microsoft.received.slice(before);
+			const lastSignIn = Arr.findLastIndex(
+				requests,
+				({ body, url }) =>
+					url.hostname === loginHost &&
+					new URLSearchParams(body).get("grant_type") ===
+						"urn:ietf:params:oauth:grant-type:device_code"
+			);
+			const firstMail = Arr.findFirstIndex(
+				requests,
+				({ url }) => url.hostname === "graph.microsoft.com"
+			);
+			expect(
+				Arr.filter(requests, ({ url }) =>
+					pipe(url.pathname, Str.endsWith("/devicecode"))
+				)
+			).toHaveLength(2);
+			expect(Option.getOrThrow(firstMail)).toBeGreaterThan(
+				Option.getOrThrow(lastSignIn)
+			);
+			expect(yield* readJson(third.configFile)).toEqual({
+				accounts: [samAccount("work"), patAccount],
+			});
+			expect(frames.slice(-2)).toEqual([
+				`\u001b[1A\rwork: Synced ${sam.folders.size} folders: ${sam.messages.size} messages saved, 0 removed.\u001b[K\n\rpersonal: Synced ${pat.folders.size} folders: ${pat.messages.size} messages saved, 0 removed.\u001b[K`,
+				"\n",
+			]);
+			expect(lines(output)).toContain("Started mx sync.");
+		}));
+
+	test("mx install runs the first syncs of the accounts at once, and without a terminal prints each account's lines after its alias", () =>
+		Effect.gen(function* () {
+			microsoft.signingIn = sam;
+			yield* fourth.cli("login", "--client-id", clientId, "--tenant", tenant);
+			microsoft.signingIn = pat;
+			yield* fourth.cli(
+				"login",
+				"--account",
+				"personal",
+				"--client-id",
+				otherClientId,
+				"--tenant",
+				"example.org"
+			);
+			yield* writeJson(join(fourth.home, ".claude.json"), {});
+			const inbox = sam.resolve("inbox");
+			const asked = microsoft.graphRequests().length;
+			const ended = microsoft.roundsEnded.length;
+			// Sam's first sync waits in its Inbox, so it cannot finish before Pat's starts unless both run at once.
+			microsoft.hold(inbox);
+			const install = yield* Effect.forkChild(
+				fourth.cli("install", "--agent", "claude-code")
+			);
+			yield* eventually("the first delta request of Pat's first sync", () =>
+				Arr.some(microsoft.graphRequests().slice(asked), isDeltaOf(pat))
+			);
+			expect(microsoft.roundsEnded.slice(ended)).not.toContain(inbox);
+			microsoft.release(inbox);
+			const { output } = yield* Fiber.join(install);
+			expect(lines(output)).toEqual(
+				expect.arrayContaining([
+					`contoso: Syncing ${sam.folders.size} folders: 0 of ${sam.messages.size} messages`,
+					`personal: Syncing ${pat.folders.size} folders: 0 of ${pat.messages.size} messages`,
+					`contoso: Synced ${sam.folders.size} folders: ${sam.messages.size} messages saved, 0 removed.`,
+					`personal: Synced ${pat.folders.size} folders: ${pat.messages.size} messages saved, 0 removed.`,
+				])
+			);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release(sam.resolve("inbox"));
 				})
 			)
 		));

@@ -451,8 +451,4 @@ export class Sync extends Context.Service<
 			});
 		})
 	);
-
-	static readonly layer = Sync.layerNoDeps.pipe(
-		Layer.provide(Layer.mergeAll(Graph.layer, Store.layer))
-	);
 }

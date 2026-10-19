@@ -206,6 +206,9 @@ const encodeAddresses = Schema.encodeEffect(
 const encodeStrings = Schema.encodeEffect(
 	Schema.fromJsonString(Schema.Array(Schema.String))
 );
+const encodeInts = Schema.encodeEffect(
+	Schema.fromJsonString(Schema.Array(Schema.Int))
+);
 
 const address = ({ emailAddress }: Recipient): Address => ({
 	address: emailAddress.address ?? "",
@@ -334,12 +337,12 @@ export class Store extends Context.Service<
 			graphId: string
 		) => Effect.Effect<Option.Option<Stored>>;
 		/**
-		 * Up to `limit` conversations of the account with a message that passes the filter, one per conversation: with
-		 * `text`, the best match of each, best first; without it, the newest of each, newest first.
+		 * Up to `limit` conversations of the accounts with a message that passes the filter, one per conversation of an
+		 * account: with `text`, the best match of each, best first; without it, the newest of each, newest first.
 		 */
 		readonly search: (filter: {
-			readonly accountId: number;
-			readonly folderId: Option.Option<string>;
+			readonly accountIds: readonly number[];
+			readonly folderIds: Option.Option<readonly string[]>;
 			readonly from: Option.Option<string>;
 			readonly limit: number;
 			readonly since: Option.Option<Temporal.Instant>;
@@ -365,6 +368,10 @@ export class Store extends Context.Service<
 			accountId: number,
 			sync: AccountSync
 		) => Effect.Effect<void>;
+		/** Removes the account's folders with their mail, and how mx sync follows it. */
+		readonly removeAccount: (accountId: number) => Effect.Effect<void>;
+		/** Removes the folders with their mail, and how mx sync follows them, of every account but `kept`. */
+		readonly keepAccounts: (kept: readonly number[]) => Effect.Effect<void>;
 	}
 >()("mx/store") {
 	static readonly layer = Layer.effect(
@@ -605,33 +612,39 @@ export class Store extends Context.Service<
 			const byGraphId = (graphId: string) =>
 				Effect.map(messages(sql`WHERE m.graph_id = ${graphId}`), Arr.head);
 
-			const search: Store["Service"]["search"] = (filter) => {
-				const folderId = Option.getOrNull(filter.folderId);
-				const from = Option.getOrNull(
-					Option.map(
-						filter.from,
-						(text) => `%${pipe(text, Str.replaceAll(likeWildcards, "!$&"))}%`
-					)
-				);
-				const since = Option.getOrNull(
-					Option.map(filter.since, (at) => at.epochMilliseconds)
-				);
-				return all(
-					FoundRow,
-					sql`WITH candidates AS (${Option.match(filter.text, {
-						onNone: () => sql`SELECT id, 0 AS rank FROM messages`,
-						onSome: (text) =>
-							sql`SELECT rowid AS id, ${sql.literal(relevance)} AS rank FROM search WHERE search MATCH ${ftsQuery(text)}`,
-					})}),
+			const search: Store["Service"]["search"] = (filter) =>
+				Effect.gen(function* () {
+					const accounts = yield* encodeInts(filter.accountIds).pipe(
+						Effect.orDie
+					);
+					const inFolders = Option.getOrNull(
+						yield* Effect.transposeOption(Option.map(filter.folderIds, jsonIds))
+					);
+					const from = Option.getOrNull(
+						Option.map(
+							filter.from,
+							(text) => `%${pipe(text, Str.replaceAll(likeWildcards, "!$&"))}%`
+						)
+					);
+					const since = Option.getOrNull(
+						Option.map(filter.since, (at) => at.epochMilliseconds)
+					);
+					return yield* all(
+						FoundRow,
+						sql`WITH candidates AS (${Option.match(filter.text, {
+							onNone: () => sql`SELECT id, 0 AS rank FROM messages`,
+							onSome: (text) =>
+								sql`SELECT rowid AS id, ${sql.literal(relevance)} AS rank FROM search WHERE search MATCH ${ftsQuery(text)}`,
+						})}),
 					matched AS (
-						SELECT m.id, m.conversation_id, c.rank, ${arrived} AS at FROM candidates c JOIN messages m ON m.id = c.id JOIN folders f ON f.id = m.folder_id
-						WHERE f.account_id = ${filter.accountId}
-						AND (${folderId} IS NULL OR m.folder_id = ${folderId})
+						SELECT m.id, f.account_id, m.conversation_id, c.rank, ${arrived} AS at FROM candidates c JOIN messages m ON m.id = c.id JOIN folders f ON f.id = m.folder_id
+						WHERE f.account_id IN (SELECT value FROM json_each(${accounts}))
+						AND (${inFolders} IS NULL OR m.folder_id IN (SELECT value FROM json_each(${inFolders})))
 						AND (${from} IS NULL OR m.from_address LIKE ${from} ESCAPE '!' OR m.from_name LIKE ${from} ESCAPE '!')
 						AND (${since} IS NULL OR ${arrived} >= ${since})
 					),
 					best AS (
-						SELECT id, rank, at, row_number() OVER (PARTITION BY conversation_id ORDER BY rank, at DESC, id DESC) AS place
+						SELECT id, rank, at, row_number() OVER (PARTITION BY account_id, conversation_id ORDER BY rank, at DESC, id DESC) AS place
 						FROM matched
 					)
 					SELECT m.*, f.account_id, f.path AS folder_path, f.sent AS folder_sent, ${sql.literal(messageLink)} AS link,
@@ -639,14 +652,14 @@ export class Store extends Context.Service<
 					FROM best b JOIN messages m ON m.id = b.id JOIN folders f ON f.id = m.folder_id
 					WHERE b.place = 1
 					ORDER BY b.rank, b.at DESC, b.id DESC LIMIT ${filter.limit}`
-				).pipe(
-					Effect.map(
-						Arr.map(
-							(row): Found => ({ message: stored(row), others: row.others })
+					).pipe(
+						Effect.map(
+							Arr.map(
+								(row): Found => ({ message: stored(row), others: row.others })
+							)
 						)
-					)
-				);
-			};
+					);
+				});
 
 			const conversation = (accountId: number, conversationId: string) =>
 				messages(
@@ -729,6 +742,30 @@ export class Store extends Context.Service<
 					ON CONFLICT (id) DO UPDATE SET mode = excluded.mode, last_success_at = excluded.last_success_at, last_error = excluded.last_error`
 				);
 
+			const removeAccount = (accountId: number) =>
+				transaction(
+					Effect.andThen(
+						run(sql`DELETE FROM folders WHERE account_id = ${accountId}`),
+						run(sql`DELETE FROM accounts WHERE id = ${accountId}`)
+					)
+				);
+
+			const keepAccounts = Effect.fnUntraced(function* (
+				kept: readonly number[]
+			) {
+				const ids = yield* encodeInts(kept).pipe(Effect.orDie);
+				yield* transaction(
+					Effect.andThen(
+						run(
+							sql`DELETE FROM folders WHERE account_id NOT IN (SELECT value FROM json_each(${ids}))`
+						),
+						run(
+							sql`DELETE FROM accounts WHERE id NOT IN (SELECT value FROM json_each(${ids}))`
+						)
+					)
+				);
+			});
+
 			return Store.of({
 				accountSyncs,
 				beat,
@@ -739,12 +776,14 @@ export class Store extends Context.Service<
 				folders,
 				hasFolder,
 				heartbeat,
+				keepAccounts,
 				keepOnly,
 				lookup,
 				ownAddresses,
 				placements,
 				reindex,
 				remove,
+				removeAccount,
 				saveAccountSync,
 				saveFolder,
 				saveFolders,

@@ -1,4 +1,5 @@
 import {
+	Array as Arr,
 	Config,
 	Context,
 	Effect,
@@ -12,7 +13,7 @@ import {
 	type Terminal,
 } from "effect";
 import { CliError, Flag, Prompt, TerminalCapabilities } from "effect/cli";
-import { CredentialFailed } from "../errors.ts";
+import { CredentialFailed, Refused } from "../errors.ts";
 import { Paths } from "../paths.ts";
 
 /** An Entra application or tenant id: a GUID. */
@@ -76,10 +77,7 @@ export type Account = typeof Account.Type;
 /** The account a layer serves. */
 export class AccountId extends Context.Service<AccountId, number>()(
 	"mx/auth/config/AccountId"
-) {
-	/** Account 1, the one mx sync and the tools serve. */
-	static readonly first = Layer.succeed(AccountId, 1);
-}
+) {}
 
 /** The alias of an account whose tenant names none, as `organizations` or a tenant id. */
 export const fallbackAlias = "main";
@@ -92,6 +90,29 @@ export const defaultAlias = (tenant: string) => {
 
 /** A list in prose, such as "work, personal and travel". */
 export const listed = new Intl.ListFormat("en", { type: "conjunction" });
+
+/** A choice in prose, such as "work or personal". */
+export const choice = new Intl.ListFormat("en", { type: "disjunction" });
+
+/** An account as the tools and the views name it: its id in the store, its alias, and its address once mx knows it. */
+export type Named = Pick<Account, "address" | "alias" | "id">;
+
+/** Without config.json mx names no account, and the mail a store holds is account 1's, which shows as main. */
+export const unnamed: Arr.NonEmptyReadonlyArray<Named> = [
+	{ alias: fallbackAlias, id: 1 },
+];
+
+/** The refusal of `alias`, which names none of `accounts`. */
+export const noAccount = (alias: string, accounts: readonly Named[]) =>
+	Refused.make({
+		message: Arr.match(accounts, {
+			onEmpty: () => `No account ${alias}. mx has no accounts; run mx login.`,
+			onNonEmpty: ([first, ...others]) =>
+				others.length === 0
+					? `No account ${alias}. The account is ${first.alias}.`
+					: `No account ${alias}. The accounts are ${listed.format(Arr.map(accounts, (account) => account.alias))}.`,
+		}),
+	});
 
 /** config.json as mx 0.3.0 and earlier write it: the client id and the tenant of the one account. */
 const OneAccount = Schema.Struct({ clientId: ClientId, tenant: Tenant });

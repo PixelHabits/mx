@@ -32,7 +32,6 @@ import {
 } from "./auth/accounts.ts";
 import {
 	type Account,
-	AccountId,
 	AccountsFile,
 	Alias,
 	accountFlag,
@@ -43,6 +42,7 @@ import {
 	clientIdFlag,
 	defaultAlias,
 	listed,
+	noAccount,
 	type SignInConfig,
 	tenantConfig,
 	tenantFlag,
@@ -68,12 +68,12 @@ import { Mailboxes, mailbox } from "./mailboxes.ts";
 import { serve } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
 import { showProgress } from "./progress.ts";
-import { accountSignInExpired, statusReport } from "./status.ts";
+import { signInExpiredFor, statusReport } from "./status.ts";
 import { Store } from "./store.ts";
-import { aboutAccount, Sync, summary } from "./sync.ts";
+import { aboutAccount, summary } from "./sync.ts";
 import { InstantFromString, PlainDateFromString } from "./temporal.ts";
 import { Updater } from "./update.ts";
-import { Watch } from "./watch.ts";
+import { unsubscribeTunnels, Watch } from "./watch.ts";
 import { ownsConsole } from "./windows.ts";
 
 /** The client id and the tenant `mx login` or `mx install` is given, when it is. */
@@ -176,6 +176,28 @@ const newAccount = Effect.fnUntraced(function* (
 });
 
 /**
+ * On a terminal, asks whether to add another account, and signs in each one the user adds, until the answer is no. An
+ * added account signs in with `MX_CLIENT_ID` and `MX_TENANT`, or else mx asks, where Enter keeps the first account's
+ * client id.
+ */
+const addAccounts = Effect.gen(function* () {
+	const { canPrompt } = yield* TerminalCapabilities.TerminalCapabilities;
+	const accounts = yield* Accounts;
+	const file = yield* AccountsFile;
+	const another = Prompt.run(
+		Prompt.Confirm({ message: "Add another Microsoft 365 account?" })
+	).pipe(Effect.catchTag("QuitError", () => Effect.succeed(false)));
+	while (canPrompt && (yield* another)) {
+		const saved = yield* file.read;
+		const settings = yield* newSettings(saved, {
+			clientId: Option.none(),
+			tenant: Option.none(),
+		});
+		yield* accounts.signIn(yield* newAccount(saved, settings, Option.none()));
+	}
+});
+
+/**
  * What `mx login` signs in to: the account `--account` names, or a new one by that alias; without it, the one account,
  * a new one aliased after its tenant when there is none, or else the one the user picks on a terminal.
  */
@@ -223,6 +245,27 @@ const loginTarget = Effect.fnUntraced(function* (
 		: yield* newAccount(saved, yield* newSettings(saved, given), Option.none());
 });
 
+/**
+ * The first sync of every account in `accounts` whose store has not finished one, all at once, in the foreground with
+ * the progress of each after its alias when there are several.
+ */
+const firstSyncs = (accounts: readonly Account[]) =>
+	Effect.gen(function* () {
+		const several = accounts.length > 1;
+		const passes = yield* Effect.forEach(accounts, (account) =>
+			Effect.map(mailbox(account.id), (services) => ({
+				about: aboutAccount(several, account.alias),
+				finished: services.sync.finishedFirstPass,
+				pass: services.sync.passWithProgress,
+			}))
+		);
+		yield* (yield* showProgress)(
+			yield* Effect.filter(passes, ({ finished }) =>
+				Effect.map(finished, (done) => !done)
+			)
+		);
+	}).pipe(Effect.scoped);
+
 const login = Command.make(
 	"login",
 	{ account: accountFlag, clientId: clientIdFlag, tenant: tenantFlag },
@@ -235,7 +278,7 @@ const login = Command.make(
 			const joined = target.added && accounts.length > 1;
 			if (joined) {
 				yield* Console.log(
-					`The accounts are ${listed.format(Arr.map(accounts, described))}. To rename one, run mx rename <alias> <new alias>.`
+					`The accounts are ${listed.format(Arr.map(accounts, described))}. To rename one, run mx rename <alias> <new alias>.\nRestart your agents so they see the new account.`
 				);
 			}
 			const resumed = yield* (yield* Installer).resumeSync;
@@ -277,6 +320,83 @@ const rename = Command.make(
 	Command.provide(Accounts.layer.pipe(Layer.provide(Paths.layer))),
 	Command.withDescription(
 		"Give an account another alias. An alias is up to 20 lowercase letters, digits and hyphens, and starts with a letter."
+	)
+);
+
+const logout = Command.make(
+	"logout",
+	{
+		account: Flag.String("account").pipe(
+			Flag.withDescription("The alias of the account to remove.")
+		),
+		yes: Flag.Boolean("yes").pipe(
+			Flag.withDefault(false),
+			Flag.withDescription("Remove it without asking.")
+		),
+	},
+	({ account: alias, yes }) =>
+		Effect.gen(function* () {
+			const file = yield* AccountsFile;
+			const saved = yield* file.read;
+			const account = yield* Option.match(
+				Arr.findFirst(saved, (each) => each.alias === alias),
+				{
+					onNone: () => noAccount(alias, saved),
+					onSome: (found) => Effect.succeed(found),
+				}
+			);
+			if (saved.length === 1) {
+				return yield* Refused.make({
+					message: `${alias} is the only account. To remove it with the rest of mx, run mx uninstall.`,
+				});
+			}
+			const confirmed =
+				yes ||
+				(yield* ask(
+					Prompt.Confirm({
+						message: `mx logout removes ${described(account)} from mx:\n  - its saved sign-in\n  - its entry in config.json\n  - the copy of its mail on this computer\nIts mailbox in Microsoft 365 stays as it is. Remove ${alias}?`,
+					}),
+					`mx can't ask you to confirm the logout here. Run mx logout --account ${alias} --yes.`
+				).pipe(Effect.catchTag("QuitError", () => Effect.succeed(false))));
+			if (!confirmed) {
+				yield* Console.log("mx logout removed nothing.");
+				return;
+			}
+			// config.json names the account until its entry goes last, so a logout that stops partway leaves an account that
+			// mx logout run again, or mx uninstall, finds and removes the rest of. The subscriptions go while the sign-in that
+			// deletes them is still saved.
+			yield* (yield* Store).removeAccount(account.id);
+			yield* Effect.scoped(
+				Effect.flatMap(mailbox(account.id), ({ graph }) =>
+					unsubscribeTunnels(graph, new Set())
+				)
+			).pipe(
+				// Without a working sign-in, as after a logout that stopped once it deleted it, nothing can delete them; Graph
+				// drops them within 3 days.
+				Effect.catchTag("LoginRequired", () => Effect.void)
+			);
+			yield* (yield* Credentials).remove(account.id);
+			yield* file.write(
+				Arr.filter(yield* file.read, ({ id }) => id !== account.id)
+			);
+			yield* Console.log(
+				`Removed ${described(account)}: its sign-in and the copy of its mail. Its mailbox in Microsoft 365 is unchanged. Restart your agents so they see the change.`
+			);
+			// mx sync restarts without the account, and as it starts drops what the one that ran on filed of it again.
+			yield* (yield* Installer).resumeSync;
+		})
+).pipe(
+	Command.provide(
+		Layer.mergeAll(
+			AccountsFile.layer,
+			Credentials.layer,
+			Installer.layer,
+			Mailboxes.layer,
+			Store.layer
+		).pipe(Layer.provide(Paths.layer))
+	),
+	Command.withDescription(
+		"Remove an account from mx: the copy of its mail on this computer, its push subscriptions, its saved sign-in, and last its entry in config.json; then restart mx sync. A logout that stops partway finishes when run again. The mailbox in Microsoft 365 stays as it is. mx keeps its last account; mx uninstall removes it with the rest of mx. It lists what it removes and asks first; --yes removes it without asking."
 	)
 );
 
@@ -324,7 +444,7 @@ const sync = Command.make(
 								error,
 								line: about(
 									error._tag === "LoginRequired"
-										? accountSignInExpired(account.alias)
+										? signInExpiredFor(account.alias)
 										: error.message
 								),
 							}))
@@ -411,9 +531,9 @@ const install = Command.make(
 	{ agent: agentFlag, clientId: clientIdFlag, tenant: tenantFlag },
 	({ agent, ...given }) =>
 		Effect.gen(function* () {
-			const { finishedFirstPass, passWithProgress } = yield* Sync;
 			const accounts = yield* Accounts;
-			const saved = yield* (yield* AccountsFile).read;
+			const file = yield* AccountsFile;
+			const saved = yield* file.read;
 			// A new first account's client id and tenant are settled before anything changes, and its alias as it signs in.
 			const first = yield* Option.match(Arr.head(saved), {
 				onNone: () =>
@@ -423,14 +543,10 @@ const install = Command.make(
 				onSome: (account) =>
 					Effect.succeed(Effect.succeed(existing(account, given))),
 			});
-			const show = yield* showProgress;
 			yield* (yield* Installer).install({
 				agents: agent,
-				firstSync: Effect.gen(function* () {
-					if (!(yield* finishedFirstPass)) {
-						yield* show(passWithProgress);
-					}
-				}),
+				// Every account whose first sync is unfinished gets it here, as one just signed in or one a stopped mx install left.
+				firstSync: Effect.flatMap(file.read, firstSyncs),
 				login: Effect.gen(function* () {
 					const target = yield* first;
 					if (
@@ -439,6 +555,7 @@ const install = Command.make(
 						!(yield* accounts.signedIn(target.account.id))
 					) {
 						yield* accounts.signIn(target);
+						yield* addAccounts;
 					}
 				}),
 			});
@@ -447,13 +564,13 @@ const install = Command.make(
 	Command.provide(
 		Layer.mergeAll(
 			Installer.layer,
-			Sync.layer,
+			Mailboxes.layer,
 			Accounts.layer,
 			AccountsFile.layer
-		).pipe(Layer.provide(Layer.mergeAll(Paths.layer, AccountId.first)))
+		).pipe(Layer.provide(Paths.layer))
 	),
 	Command.withDescription(
-		"Install this binary for the signed-in user, start mx sync at sign-in, add mx mcp to the MCP config of each agent chosen, and sign in to the first account when it has no saved sign-in, asking on a terminal for the alias of a new one. Until mail has synced once, it syncs in the foreground with its progress before it starts mx sync; stopped, it resumes on the next run. Run it again to reinstall."
+		"Install this binary for the signed-in user, start mx sync at sign-in, add mx mcp to the MCP config of each agent chosen, and sign in to the first account when it has no saved sign-in, asking on a terminal for the alias of a new one. On a terminal, after each sign-in it asks whether to add another account. Then every account whose mail has not synced once syncs in the foreground, all at once, each with a progress line of its own, before mx install starts mx sync. A stopped first sync resumes on the next run. Run it again to reinstall."
 	)
 );
 
@@ -697,6 +814,7 @@ export const mx = Command.make("mx", {}, () =>
 	),
 	Command.withSubcommands([
 		login,
+		logout,
 		rename,
 		sync,
 		status,

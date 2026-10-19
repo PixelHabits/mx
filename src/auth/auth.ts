@@ -337,10 +337,6 @@ export class Auth extends Context.Service<
 			return Auth.of({ authorize });
 		})
 	);
-
-	static readonly layer = Auth.layerNoDeps.pipe(
-		Layer.provide(Credentials.layer)
-	);
 }
 
 /** A device-code sign-in under way: the code to enter at the URL, and `complete`, which waits for the user to enter it. */

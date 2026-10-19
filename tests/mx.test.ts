@@ -936,12 +936,19 @@ const neverSynced = (name: string) =>
 		});
 	});
 
-/** `platform` on a machine of its own below `name`, and where mx keeps the mail store there. */
+/** `platform` on a machine of its own below `name`, and where mx keeps config.json and the mail store there. */
 const ownStore = (name: string) => {
 	const root = join(home, name);
 	return {
+		configFile: join(root, "config", "mx", "config.json"),
 		database: join(root, "data", "mx", "mx.sqlite"),
-		system: platformWith({ ...environment, XDG_DATA_HOME: join(root, "data") }),
+		system: platformWith({
+			...environment,
+			XDG_CACHE_HOME: join(root, "cache"),
+			XDG_CONFIG_HOME: join(root, "config"),
+			XDG_DATA_HOME: join(root, "data"),
+			XDG_STATE_HOME: join(root, "state"),
+		}),
 	};
 };
 
@@ -1156,7 +1163,7 @@ const bookClubReplyLine =
 	/ \| Jonas Example <jonas@example\.com> \| RE: Book club: the next novel \| unread \(\+1 in thread\)$/u;
 const recipeSwapLine = /Recipe swap \| unread \(\+3 in thread\)$/u;
 const idListingPath = /^\/v1\.0\/me\/mailFolders\/[^/]+\/messages$/u;
-const reconciledLine = /^Reconciled \d+ folders: /u;
+const reconciledLine = /^contoso: Reconciled \d+ folders: /u;
 const seedOrderLine = /^#2 .* \| Garden supplies order \| unread$/mu;
 const rotaInArchiveLine =
 	/ Archive \| Rosa Example <rosa@example\.com> \| Garden plot rota /u;
@@ -4322,15 +4329,26 @@ describe("mx", () => {
 
 	test("mx sync lists the folders and checks the store against Graph within its own account, so another account's folders and mail stay", () =>
 		Effect.gen(function* () {
-			const { database, system } = ownStore("store-two-accounts");
-			yield* (yield* FileSystem.FileSystem).makeDirectory(dirname(database), {
-				recursive: true,
-			});
+			const {
+				configFile: ownConfigFile,
+				database,
+				system,
+			} = ownStore("store-two-accounts");
+			const fs = yield* FileSystem.FileSystem;
+			yield* fs.makeDirectory(dirname(database), { recursive: true });
 			yield* onStore(database)(migrate(migrations));
 			const received = Temporal.Instant.from(
 				"2026-10-05T18:00:00Z"
 			).epochMilliseconds;
-			// mx syncs no second account yet, so its folder and mail go straight into the store.
+			// mx sync drops the mail of an account config.json does not name, so it names the second account, which has no
+			// saved sign-in: mx sync stops it and syncs the first. Its folder and mail go straight into the store.
+			yield* fs.makeDirectory(dirname(ownConfigFile), { recursive: true });
+			yield* writeJson(ownConfigFile, {
+				accounts: [
+					{ alias: "contoso", clientId, id: 1, tenant },
+					{ alias: "other", clientId, id: 2, tenant },
+				],
+			});
 			yield* withDatabase(database, (db) => {
 				db.run("INSERT INTO accounts (id, mode) VALUES (2, 'push')");
 				db.run(
@@ -5452,11 +5470,20 @@ describe("mx", () => {
 				yield* writeJson(join(root, ".claude.json"), { numStartups: 1 });
 				const system = ownWindows(root);
 				// Enter picks the agents mx offers, and keeps the alias mx offers for the first account.
-				const { system: onTerminal } = fakeTerminal(system, [
-					"return",
-					"return",
-				]);
-				yield* withTerminal(true)(cliOn(onTerminal)("install"));
+				const {
+					frames,
+					press,
+					system: onTerminal,
+				} = fakeTerminal(system, ["return", "return"]);
+				const installing = yield* Effect.forkChild(
+					withTerminal(true)(cliOn(onTerminal)("install"))
+				);
+				yield* eventually("the offer of another account", () =>
+					Arr.some(frames, Str.includes("Add another Microsoft 365 account?"))
+				);
+				// Enter adds no other account.
+				yield* press("return");
+				yield* Fiber.join(installing);
 				for (const { file, settings } of configs) {
 					expect(yield* readJson(file)).toEqual({
 						...settings,

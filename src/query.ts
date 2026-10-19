@@ -5,6 +5,7 @@ import {
 	Duration,
 	Effect,
 	Layer,
+	Option,
 	Path,
 	pipe,
 	Schema,
@@ -12,7 +13,7 @@ import {
 	Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
-import { AccountsFile, fallbackAlias } from "./auth/config.ts";
+import { AccountsFile, type Named, unnamed } from "./auth/config.ts";
 import { Refused } from "./errors.ts";
 import { isOutlookLink } from "./outlook.ts";
 import { Paths } from "./paths.ts";
@@ -33,11 +34,16 @@ const maxCharacters = 20_000;
 const maxValueLength = 200;
 
 /**
- * What the worker reads on stdin: the store to open and the agent's SQL. The worker answers the mx mcp of an older
- * release, which an update leaves running on the new binary, so the request only gains optional fields.
+ * What the worker reads on stdin: the store to open, the agent's SQL, and the id of the account whose mail alone the
+ * views hold, if any. The worker answers the mx mcp of an older release, which an update leaves running on the new
+ * binary, so the request only gains optional fields.
  */
 const Request = Schema.fromJsonString(
-	Schema.Struct({ database: Schema.String, sql: Schema.String })
+	Schema.Struct({
+		account: Schema.optionalKey(Schema.Int),
+		database: Schema.String,
+		sql: Schema.String,
+	})
 );
 
 /** What the worker writes on stdout: the table, or why SQLite or mx refused the SQL. */
@@ -96,15 +102,6 @@ const table = (
 	return lines.length === 1 ? `${header}\n(no rows)` : Arr.join(lines, "\n");
 };
 
-/** An account the views show, by its id in the store, with the alias config.json gives it. */
-interface Aliased {
-	readonly alias: string;
-	readonly id: number;
-}
-
-/** Without config.json mx names no account, and the mail a store holds is account 1's, which shows as main. */
-const unnamed: readonly Aliased[] = [{ alias: fallbackAlias, id: 1 }];
-
 /**
  * Selects `sql` from the store at `database`, opened read-only, so SQLite refuses every write; SQLite's refusal throws.
  * mx's SELECT around the SQL makes SQLite's parser refuse anything but one SELECT. Bun prepares only a statement's
@@ -112,8 +109,8 @@ const unnamed: readonly Aliased[] = [{ alias: fallbackAlias, id: 1 }];
  * parenthesis, is refused. A comment can still hide mx's LIMIT, so the table stops at `maxRows` itself.
  */
 const select = (
-	{ database, sql }: typeof Request.Type,
-	accounts: readonly Aliased[]
+	{ account, database, sql }: typeof Request.Type,
+	accounts: readonly Named[]
 ): typeof Answer.Type => {
 	const db = new Database(database, { readonly: true });
 	db.run(aliasesTable);
@@ -123,7 +120,7 @@ const select = (
 			alias,
 		]);
 	}
-	for (const view of views) {
+	for (const view of views(Option.fromUndefinedOr(account))) {
 		db.run(view);
 	}
 	// The line break ends a `--` comment at the end of the SQL before mx's parenthesis.
@@ -146,7 +143,7 @@ const select = (
 /** The answer to the request over the views of `accounts`, with SQLite's own message when it refused the SQL. */
 const answer = (
 	request: typeof Request.Type,
-	accounts: readonly Aliased[]
+	accounts: readonly Named[]
 ): typeof Answer.Type => {
 	try {
 		return select(request, accounts);
@@ -186,8 +183,14 @@ export const answerQuery = Effect.gen(function* () {
 export class Query extends Context.Service<
 	Query,
 	{
-		/** The table the SQL selects; SQL that SQLite or mx refuses, or that runs past `queryTimeout`, is refused with why. */
-		readonly run: (sql: string) => Effect.Effect<string, Refused>;
+		/**
+		 * The table the SQL selects, over the mail of the account with that id alone when there is one; SQL that SQLite or
+		 * mx refuses, or that runs past `queryTimeout`, is refused with why.
+		 */
+		readonly run: (
+			sql: string,
+			account: Option.Option<number>
+		) => Effect.Effect<string, Refused>;
 	}
 >()("mx/query") {
 	static readonly layer = Layer.effect(
@@ -201,8 +204,15 @@ export class Query extends Context.Service<
 				? [queryWorker]
 				: [path.join(import.meta.dir, "main.ts"), queryWorker];
 
-			const run = Effect.fnUntraced(function* (sql: string) {
+			const run = Effect.fnUntraced(function* (
+				sql: string,
+				account: Option.Option<number>
+			) {
 				const request = yield* Schema.encodeEffect(Request)({
+					...Option.match(account, {
+						onNone: () => ({}),
+						onSome: (id) => ({ account: id }),
+					}),
 					database,
 					sql,
 				}).pipe(Effect.orDie);

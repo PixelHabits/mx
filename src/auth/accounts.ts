@@ -22,7 +22,7 @@ import {
 	Alias,
 	aliasRule,
 	type Identity,
-	listed,
+	noAccount,
 } from "./config.ts";
 import { Credentials } from "./credentials.ts";
 
@@ -215,11 +215,7 @@ export class Accounts extends Context.Service<
 			) {
 				const saved = yield* file.read;
 				if (!Arr.some(saved, ({ alias }) => alias === from)) {
-					return yield* Refused.make({
-						message: Arr.isReadonlyArrayNonEmpty(saved)
-							? `No account ${from}. The accounts are ${listed.format(Arr.map(saved, ({ alias }) => alias))}.`
-							: `No account ${from}. mx has no accounts; run mx login.`,
-					});
+					return yield* noAccount(from, saved);
 				}
 				if (!Schema.is(Alias)(to)) {
 					return yield* notAnAlias(to);

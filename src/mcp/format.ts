@@ -3,6 +3,9 @@ import type { Attachment } from "../graph/api.ts";
 import type { Address, Found, Stored } from "../store.ts";
 import { localTime } from "../temporal.ts";
 
+/** The alias of a message's account that its lines show, or none, as when mx has one account. */
+export type Label = (message: Stored) => Option.Option<string>;
+
 /** Exchange writes an inline image into a text body as `[cid:<content id>]`. */
 const cidReference = /\[cid:([^\]\s]+)\]/gu;
 
@@ -60,8 +63,18 @@ const bodyText = (text: string) => {
 	);
 };
 
-/** One line per message: `#id date folder | sender | subject | markers`; a draft names its recipients instead. */
-export const line = (message: Stored) => {
+/** `#id`, and the alias of the message's account in brackets when `label` gives one: `#12 [work]`. */
+const numbered = (message: Stored, label: Label) =>
+	Option.match(label(message), {
+		onNone: () => `#${message.id}`,
+		onSome: (alias) => `#${message.id} [${alias}]`,
+	});
+
+/**
+ * One line per message: `#id date folder | sender | subject | markers`, with `[alias]` after the id when `label` gives
+ * one; a draft names its recipients instead of its sender.
+ */
+export const line = (message: Stored, label: Label) => {
 	const party = message.draft
 		? `to ${people(message.to) || "nobody yet"}`
 		: Option.match(message.from, {
@@ -69,28 +82,28 @@ export const line = (message: Stored) => {
 				onSome: person,
 			});
 	const flags = markers(message);
-	return `#${message.id} ${date(message)} ${message.folder} | ${party} | ${message.subject || "(no subject)"}${flags === "" ? "" : ` | ${flags}`}`;
+	return `${numbered(message, label)} ${date(message)} ${message.folder} | ${party} | ${message.subject || "(no subject)"}${flags === "" ? "" : ` | ${flags}`}`;
 };
 
 /** One line per conversation found, ending in `(+N in thread)` when the conversation holds N more messages. */
-export const listing = (found: readonly Found[]) =>
+export const listing = (found: readonly Found[], label: Label) =>
 	found.length === 0
 		? "No messages."
 		: Arr.join(
 				Arr.map(
 					found,
 					({ message, others }) =>
-						`${line(message)}${others === 0 ? "" : ` (+${others} in thread)`}`
+						`${line(message, label)}${others === 0 ? "" : ` (+${others} in thread)`}`
 				),
 				"\n"
 			);
 
 /** Headers and the Outlook link, then `body`: the new text from the store, or the whole body Graph returned. */
-export const messageText = (stored: Stored, body: string) => {
+export const messageText = (stored: Stored, body: string, label: Label) => {
 	const flags = markers(stored);
 	return Arr.join(
 		[
-			`#${stored.id} ${date(stored)} ${stored.folder}${flags === "" ? "" : ` | ${flags}`}`,
+			`${numbered(stored, label)} ${date(stored)} ${stored.folder}${flags === "" ? "" : ` | ${flags}`}`,
 			...Option.match(stored.from, {
 				onNone: () => [],
 				onSome: (from) => [`From: ${person(from)}`],
@@ -110,10 +123,14 @@ export const messageText = (stored: Stored, body: string) => {
 	);
 };
 
-/** The conversation oldest first, each message with its Outlook link; the user's own messages say `(me)` in place of a From line. */
+/**
+ * The conversation oldest first, each message with its Outlook link, after a header with `[alias]` when `label` gives
+ * one; the user's own messages say `(me)` in place of a From line.
+ */
 export const threadText = (
 	messages: readonly Stored[],
-	own: ReadonlySet<string>
+	own: ReadonlySet<string>,
+	label: Label
 ) => {
 	const isOwn = (stored: Stored) =>
 		stored.inSentItems ||
@@ -143,7 +160,11 @@ export const threadText = (
 	);
 	const subject = Option.match(Arr.head(messages), {
 		onNone: () => "",
-		onSome: (first) => first.subject || "(no subject)",
+		onSome: (first) =>
+			Option.match(label(first), {
+				onNone: () => first.subject || "(no subject)",
+				onSome: (alias) => `[${alias}] ${first.subject || "(no subject)"}`,
+			}),
 	});
 	return Arr.join(
 		[`${subject}, ${messages.length} messages`, ...entries],

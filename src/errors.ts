@@ -1,14 +1,20 @@
 import { Schema } from "effect";
 
-/** No saved sign-in, or Microsoft refused it; only a new device-code sign-in helps. */
+/**
+ * No saved sign-in, or Microsoft refused it; only a new device-code sign-in helps. `account` names the account to sign in
+ * to again when mx has several.
+ */
 export class LoginRequired extends Schema.TaggedError<
 	LoginRequired,
 	{ readonly brand: unique symbol }
 >("mx/errors/LoginRequired")("LoginRequired", {
+	account: Schema.optionalKey(Schema.String),
 	reason: Schema.String,
 }) {
 	override get message() {
-		return `${this.reason} Run mx login.`;
+		return this.account === undefined
+			? `${this.reason} Run mx login.`
+			: `${this.reason} Run mx login --account ${this.account}.`;
 	}
 }
 

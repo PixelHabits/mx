@@ -15,9 +15,11 @@ const staleAfter = Duration.minutes(15);
 /** The last error mx sync records when Microsoft refuses the saved sign-in or there is none. */
 export const signInExpired = "Sign-in expired. Run mx login.";
 
-/** What mx says of the account aliased `alias` when Microsoft refuses its saved sign-in or it has none, among several. */
-export const accountSignInExpired = (alias: string) =>
+/** The last error mx sync records for the account aliased `alias`, of several, when Microsoft refuses its sign-in or there is none. */
+export const signInExpiredFor = (alias: string) =>
 	`Sign-in expired. Run mx login --account ${alias}.`;
+
+const neverRan = "⚠ mx sync has never run. Run mx status.";
 
 /** How long before `now` the instant was, rounded down: `45 s`, `12 min`, `3 h` or `2 d`. */
 export const ago = (then: Temporal.Instant, now: Temporal.Instant) => {
@@ -59,22 +61,19 @@ const synced = (
 	});
 
 /**
- * The line a read tool puts before its answer when the store may be out of date: the sign-in expired, mx sync never ran
- * or is not running, or mail last synced longer ago than `staleAfter`, with the last error when there is one. None while
- * sync runs and mail is fresh.
+ * Why mail that last synced at `lastSuccess`, with the last error `error`, may be out of date: the sign-in expired, as
+ * `expired` says, mx sync is not running, or the mail last synced longer ago than `staleAfter`, with the last error when
+ * there is one. None while sync runs and mail is fresh.
  */
-export const syncWarning = (
-	heartbeat: Option.Option<Heartbeat>,
+const outOfDate = (
+	{ error, lastSuccess }: Pick<AccountSync, "error" | "lastSuccess">,
+	alive: boolean,
+	expired: string,
 	now: Temporal.Instant
 ): Option.Option<string> => {
-	if (Option.isNone(heartbeat)) {
-		return Option.some("⚠ mx sync has never run. Run mx status.");
+	if (Option.contains(error, expired)) {
+		return Option.some(expired);
 	}
-	const { error, lastSuccess } = heartbeat.value;
-	if (Option.contains(error, signInExpired)) {
-		return Option.some(`⚠ ${signInExpired}`);
-	}
-	const alive = isAlive(heartbeat.value, now);
 	if (alive && isFresh(lastSuccess, now)) {
 		return Option.none();
 	}
@@ -83,8 +82,64 @@ export const syncWarning = (
 		onSome: (message) => ` Last error: ${message}`,
 	});
 	return Option.some(
-		`⚠ ${synced(lastSuccess, now)}${alive ? "" : " and mx sync is not running"}.${lastError} Run mx status.`
+		`${synced(lastSuccess, now)}${alive ? "" : " and mx sync is not running"}.${lastError} Run mx status.`
 	);
+};
+
+/**
+ * The line a read tool puts before its answer when the store may be out of date: the sign-in expired, mx sync never ran
+ * or is not running, or mail last synced longer ago than `staleAfter`, with the last error when there is one. None while
+ * sync runs and mail is fresh.
+ */
+export const syncWarning = (
+	heartbeat: Option.Option<Heartbeat>,
+	now: Temporal.Instant
+): Option.Option<string> =>
+	Option.match(heartbeat, {
+		onNone: () => Option.some(neverRan),
+		onSome: (beat) =>
+			Option.map(
+				outOfDate(beat, isAlive(beat, now), signInExpired, now),
+				(text) => `⚠ ${text}`
+			),
+	});
+
+/**
+ * With several accounts, the lines a read tool puts before its answer: one for each account whose mail may be out of
+ * date, after its alias, as `syncWarning` words it for one, or the one line that mx sync never ran. None while sync runs
+ * and every account's mail is fresh.
+ */
+export const accountWarnings = (
+	heartbeat: Option.Option<Heartbeat>,
+	accounts: readonly {
+		readonly alias: string;
+		readonly sync: Option.Option<AccountSync>;
+	}[],
+	now: Temporal.Instant
+): Option.Option<string> => {
+	if (Option.isNone(heartbeat)) {
+		return Option.some(neverRan);
+	}
+	const alive = isAlive(heartbeat.value, now);
+	const warnings = Arr.getSomes(
+		Arr.map(accounts, ({ alias, sync }) =>
+			Option.map(
+				outOfDate(
+					{
+						error: Option.flatMap(sync, ({ error }) => error),
+						lastSuccess: Option.flatMap(sync, ({ lastSuccess }) => lastSuccess),
+					},
+					alive,
+					signInExpiredFor(alias),
+					now
+				),
+				(text) => `⚠ ${alias}: ${text}`
+			)
+		)
+	);
+	return Arr.isReadonlyArrayNonEmpty(warnings)
+		? Option.some(Arr.join(warnings, "\n"))
+		: Option.none();
 };
 
 /**

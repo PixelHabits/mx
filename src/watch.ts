@@ -28,7 +28,7 @@ import type { Graph, GraphError } from "./graph/graph.ts";
 import { policy } from "./http-policy.ts";
 import { Mailboxes, mailbox } from "./mailboxes.ts";
 import { Cloudflared } from "./push/cloudflared.ts";
-import { accountSignInExpired, beatInterval, signInExpired } from "./status.ts";
+import { beatInterval, signInExpired, signInExpiredFor } from "./status.ts";
 import {
 	type AccountSync,
 	type Heartbeat,
@@ -94,6 +94,22 @@ type Watched = (typeof watched)[number];
 
 /** The notification URL of every subscription an `mx sync` makes: a quick tunnel's `/graph`. */
 const quickTunnelUrl = /^https:\/\/[a-z0-9-]+\.trycloudflare\.com\/graph$/u;
+
+/** Deletes the quick-tunnel subscriptions of the account `graph` signs in to, but those in `kept`. */
+export const unsubscribeTunnels = Effect.fnUntraced(function* (
+	graph: Graph["Service"],
+	kept: ReadonlySet<string>
+) {
+	const stale = Arr.filter(
+		yield* graph.subscriptions,
+		(subscription: Subscription) =>
+			quickTunnelUrl.test(subscription.notificationUrl) &&
+			!kept.has(subscription.id)
+	);
+	yield* Effect.forEach(stale, ({ id }) => graph.unsubscribe(id), {
+		discard: true,
+	});
+});
 
 const Notification = Schema.Struct({
 	clientState: Schema.optionalKey(Schema.NullOr(Schema.String)),
@@ -246,6 +262,11 @@ export class Watch extends Context.Service<
 			const clientState = randomHex(32);
 			const accounts = yield* (yield* AccountsFile).read;
 			const several = accounts.length > 1;
+			// An mx sync that ran on while mx logout removed an account can file some of its mail again before the logout
+			// restarts it.
+			if (Arr.isReadonlyArrayNonEmpty(accounts)) {
+				yield* store.keepAccounts(Arr.map(accounts, ({ id }) => id));
+			}
 			const saved = yield* store.accountSyncs;
 			const following = yield* Effect.forEach(accounts, (account) =>
 				Effect.gen(function* () {
@@ -255,9 +276,7 @@ export class Watch extends Context.Service<
 					return {
 						about: aboutAccount(several, account.alias),
 						account,
-						expired: several
-							? accountSignInExpired(account.alias)
-							: signInExpired,
+						expired: several ? signInExpiredFor(account.alias) : signInExpired,
 						firstPass: yield* Latch.make(),
 						graph,
 						lastPoll: yield* Ref.make(0),
@@ -464,20 +483,9 @@ export class Watch extends Context.Service<
 			 * behind, and this run's on a tunnel that ended.
 			 */
 			const clearStale = (followed: Followed) =>
-				Effect.gen(function* () {
-					const ours = new Set((yield* Ref.get(followed.subscribed)).values());
-					const stale = Arr.filter(
-						yield* followed.graph.subscriptions,
-						(subscription: Subscription) =>
-							quickTunnelUrl.test(subscription.notificationUrl) &&
-							!ours.has(subscription.id)
-					);
-					yield* Effect.forEach(
-						stale,
-						({ id }) => followed.graph.unsubscribe(id),
-						{ discard: true }
-					);
-				});
+				Effect.flatMap(Ref.get(followed.subscribed), (ours) =>
+					unsubscribeTunnels(followed.graph, new Set(ours.values()))
+				);
 
 			/**
 			 * Handles the account's notifications in batches: each changed folder gets one delta pass, `missed` gets one too,
