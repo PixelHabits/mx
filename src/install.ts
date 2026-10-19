@@ -13,6 +13,7 @@ import {
 	Path,
 	Schedule,
 	Stream,
+	Terminal,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { type Agent, type AgentId, agents, type ConfigFile } from "./agents.ts";
@@ -26,6 +27,7 @@ import {
 } from "./errors.ts";
 import type { GraphError } from "./graph/graph.ts";
 import { Paths } from "./paths.ts";
+import { onSystem } from "./system.ts";
 import {
 	deleteAfterExit,
 	readUserPath,
@@ -171,22 +173,6 @@ interface SyncAtSignIn {
 	readonly restart: Effect.Effect<void, InstallFailed>;
 }
 
-/** The choice for the system mx runs on, where Linux stands for any system that is not macOS or Windows. */
-const onSystem = <A>(choices: {
-	readonly darwin: A;
-	readonly linux: A;
-	readonly win32: A;
-}) => {
-	switch (process.platform) {
-		case "darwin":
-			return choices.darwin;
-		case "win32":
-			return choices.win32;
-		default:
-			return choices.linux;
-	}
-};
-
 /**
  * Installs mx for the signed-in user: the binary, the background `mx sync`, and `mx mcp` in the config of each agent
  * chosen. Each step writes the state it wants, so running it again reinstalls without duplicating anything.
@@ -233,6 +219,7 @@ export class Installer extends Context.Service<
 			const fs = yield* FileSystem.FileSystem;
 			const path = yield* Path.Path;
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+			const terminal = yield* Terminal.Terminal;
 			const { randomUUIDv4 } = yield* Crypto.Crypto;
 			const credentials = yield* Credentials;
 			const auth = yield* Auth;
@@ -839,7 +826,7 @@ export class Installer extends Context.Service<
 							}
 							yield* credentials.use(login);
 							if (!(yield* signedIn)) {
-								yield* signIn(auth, login);
+								yield* signIn({ auth, spawner, terminal }, login);
 							}
 							yield* firstSync;
 						}),

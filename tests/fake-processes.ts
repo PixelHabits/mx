@@ -1,5 +1,13 @@
 import { BunServices } from "@effect/platform-bun";
-import { Array as Arr, Deferred, Effect, Layer, Sink, Stream } from "effect";
+import {
+	Array as Arr,
+	Deferred,
+	Effect,
+	Layer,
+	PlatformError,
+	Sink,
+	Stream,
+} from "effect";
 import { type ChildProcess, ChildProcessSpawner } from "effect/process";
 import { queryWorker } from "../src/query.ts";
 import { readUserPath, stopSync, writeUserPath } from "../src/windows.ts";
@@ -52,10 +60,22 @@ const plistLabel = /([^/\\]+)\.plist$/u;
  * that reads the user PATH on Windows prints `userPath` as it does, and the one that writes it sets `userPath`. mxw.exe
  * starts a background `mx sync` that runs on, and the PowerShell that stops mx sync ends each but the `unstoppable`
  * ones, prints the process id of each one left, and exits 1 when any is left. `launchctl` loads and unloads
- * LaunchAgents and fails as it does on macOS. Any other program exits 0 at once.
+ * LaunchAgents and fails as it does on macOS. A program in `missing` fails to start, as one the machine lacks does, one
+ * in `failing` exits 1, and one in `hanging` runs until the scope that started it closes, which kills it as Effect's
+ * spawner does. Any other program exits 0 at once. What mx writes to a program's stdin goes to `inputs`.
  */
 export class FakeProcesses {
 	readonly commands: (readonly string[])[] = [];
+	/** What mx wrote to the stdin of each program it gave input, by the program's index in `commands`. */
+	readonly inputs = new Map<number, string>();
+	/** The programs this machine lacks. */
+	readonly missing = new Set<string>();
+	/** The programs that exit 1. */
+	readonly failing = new Set<string>();
+	/** The programs that never exit on their own. */
+	readonly hanging = new Set<string>();
+	/** The programs killed, by their index in `commands`. */
+	readonly killed = new Set<number>();
 	/** The `Path` value under `HKCU\Environment`. */
 	userPath = "";
 	/** Runs as each program starts, for a test that checks what holds at that moment. */
@@ -185,6 +205,23 @@ export class FakeProcesses {
 		}
 		this.commands.push([command.command, ...command.args]);
 		this.onSpawn?.();
+		if (this.missing.has(command.command)) {
+			return Effect.fail(
+				PlatformError.systemError({
+					_tag: "NotFound",
+					method: "spawn",
+					module: "ChildProcess",
+					pathOrDescriptor: command.command,
+				})
+			);
+		}
+		const index = this.commands.length - 1;
+		const { stdin } = command.options;
+		const input = Stream.isStream(stdin)
+			? Effect.map(Stream.mkString(Stream.decodeText(stdin)), (text) => {
+					this.inputs.set(index, text);
+				})
+			: Effect.void;
 		const line = commandLine(command);
 		if (line === pathWrite) {
 			this.userPath = command.options.env?.MX_PATH ?? "";
@@ -203,10 +240,34 @@ export class FakeProcesses {
 		return Effect.flatMap(
 			Deferred.make<ChildProcessSpawner.ExitCode>(),
 			(exit) => {
+				if (this.hanging.has(command.command)) {
+					return Effect.andThen(
+						input,
+						Effect.as(
+							Effect.addFinalizer(() =>
+								Effect.andThen(
+									Deferred.succeed(exit, ExitCode(143)),
+									Effect.sync(() => {
+										this.killed.add(index);
+									})
+								)
+							),
+							handle(this.commands.length, exit)
+						)
+					);
+				}
 				if (command.args[0] !== "tunnel") {
-					return Effect.as(
-						Deferred.succeed(exit, ExitCode(this.exitCode(command))),
-						handle(this.commands.length, exit, stdout)
+					return Effect.andThen(
+						input,
+						Effect.as(
+							Deferred.succeed(
+								exit,
+								ExitCode(
+									this.failing.has(command.command) ? 1 : this.exitCode(command)
+								)
+							),
+							handle(this.commands.length, exit, stdout)
+						)
 					);
 				}
 				this.opened += 1;

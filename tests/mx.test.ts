@@ -298,6 +298,11 @@ const withTerminalOn =
 const withStdinTerminal = withTerminalOn(process.stdin);
 /** A bare mx plays its banner only when stdout is a terminal. */
 const withStdoutTerminal = withTerminalOn(process.stdout);
+// bun test run in a terminal hands it stdin, so mx's stdin is a terminal only in a test that says so.
+Object.defineProperty(process.stdin, "isTTY", {
+	configurable: true,
+	value: false,
+});
 
 /** A key of one character types it, and a longer one, such as `return`, presses the key of that name. */
 const keyPress = (name: string): Terminal.UserInput => ({
@@ -307,7 +312,8 @@ const keyPress = (name: string): Terminal.UserInput => ({
 
 /**
  * `system` on a terminal where the user presses `keys` in turn, across every prompt, `press` presses one more once mx
- * reads the terminal, and `close` ends its input, as when stdin closes. `frames` keeps everything mx drew on it.
+ * reads the terminal, and `close` ends its input, as when stdin closes. `reading` answers whether mx has read the
+ * terminal, and `frames` keeps everything mx drew on it.
  */
 const fakeTerminal = (system: typeof platform, keys: readonly string[]) => {
 	const frames: string[] = [];
@@ -341,6 +347,7 @@ const fakeTerminal = (system: typeof platform, keys: readonly string[]) => {
 		frames,
 		press: (name: string) =>
 			Effect.flatMap(read, (queue) => Queue.offer(queue, keyPress(name))),
+		reading: () => input !== undefined,
 		system: Layer.merge(system, terminal),
 	};
 };
@@ -363,6 +370,7 @@ const asIfOn =
 		);
 const onWindows = asIfOn("win32");
 const onMac = asIfOn("darwin");
+const onLinux = asIfOn("linux");
 
 /** Runs `effect` as if Explorer started mx on a double-click: on Windows, alone on a console of its own. */
 const doubleClicked = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -740,6 +748,24 @@ const syncCommands = onThisSystem({
 		restart: [stopBackground, `${background} sync`],
 		start: [stopBackground, `${background} sync`],
 	},
+});
+
+/** The programs that open a URL in the browser on Linux, macOS and Windows. */
+const browsers = new Set(["xdg-open", "open", "rundll32.exe"]);
+/** Those, and the programs that copy text to the clipboard. */
+const desktopPrograms = new Set([
+	...browsers,
+	"wl-copy",
+	"xclip",
+	"xsel",
+	"pbcopy",
+	"clip.exe",
+]);
+/** Every program works again. */
+const restorePrograms = Effect.sync(() => {
+	processes.missing.clear();
+	processes.failing.clear();
+	processes.hanging.clear();
 });
 
 /** The agents mx offers here, as `--agent` names them; Claude Desktop only on Windows and macOS. */
@@ -1416,12 +1442,19 @@ describe("mx", () => {
 			);
 		}));
 
-	test("mx login signs in at the tenant it is given, asks for Mail.Send, and saves the refresh token in the secret store", () =>
+	test("mx login signs in at the tenant it is given, asks for Mail.Send, and saves the refresh token in the secret store; without a terminal it prints the URL and the code and starts no clipboard or browser program", () =>
 		Effect.gen(function* () {
+			const before = processes.commands.length;
 			const { output } = yield* cli("login");
 			expect(new Set(tenantsAsked())).toEqual(new Set([tenant]));
-			expect(output).toContain(verificationUri);
-			expect(output).toContain(userCode);
+			expect(lines(output)).toContain(
+				`Open ${verificationUri} and enter the code ${userCode}.`
+			);
+			expect(
+				Arr.filter(processes.commands.slice(before), ([program = ""]) =>
+					desktopPrograms.has(program)
+				)
+			).toEqual([]);
 			const forms = tokenForms();
 			expect(forms[0]?.get("client_id")).toBe(clientId);
 			expect(forms[0]?.get("scope")).toBe(
@@ -1439,6 +1472,143 @@ describe("mx", () => {
 			expect(yield* (yield* FileSystem.FileSystem).exists(tokenFile)).toBe(
 				false
 			);
+		}));
+
+	test("on a terminal, mx login copies the code to the clipboard, says so, opens the sign-in page in the browser on Enter, and signs in, with the programs of Linux, macOS and Windows", () =>
+		Effect.forEach(
+			[
+				{
+					browser: ["xdg-open", verificationUri],
+					clipboard: ["wl-copy"],
+					on: onLinux,
+				},
+				{
+					browser: ["open", verificationUri],
+					clipboard: ["pbcopy"],
+					on: onMac,
+				},
+				{
+					browser: [
+						"rundll32.exe",
+						"url.dll,FileProtocolHandler",
+						verificationUri,
+					],
+					clipboard: ["clip.exe"],
+					on: onWindows,
+				},
+			],
+			({ browser, clipboard, on }) =>
+				Effect.gen(function* () {
+					const { system } = fakeTerminal(platform, ["return"]);
+					const before = processes.commands.length;
+					const { output } = yield* on(
+						withStdinTerminal(true)(cliOn(system)("login"))
+					);
+					expect(lines(output).slice(0, 3)).toEqual([
+						`Your sign-in code is ${userCode}. It is on your clipboard.`,
+						`Press Enter to open ${verificationUri} in your browser, then paste the code there.`,
+						"Signed in. The refresh token is saved.",
+					]);
+					expect(processes.commands.slice(before, before + 2)).toEqual([
+						clipboard,
+						browser,
+					]);
+					expect(processes.inputs.get(before)).toBe(userCode);
+					expect(yield* savedRefreshToken).toBe(issued(1));
+				}),
+			{ discard: true }
+		));
+
+	test("on a terminal, mx login signs in when the code is entered with no key pressed, and opens no browser", () =>
+		Effect.gen(function* () {
+			const { system } = fakeTerminal(platform, []);
+			const before = processes.commands.length;
+			const { output } = yield* withStdinTerminal(true)(cliOn(system)("login"));
+			expect(lines(output)).toContain("Signed in. The refresh token is saved.");
+			expect(
+				Arr.filter(processes.commands.slice(before), ([program = ""]) =>
+					browsers.has(program)
+				)
+			).toEqual([]);
+			expect(yield* savedRefreshToken).toBe(issued(1));
+		}));
+
+	test("on a terminal on Linux where no clipboard program works, mx login tries wl-copy, xclip and xsel, asks to enter the code, and Enter still opens the browser", () =>
+		onLinux(
+			Effect.gen(function* () {
+				processes.missing.add("wl-copy").add("xsel");
+				processes.failing.add("xclip");
+				const { system } = fakeTerminal(platform, ["return"]);
+				const before = processes.commands.length;
+				const { output } = yield* withStdinTerminal(true)(
+					cliOn(system)("login")
+				);
+				expect(lines(output).slice(0, 2)).toEqual([
+					`Your sign-in code is ${userCode}.`,
+					`Press Enter to open ${verificationUri} in your browser, then enter the code there.`,
+				]);
+				expect(processes.commands.slice(before, before + 4)).toEqual([
+					["wl-copy"],
+					["xclip", "-selection", "clipboard"],
+					["xsel", "--clipboard", "--input"],
+					["xdg-open", verificationUri],
+				]);
+			})
+		).pipe(Effect.ensuring(restorePrograms)));
+
+	test("on a terminal on Linux where wl-copy never exits, mx login kills it, copies the code with xclip, says so, and signs in", () =>
+		onLinux(
+			Effect.gen(function* () {
+				processes.hanging.add("wl-copy");
+				const { system } = fakeTerminal(platform, ["return"]);
+				const before = processes.commands.length;
+				const { output } = yield* withStdinTerminal(true)(
+					cliOn(system)("login")
+				).pipe(onTestClock);
+				expect(processes.commands.slice(before, before + 2)).toEqual([
+					["wl-copy"],
+					["xclip", "-selection", "clipboard"],
+				]);
+				expect(processes.killed.has(before)).toBe(true);
+				expect(processes.inputs.get(before + 1)).toBe(userCode);
+				expect(lines(output).slice(0, 3)).toEqual([
+					`Your sign-in code is ${userCode}. It is on your clipboard.`,
+					`Press Enter to open ${verificationUri} in your browser, then paste the code there.`,
+					"Signed in. The refresh token is saved.",
+				]);
+				expect(yield* savedRefreshToken).toBe(issued(1));
+			})
+		).pipe(Effect.ensuring(restorePrograms)));
+
+	test("on a terminal where no browser opens, Enter makes mx login say to open the sign-in page, and it still signs in", () =>
+		onLinux(
+			Effect.gen(function* () {
+				processes.failing.add("xdg-open");
+				const { system } = fakeTerminal(platform, ["return"]);
+				const { output } = yield* withStdinTerminal(true)(
+					cliOn(system)("login")
+				);
+				expect(lines(output).slice(2, 4)).toEqual([
+					`Could not open a browser. Open ${verificationUri} yourself.`,
+					"Signed in. The refresh token is saved.",
+				]);
+			})
+		).pipe(Effect.ensuring(restorePrograms)));
+
+	test("on a terminal, input that ends before Enter, as Ctrl+C ends it, stops mx login without signing in and without an error", () =>
+		Effect.gen(function* () {
+			const { close, reading, system } = fakeTerminal(platform, []);
+			const tokens = microsoft.refreshTokens.length;
+			const login = yield* Effect.forkChild(
+				withStdinTerminal(true)(runOn(system)("login"))
+			);
+			yield* eventually("mx to wait for Enter", reading);
+			yield* close;
+			const { errors, exit, output } = yield* Fiber.join(login);
+			expect(Exit.hasInterrupts(exit)).toBe(true);
+			expect(errors).toBe("");
+			expect(output).not.toContain("Signed in.");
+			expect(microsoft.refreshTokens).toHaveLength(tokens);
 		}));
 
 	test("mx login asks for the client id and the tenant once, where Enter keeps organizations, saves both in config.json and signs in with them", () =>

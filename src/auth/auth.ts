@@ -8,7 +8,9 @@ import {
 	Option,
 	Redacted,
 	Schema,
+	Stream,
 	SynchronizedRef,
+	type Terminal,
 } from "effect";
 import { Hex } from "effect/encoding";
 import {
@@ -17,6 +19,8 @@ import {
 	HttpClientRequest,
 	HttpClientResponse,
 } from "effect/http";
+import type { ChildProcessSpawner } from "effect/process";
+import { copyToClipboard, openInBrowser } from "../desktop.ts";
 import {
 	type CredentialFailed,
 	LoginRequired,
@@ -371,15 +375,58 @@ export class Auth extends Context.Service<
 }
 
 /**
- * The device-code sign-in at the terminal with `config`: prints the URL and the code, waits for the user, and saves the
- * sign-in.
+ * The device-code sign-in with `config`: prints the URL and the code, waits for the user, and saves the sign-in. On a
+ * terminal, as GitHub CLI does, it copies the code to the clipboard and opens the URL in the browser when the user
+ * presses Enter. The sign-in finishes whenever the code is entered, also on another device with no key pressed, and
+ * input that ends before Enter, as Esc and Ctrl+C end it in raw mode, interrupts it as Ctrl+C does anywhere else.
  */
 export const signIn = Effect.fnUntraced(function* (
-	auth: Auth["Service"],
+	{
+		auth,
+		spawner,
+		terminal,
+	}: {
+		readonly auth: Auth["Service"];
+		readonly spawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
+		readonly terminal: Terminal.Terminal;
+	},
 	config: SignInConfig
 ) {
 	const { complete, url, userCode } = yield* auth.startLogin(config);
-	yield* Console.log(`Open ${url} and enter the code ${userCode}.`);
-	yield* complete;
+	if (process.stdin.isTTY === true) {
+		const copied = yield* copyToClipboard(spawner, userCode);
+		yield* Console.log(
+			copied
+				? `Your sign-in code is ${userCode}. It is on your clipboard.`
+				: `Your sign-in code is ${userCode}.`
+		);
+		yield* Console.log(
+			`Press Enter to open ${url} in your browser, then ${copied ? "paste" : "enter"} the code there.`
+		);
+		// Reading stops at Enter, which ends raw mode, so Ctrl+C is a signal again while the sign-in waits on.
+		const openOnEnter = Effect.gen(function* () {
+			const enter = yield* Effect.scoped(
+				Effect.flatMap(terminal.readInput, (input) =>
+					Stream.fromQueue(input).pipe(
+						Stream.filter(
+							({ key }) => key.name === "return" || key.name === "enter"
+						),
+						Stream.runHead
+					)
+				)
+			);
+			if (Option.isNone(enter)) {
+				return yield* Effect.interrupt;
+			}
+			if (!(yield* openInBrowser(spawner, url))) {
+				yield* Console.log(`Could not open a browser. Open ${url} yourself.`);
+			}
+			return yield* Effect.never;
+		});
+		yield* Effect.raceFirst(complete, openOnEnter);
+	} else {
+		yield* Console.log(`Open ${url} and enter the code ${userCode}.`);
+		yield* complete;
+	}
 	yield* Console.log("Signed in. The refresh token is saved.");
 });

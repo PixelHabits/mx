@@ -16,6 +16,7 @@ import {
 	Terminal,
 } from "effect";
 import { CliError, Command, Flag, Prompt } from "effect/cli";
+import { ChildProcessSpawner } from "effect/process";
 import packageJson from "../package.json" with { type: "json" };
 import { agentFlag } from "./agents.ts";
 import { Auth, signIn } from "./auth/auth.ts";
@@ -55,7 +56,14 @@ const login = Command.make(
 	{ clientId: clientIdFlag, tenant: tenantFlag },
 	(config) =>
 		Effect.gen(function* () {
-			yield* signIn(yield* Auth, config);
+			yield* signIn(
+				{
+					auth: yield* Auth,
+					spawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+					terminal: yield* Terminal.Terminal,
+				},
+				config
+			);
 			yield* (yield* Installer).resumeSync;
 		})
 ).pipe(
