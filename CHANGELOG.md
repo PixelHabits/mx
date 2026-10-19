@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/PixelHabits/mx/compare/v0.1.1...v0.2.0) (2026-10-19)
+
+
+### Features
+
+* **login:** copy the sign-in code and open the browser on Enter, as gh does ([10136e6](https://github.com/PixelHabits/mx/commit/10136e63b61bcac47de97141d4c01a1da22aa219))
+
 ## [0.1.1](https://github.com/PixelHabits/mx/compare/v0.1.0...v0.1.1) (2026-10-19)
 
 
