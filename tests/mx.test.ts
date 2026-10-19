@@ -819,7 +819,7 @@ const codexApprovals = (approvals: readonly (readonly [string, string])[]) =>
 		),
 		""
 	);
-/** The recommended approvals: every tool runs without asking, except send and delete, which always ask. */
+/** The recommended approvals: every tool runs without asking, except send, delete and delete_folder, which always ask. */
 const recommended = [
 	["search", "approve"],
 	["query", "approve"],
@@ -832,6 +832,8 @@ const recommended = [
 	["send", "prompt"],
 	["update", "approve"],
 	["delete", "prompt"],
+	["folder", "approve"],
+	["delete_folder", "prompt"],
 ] as const;
 const codexWithMx = `# Codex settings for the test machine.
 model = "gpt-6.1-sol"
@@ -1166,7 +1168,9 @@ const tools = [
 	"attachment",
 	"delete",
 	"delete_draft",
+	"delete_folder",
 	"draft",
+	"folder",
 	"message",
 	"query",
 	"search",
@@ -1255,7 +1259,7 @@ describe("mx", () => {
 			expect(frames).toEqual([]);
 		}));
 
-	test("mx mcp speaks MCP 2026-07-28, then the 2025-11-25 and 2025-06-18 handshakes, and lists the eleven tools, marking reads read-only and every write but draft destructive", () =>
+	test("mx mcp speaks MCP 2026-07-28, then the 2025-11-25 and 2025-06-18 handshakes, and lists the thirteen tools, marking reads read-only and every write but draft destructive", () =>
 		Effect.gen(function* () {
 			const client = yield* McpClient;
 			expect(yield* client.request("server/discover")).toMatchObject({
@@ -1279,7 +1283,9 @@ describe("mx", () => {
 				attachment: "read safe",
 				delete: "write destructive",
 				delete_draft: "write destructive",
+				delete_folder: "write destructive",
 				draft: "write safe",
+				folder: "write destructive",
 				message: "read safe",
 				query: "read safe",
 				search: "read safe",
@@ -2915,6 +2921,171 @@ describe("mx", () => {
 			).toEqual([]);
 		}));
 
+	test("folder creates each missing folder of a path, and search and query see the new folders at once", () =>
+		Effect.gen(function* () {
+			const asked = microsoft.graphRequests().length;
+			expect(yield* tool("folder", { create: "Clients/Acme/Contracts" })).toBe(
+				"Created Clients, Clients/Acme, Clients/Acme/Contracts."
+			);
+			expect(yield* tool("folder", { create: "Clients/Globex" })).toBe(
+				"Created Clients/Globex."
+			);
+			expect(
+				Arr.map(
+					Arr.filter(
+						microsoft.graphRequests().slice(asked),
+						(request) => request.method === "POST"
+					),
+					({ body, url }) => `${url.pathname} ${body}`
+				)
+			).toEqual([
+				'/v1.0/me/mailFolders {"displayName":"Clients"}',
+				`/v1.0/me/mailFolders/${microsoft.folderId("Clients")}/childFolders {"displayName":"Acme"}`,
+				`/v1.0/me/mailFolders/${microsoft.folderId("Acme")}/childFolders {"displayName":"Contracts"}`,
+				`/v1.0/me/mailFolders/${microsoft.folderId("Clients")}/childFolders {"displayName":"Globex"}`,
+			]);
+			expect(yield* tool("search", { folder: "Clients/Acme/Contracts" })).toBe(
+				"No messages."
+			);
+			expect(
+				yield* tool("query", {
+					sql: "SELECT path, total FROM folders WHERE path LIKE 'Clients%' ORDER BY path",
+				})
+			).toBe(
+				"path\ttotal\nClients\t0\nClients/Acme\t0\nClients/Acme/Contracts\t0\nClients/Globex\t0"
+			);
+		}));
+
+	test("folder renames and moves a folder, and the local copy shows the new paths at once, for the folders and mail inside it too, as the next sync does", () =>
+		Effect.gen(function* () {
+			microsoft.deliver({
+				body: "The signed contract is attached.",
+				conversationId: "conversation-contract",
+				from: priya,
+				parentFolderId: microsoft.folderId("Contracts"),
+				received: "2026-10-09T09:00:00Z",
+				subject: "Acme contract",
+			});
+			yield* cli("sync", "--once");
+			const contract = idOf(
+				yield* tool("search", { query: "contract" }),
+				"Acme contract"
+			);
+			expect(
+				yield* tool("folder", { name: "Acme Corp", rename: "Clients/Acme" })
+			).toBe("Renamed Clients/Acme to Clients/Acme Corp.");
+			expect(yield* tool("message", { id: contract })).toMatch(
+				lineIn(contract, "Clients/Acme Corp/Contracts")
+			);
+			expect(yield* tool("folder", { move: "Acme Corp", to: "Inbox" })).toBe(
+				"Moved Clients/Acme Corp to Inbox/Acme Corp."
+			);
+			expect(yield* tool("folder", { move: "Globex", to: "/" })).toBe(
+				"Moved Clients/Globex to Globex."
+			);
+			expect(
+				yield* tool("search", { folder: "Inbox/Acme Corp/Contracts" })
+			).toMatch(lineIn(contract, "Inbox/Acme Corp/Contracts"));
+			expect(
+				yield* refusal("search", { folder: "Clients/Acme Corp" })
+			).toContain("No folder named Clients/Acme Corp.");
+			const paths = {
+				sql: "SELECT path FROM folders WHERE path LIKE '%Acme%' OR path LIKE '%Globex%' OR path LIKE 'Clients%' ORDER BY path",
+			};
+			const moved =
+				"path\nClients\nGlobex\nInbox/Acme Corp\nInbox/Acme Corp/Contracts";
+			expect(yield* tool("query", paths)).toBe(moved);
+			yield* cli("sync", "--once");
+			expect(yield* tool("query", paths)).toBe(moved);
+		}));
+
+	test("delete_folder moves a folder with everything in it to Deleted Items through move, never DELETE, and its mail leaves the folders it was in at once", () =>
+		Effect.gen(function* () {
+			const contract = idOf(
+				yield* tool("search", { query: "contract" }),
+				"Acme contract"
+			);
+			expect(yield* tool("delete_folder", { folder: "Inbox/Acme Corp" })).toBe(
+				"Moved Inbox/Acme Corp to Deleted Items/Acme Corp, where Outlook can restore it."
+			);
+			expect(
+				graphRequests(
+					`/mailFolders/${microsoft.folderId("Acme Corp")}/move`
+				).at(-1)?.body
+			).toBe('{"destinationId":"deleteditems"}');
+			expect(
+				Arr.filter(
+					microsoft.received,
+					(request) =>
+						request.method === "DELETE" || permanent.test(request.url.pathname)
+				)
+			).toEqual([]);
+			expect(yield* tool("message", { id: contract })).toMatch(
+				lineIn(contract, "Deleted Items/Acme Corp/Contracts")
+			);
+			expect(
+				yield* refusal("search", { folder: "Inbox/Acme Corp/Contracts" })
+			).toContain("No folder named Inbox/Acme Corp/Contracts.");
+			expect(
+				yield* tool("query", {
+					sql: "SELECT folder FROM mail WHERE conversation_id = 'conversation-contract'",
+				})
+			).toBe("folder\nDeleted Items/Acme Corp/Contracts");
+		}));
+
+	test("folder and delete_folder refuse Outlook's own folders, Deleted Items and the folders in it, and send Graph no change", () =>
+		Effect.gen(function* () {
+			const changes = () =>
+				Arr.filter(
+					microsoft.graphRequests(),
+					(request) => request.method !== "GET"
+				).length;
+			const before = changes();
+			for (const [name, args] of [
+				["folder", { name: "Incoming", rename: "Inbox" }],
+				["folder", { move: "Sent Items", to: "Archive" }],
+				["delete_folder", { folder: "Drafts" }],
+				["delete_folder", { folder: "Deleted Items" }],
+			] as const) {
+				expect(yield* refusal(name, args)).toContain(
+					"is one of Outlook's own folders"
+				);
+			}
+			for (const [name, args] of [
+				["delete_folder", { folder: "Deleted Items/Acme Corp" }],
+				["folder", { name: "Acme", rename: "Deleted Items/Acme Corp" }],
+				["folder", { move: "Contracts", to: "Inbox" }],
+				["folder", { create: "Deleted Items/Acme Corp/Drafts" }],
+			] as const) {
+				expect(yield* refusal(name, args)).toContain("in Deleted Items");
+			}
+			expect(
+				yield* refusal("folder", { move: "Clients", to: "Deleted Items" })
+			).toContain("use delete_folder");
+			expect(changes()).toBe(before);
+		}));
+
+	test("folder says when the folder that would hold the folder already holds one of that name", () =>
+		Effect.gen(function* () {
+			microsoft.addFolder("folder-receipts", "Receipts", "folder-inbox");
+			expect(yield* refusal("folder", { create: "Inbox/Receipts" })).toBe(
+				"Inbox already has a folder named Receipts."
+			);
+			expect(
+				yield* refusal("folder", { name: "Globex", rename: "Clients" })
+			).toBe("The top of the mailbox already has a folder named Globex.");
+		}).pipe(
+			// The folders the folder tests made leave the mailbox and the store with this last of them.
+			Effect.ensuring(
+				Effect.suspend(() => {
+					for (const name of ["Clients", "Globex", "Acme Corp", "Receipts"]) {
+						microsoft.removeFolder(microsoft.folderId(name));
+					}
+					return Effect.orDie(cli("sync", "--once"));
+				})
+			)
+		));
+
 	test("a message removed in Outlook leaves the store on the next sync", () =>
 		Effect.gen(function* () {
 			const id = idOf(yield* tool("search", { query: "travel cap" }), "RE:");
@@ -4023,7 +4194,9 @@ describe("mx", () => {
 				numStartups: 1,
 			});
 			expect(yield* readJson(`${folder}/settings.json`)).toMatchObject({
-				permissions: { ask: ["mcp__mx__send", "mcp__mx__delete"] },
+				permissions: {
+					ask: ["mcp__mx__send", "mcp__mx__delete", "mcp__mx__delete_folder"],
+				},
 			});
 			expect(yield* fs.readFileString(claudeCodeConfig)).toBe(before);
 		}));
@@ -4210,7 +4383,7 @@ describe("mx", () => {
 							([name]) => `mcp__mx__${name}`
 						),
 					],
-					ask: ["mcp__mx__send"],
+					ask: ["mcp__mx__send", "mcp__mx__delete_folder"],
 					deny: ["mcp__mx__delete"],
 				},
 			});

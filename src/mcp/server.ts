@@ -11,6 +11,7 @@ import {
 	Option,
 	Order,
 	Path,
+	Predicate,
 	Result,
 	Schema,
 } from "effect";
@@ -23,8 +24,19 @@ import {
 	NotFound,
 	Refused,
 } from "../errors.ts";
-import { FlagStatus, type Message, type Recipient } from "../graph/api.ts";
-import { type Compose, Graph, isNotFound } from "../graph/graph.ts";
+import {
+	FlagStatus,
+	type Message,
+	type Recipient,
+	wellKnownFolders,
+} from "../graph/api.ts";
+import {
+	type Compose,
+	Graph,
+	type GraphError,
+	isFolderExists,
+	isNotFound,
+} from "../graph/graph.ts";
 import { Log } from "../log.ts";
 import { Paths } from "../paths.ts";
 import { Query } from "../query.ts";
@@ -146,15 +158,15 @@ const decodeSend = Schema.decodeUnknownEffect(
 	{ onExcessProperty: "error" }
 );
 
+const NamedFolder = Schema.String.annotate({
+	description: "A folder name or path, such as Inbox or Inbox/Projects.",
+});
+
 const search = Tool.make("search", {
 	description:
 		"Search the local copy of the mailbox. query matches words and their other forms in the subject, the sender and the message's new text; every filter is optional. Answers one line per conversation, best match first, or newest first without a query: #id date folder | sender | subject | markers, and (+N in thread) when the conversation holds N more messages, which thread shows.",
 	parameters: Schema.Struct({
-		folder: Schema.optionalKey(
-			Schema.String.annotate({
-				description: "A folder name or path, such as Inbox or Inbox/Projects.",
-			})
-		),
+		folder: Schema.optionalKey(NamedFolder),
 		from: Schema.optionalKey(
 			Schema.String.annotate({
 				description: "Part of the sender's name or address.",
@@ -301,12 +313,57 @@ const deleteMessages = Tool.make("delete", {
 	.annotate(Tool.Destructive, true)
 	.annotate(Tool.OpenWorld, false);
 
+const changeFolder = Tool.make("folder", {
+	description:
+		"Creates, renames or moves a mail folder, one change per call. create makes each missing folder of a path from the top of the mailbox, such as Inbox/Projects/Acme. rename with name gives a folder a new name. move with to puts a folder, with everything in it, into the folder to, or at the top of the mailbox when to is /. Folders are named as in search. Outlook's own folders, such as Inbox and Sent Items, are never renamed or moved, and nothing changes in Deleted Items, where only delete_folder moves a folder.",
+	parameters: Schema.Struct({
+		create: Schema.optionalKey(
+			Schema.String.annotate({
+				description:
+					"A path from the top of the mailbox, such as Inbox/Projects/Acme.",
+			})
+		),
+		move: Schema.optionalKey(NamedFolder),
+		name: Schema.optionalKey(
+			Schema.String.annotate({ description: "The new name, with rename." })
+		),
+		rename: Schema.optionalKey(NamedFolder),
+		to: Schema.optionalKey(
+			NamedFolder.annotate({
+				description:
+					"The folder that move puts the folder in, or / for the top of the mailbox.",
+			})
+		),
+	}),
+})
+	.annotate(Tool.Destructive, true)
+	.annotate(Tool.OpenWorld, false);
+
+/** `folder`'s three changes; a call that mixes their fields matches none. */
+const decodeFolderChange = Schema.decodeUnknownEffect(
+	Schema.Union([
+		Schema.Struct({ create: Schema.String }),
+		Schema.Struct({ name: Schema.String, rename: Schema.String }),
+		Schema.Struct({ move: Schema.String, to: Schema.String }),
+	]),
+	{ onExcessProperty: "error" }
+);
+
+const deleteFolder = Tool.make("delete_folder", {
+	description:
+		"Moves a folder, with the folders and messages in it, to Deleted Items, where Outlook can restore it. Refuses Outlook's own folders, such as Inbox, and the folders already in Deleted Items.",
+	parameters: Schema.Struct({ folder: NamedFolder }),
+})
+	.annotate(Tool.Destructive, true)
+	.annotate(Tool.OpenWorld, false);
+
 /** Whether an agent runs a tool without asking or asks every time. */
 export type Approval = "allow" | "ask";
 
 /**
- * The approval mx recommends for each tool, in the order mx lists them: only `send` and `delete` ask every time. The
- * hints do not decide it: `update_draft`, `delete_draft` and `update` are destructive and still run without asking.
+ * The approval mx recommends for each tool, in the order mx lists them: only `send`, `delete` and `delete_folder` ask
+ * every time. The hints do not decide it: `update_draft`, `delete_draft`, `update` and `folder` are destructive and
+ * still run without asking.
  */
 export const recommendedApprovals: readonly {
 	readonly approval: Approval;
@@ -323,6 +380,8 @@ export const recommendedApprovals: readonly {
 	{ approval: "ask", tool: send.name },
 	{ approval: "allow", tool: update.name },
 	{ approval: "ask", tool: deleteMessages.name },
+	{ approval: "allow", tool: changeFolder.name },
+	{ approval: "ask", tool: deleteFolder.name },
 ];
 
 const textResult = (text: string, isError: boolean) =>
@@ -444,6 +503,20 @@ const register = Effect.fnUntraced(function* <
 		}),
 	});
 });
+
+/** Refuses a name no path could hold: a blank one, or one with `/`, which separates the folders of a path. */
+const checkFolderName = (name: string) =>
+	name.trim() === "" || name.includes("/")
+		? Refused.make({
+				message: `"${name}" is not a folder name: a name is not blank and holds no /, which separates the folders of a path.`,
+			})
+		: Effect.void;
+
+/** The path of the folder that holds the folder at `path`, or none at the top of the mailbox. */
+const parentOf = (path: string) => {
+	const end = path.lastIndexOf("/");
+	return end === -1 ? Option.none<string>() : Option.some(path.slice(0, end));
+};
 
 const unsafeInFileName = /[/\\\0]/gu;
 const leadingDots = /^\.+/u;
@@ -647,14 +720,151 @@ export const tools = Layer.effectDiscard(
 			return first;
 		});
 
-		/** Whether `folder` is Deleted Items or a folder inside it, where mail goes only through `delete`, which the client asks about. */
+		/** The ids of Outlook's own folders that the mailbox has, by well-known name; they hold for the life of the process. */
+		const wellKnown = yield* Effect.cachedWithTTL(
+			Effect.forEach(wellKnownFolders, (name) =>
+				graph.folder(name).pipe(
+					Effect.map(({ id }) => Option.some([name, id] as const)),
+					Effect.catchIf(isNotFound, () => Effect.succeedNone)
+				)
+			).pipe(Effect.map((found) => new Map(Arr.getSomes(found)))),
+			(exit) => (Exit.isSuccess(exit) ? Duration.infinity : Duration.zero)
+		);
+
+		/**
+		 * Whether `folder` is Deleted Items or a folder inside it, where mail and folders go only through `delete` and
+		 * `delete_folder`, which the client asks about.
+		 */
 		const inDeletedItems = Effect.fnUntraced(function* (folder: StoredFolder) {
-			const { id } = yield* graph.folder("deleteditems");
+			const id = (yield* wellKnown).get("deleteditems");
+			if (id === undefined) {
+				return yield* NotFound.make({
+					message:
+						"Graph found no Deleted Items in the mailbox, so mx cannot tell which folders are in it.",
+				});
+			}
 			return Arr.some(
 				yield* store.folders,
 				(deleted) =>
 					deleted.id === id && `${folder.path}/`.startsWith(`${deleted.path}/`)
 			);
+		});
+
+		/** The folder `name` names, for `folder` or `delete_folder` to change: refused when Outlook keeps it, or in Deleted Items. */
+		const changeable = Effect.fnUntraced(function* (name: string) {
+			const found = yield* folderNamed(name);
+			if (Arr.contains((yield* wellKnown).values(), found.id)) {
+				return yield* Refused.make({
+					message: `${found.path} is one of Outlook's own folders, which mx never renames, moves or deletes.`,
+				});
+			}
+			if (yield* inDeletedItems(found)) {
+				return yield* Refused.make({
+					message: `${found.path} is in Deleted Items, where mx changes no folder; Outlook can restore it.`,
+				});
+			}
+			return found;
+		});
+
+		/** Answers Graph's refusal of a second folder named `name` in the folder at `place`, or at the top of the mailbox. */
+		const unlessTaken =
+			(place: Option.Option<string>, name: string) =>
+			<A>(change: Effect.Effect<A, GraphError>) =>
+				Effect.catchIf(change, isFolderExists, () =>
+					Refused.make({
+						message: `${Option.getOrElse(place, () => "The top of the mailbox")} already has a folder named ${name}.`,
+					})
+				);
+
+		/** Creates each folder of the path `wanted` below the deepest one the store has; answers the paths it created. */
+		const createFolders = Effect.fnUntraced(function* (wanted: string) {
+			const names = wanted.split("/");
+			yield* Effect.forEach(names, checkFolderName, { discard: true });
+			const byPath = new Map(
+				Arr.map(yield* store.folders, (folder) => [
+					folder.path.toLowerCase(),
+					folder,
+				])
+			);
+			const known = Arr.takeWhile(
+				Arr.map(names, (_, last) =>
+					byPath.get(Arr.join(names.slice(0, last + 1), "/").toLowerCase())
+				),
+				Predicate.isNotUndefined
+			);
+			const parent = Arr.last(known);
+			if (known.length === names.length) {
+				return yield* Refused.make({ message: `${wanted} already exists.` });
+			}
+			if (Option.isSome(parent) && (yield* inDeletedItems(parent.value))) {
+				return yield* Refused.make({
+					message: `${parent.value.path} is in Deleted Items, where folder creates no folder.`,
+				});
+			}
+			let place: Option.Option<{ readonly id: string; readonly path: string }> =
+				parent;
+			const created: string[] = [];
+			for (const name of names.slice(known.length)) {
+				const made = yield* graph
+					.createFolder(
+						Option.map(place, (folder) => folder.id),
+						name
+					)
+					.pipe(
+						unlessTaken(
+							Option.map(place, (folder) => folder.path),
+							name
+						)
+					);
+				const saved = yield* store.saveFolder(made, false);
+				created.push(saved);
+				place = Option.some({ id: made.id, path: saved });
+			}
+			return `Created ${Arr.join(created, ", ")}.`;
+		});
+
+		const renameFolder = Effect.fnUntraced(function* (
+			target: string,
+			name: string
+		) {
+			yield* checkFolderName(name);
+			const found = yield* changeable(target);
+			const renamed = yield* graph
+				.renameFolder(found.id, name)
+				.pipe(unlessTaken(parentOf(found.path), name));
+			return `Renamed ${found.path} to ${yield* store.saveFolder(renamed, false)}.`;
+		});
+
+		const moveFolder = Effect.fnUntraced(function* (
+			target: string,
+			to: string
+		) {
+			const found = yield* changeable(target);
+			const destination =
+				to === "/" ? Option.none() : Option.some(yield* folderNamed(to));
+			if (
+				Option.isSome(destination) &&
+				(yield* inDeletedItems(destination.value))
+			) {
+				return yield* Refused.make({
+					message: `folder does not move folders to ${destination.value.path}; use delete_folder, which moves a folder to Deleted Items.`,
+				});
+			}
+			const moved = yield* graph
+				.moveFolder(
+					found.id,
+					Option.match(destination, {
+						onNone: () => "msgfolderroot",
+						onSome: ({ id }) => id,
+					})
+				)
+				.pipe(
+					unlessTaken(
+						Option.map(destination, (folder) => folder.path),
+						found.name
+					)
+				);
+			return `Moved ${found.path} to ${yield* store.saveFolder(moved, false)}.`;
 		});
 
 		const numbered = (found: Stored) =>
@@ -969,11 +1179,41 @@ export const tools = Layer.effectDiscard(
 			)
 		);
 
+		yield* register(changeFolder, (params) =>
+			decodeFolderChange(params).pipe(
+				Effect.mapError(() =>
+					Refused.make({
+						message:
+							"folder takes create, rename and name, or move and to: one change per call.",
+					})
+				),
+				Effect.flatMap((change) => {
+					if ("create" in change) {
+						return createFolders(change.create);
+					}
+					if ("rename" in change) {
+						return renameFolder(change.rename, change.name);
+					}
+					return moveFolder(change.move, change.to);
+				})
+			)
+		);
+
+		yield* register(deleteFolder, ({ folder }) =>
+			Effect.gen(function* () {
+				const found = yield* changeable(folder);
+				const moved = yield* graph
+					.moveFolder(found.id, "deleteditems")
+					.pipe(unlessTaken(Option.some("Deleted Items"), found.name));
+				return `Moved ${found.path} to ${yield* store.saveFolder(moved, false)}, where Outlook can restore it.`;
+			})
+		);
+
 		yield* prompts;
 	})
 );
 
-const instructions = `mx is a local copy of the user's Microsoft 365 mailbox, kept current by mx sync. Messages have short local ids such as #12. delete moves mail to Deleted Items; nothing deletes mail for good.
+const instructions = `mx is a local copy of the user's Microsoft 365 mailbox, kept current by mx sync. Messages have short local ids such as #12. delete and delete_folder move mail and folders to Deleted Items; nothing deletes mail for good.
 
 Reading mail costs context:
 - To count, group or compare mail, such as senders over a month or conversations still waiting on the user, call query with one SELECT instead of reading many search lines.

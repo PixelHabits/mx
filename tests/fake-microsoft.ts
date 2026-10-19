@@ -22,6 +22,7 @@ const wellKnown: Record<string, string> = {
 	deleteditems: "folder-deleted",
 	drafts: "folder-drafts",
 	inbox: "folder-inbox",
+	msgfolderroot: "folder-root",
 	sentitems: "folder-sent",
 };
 
@@ -82,6 +83,13 @@ const json = (
 
 const graphError = (status: number, code: string, message: string) =>
 	json({ error: { code, message } }, status);
+
+const notFound = () =>
+	graphError(
+		404,
+		"ErrorItemNotFound",
+		"The specified object was not found in the store."
+	);
 
 const recipients = (list: readonly Address[]) =>
 	Arr.map(list, (emailAddress) => ({ emailAddress }));
@@ -434,12 +442,32 @@ export class FakeMicrosoft {
 		this.folders.set(id, { displayName, parentFolderId });
 	}
 
-	/** Deletes a mail folder and the messages in it for good. */
+	/** Deletes a mail folder, the folders in it and their messages for good. */
 	removeFolder(id: string) {
+		for (const [child, { parentFolderId }] of [...this.folders]) {
+			if (parentFolderId === id) {
+				this.removeFolder(child);
+			}
+		}
 		this.folders.delete(id);
 		for (const message of this.inFolder(id)) {
 			this.messages.delete(message.id);
 		}
+	}
+
+	/** The id of the one folder named `displayName`. */
+	folderId(displayName: string) {
+		const [id, ...others] = Arr.map(
+			Arr.filter(
+				[...this.folders],
+				([, folder]) => folder.displayName === displayName
+			),
+			([folderId]) => folderId
+		);
+		if (id === undefined || others.length > 0) {
+			throw new Error(`Expected one folder named ${displayName}.`);
+		}
+		return id;
 	}
 
 	/** A message from Bob arrives in Inbox, and Graph notifies Inbox's subscriptions. */
@@ -884,7 +912,13 @@ export class FakeMicrosoft {
 		}
 		const [, , , collection, id, action, attachmentId, value] = parts;
 		if (collection === "mailFolders") {
-			return this.folderRequest(url, asText, id, action, attachmentId);
+			return this.folderRequest(
+				{ body, method, url },
+				asText,
+				id,
+				action,
+				attachmentId
+			);
 		}
 		if (collection === "sendMail") {
 			this.newMessage(body.message as Json, "folder-sent");
@@ -898,11 +932,7 @@ export class FakeMicrosoft {
 		}
 		const message = this.messages.get(id);
 		if (message === undefined) {
-			return graphError(
-				404,
-				"ErrorItemNotFound",
-				"The specified object was not found in the store."
-			);
+			return notFound();
 		}
 		if (action === "attachments") {
 			return this.attachmentRequest(method, message, body, attachmentId, value);
@@ -911,25 +941,44 @@ export class FakeMicrosoft {
 	}
 
 	private folderRequest(
-		url: URL,
+		{ body, method, url }: { body: Json; method: string; url: URL },
 		asText: boolean,
 		id: string | undefined,
 		action: string | undefined,
 		messagesAction: string | undefined
 	) {
 		if (id === undefined) {
-			return json({ value: this.foldersUnder("folder-root") });
+			return method === "POST"
+				? this.placeFolder(
+						this.newId("folder"),
+						String(body.displayName),
+						"folder-root",
+						201
+					)
+				: json({ value: this.foldersUnder("folder-root") });
 		}
 		const folderId = wellKnown[id] ?? id;
-		if (!this.folders.has(folderId)) {
-			return graphError(
-				404,
-				"ErrorItemNotFound",
-				"The specified object was not found in the store."
-			);
+		const folder = this.folders.get(folderId);
+		if (folder === undefined) {
+			return notFound();
 		}
 		if (action === "childFolders") {
-			return json({ value: this.foldersUnder(folderId) });
+			return method === "POST"
+				? this.placeFolder(
+						this.newId("folder"),
+						String(body.displayName),
+						folderId,
+						201
+					)
+				: json({ value: this.foldersUnder(folderId) });
+		}
+		if (action === "move") {
+			const destination = String(body.destinationId);
+			const parentFolderId = wellKnown[destination] ?? destination;
+			return parentFolderId === "folder-root" ||
+				this.folders.has(parentFolderId)
+				? this.placeFolder(folderId, folder.displayName, parentFolderId, 201)
+				: notFound();
 		}
 		if (action === "messages" && messagesAction === "delta") {
 			return this.delta(folderId, url, asText);
@@ -937,7 +986,50 @@ export class FakeMicrosoft {
 		if (action === "messages") {
 			return this.messageIds(folderId, url);
 		}
-		return json(this.folderJson(folderId));
+		if (method === "PATCH") {
+			return this.placeFolder(
+				folderId,
+				String(body.displayName),
+				folder.parentFolderId,
+				200
+			);
+		}
+		if (method === "GET") {
+			return json(this.folderJson(folderId));
+		}
+		return graphError(
+			405,
+			"ErrorInvalidRequest",
+			"The fake does not answer this request."
+		);
+	}
+
+	/**
+	 * Names and places a folder, created, renamed or moved, and answers it with `status`; Graph refuses a second folder
+	 * of a name in one parent, in any case.
+	 */
+	private placeFolder(
+		id: string,
+		displayName: string,
+		parentFolderId: string,
+		status: number
+	) {
+		const taken = Arr.some(
+			[...this.folders],
+			([other, folder]) =>
+				other !== id &&
+				folder.parentFolderId === parentFolderId &&
+				folder.displayName.toLowerCase() === displayName.toLowerCase()
+		);
+		if (taken) {
+			return graphError(
+				409,
+				"ErrorFolderExists",
+				"A folder with the specified name already exists."
+			);
+		}
+		this.folders.set(id, { displayName, parentFolderId });
+		return json(this.folderJson(id), status);
 	}
 
 	/** Logs the change and answers the message as Graph holds it now. */

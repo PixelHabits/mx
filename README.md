@@ -11,7 +11,8 @@ mx gives Claude Desktop, Claude Code and Codex your mail through the Model Conte
 - Draft new messages, replies, reply-alls and forwards, with attachments.
 - Send mail. By default your agent asks you first, every time.
 - Mark mail read, flag it, categorize it and move it between folders.
-- Delete mail. It goes to Deleted Items, so you can always get it back.
+- Create, rename and move folders.
+- Delete mail and folders. They go to Deleted Items, so you can always get them back.
 
 ## Install
 
@@ -121,6 +122,8 @@ Your agent uses these tools:
 | `send` | Sends a draft, or a new message. |
 | `update` | Marks, flags, categorizes or moves messages. |
 | `delete` | Moves messages to Deleted Items. |
+| `folder` | Creates, renames or moves a folder. |
+| `delete_folder` | Moves a folder, with everything in it, to Deleted Items. |
 
 ### Triage and interview
 
@@ -135,7 +138,7 @@ In Claude Code, type `/mx:triage` or `/mx:interview`. You can give triage a star
 
 `mx install` sets these defaults in Claude Code and Codex:
 
-- **Asks you first:** `send` and `delete`.
+- **Asks you first:** `send`, `delete` and `delete_folder`.
 - **Runs without asking:** everything else.
 
 When your agent sends a draft, the approval prompt shows every recipient and the subject.

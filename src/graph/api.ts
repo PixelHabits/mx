@@ -105,6 +105,33 @@ export type Folder = typeof Folder.Type;
 export const folderSelect =
 	"id,displayName,parentFolderId,childFolderCount,totalItemCount";
 
+/**
+ * The names Graph gives the folders Outlook makes and keeps, whatever the mailbox's language
+ * (https://learn.microsoft.com/graph/api/resources/mailfolder). A mailbox may lack some of them.
+ */
+export const wellKnownFolders = [
+	"archive",
+	"clutter",
+	"conflicts",
+	"conversationhistory",
+	"deleteditems",
+	"drafts",
+	"inbox",
+	"junkemail",
+	"localfailures",
+	"msgfolderroot",
+	"outbox",
+	"recoverableitemsdeletions",
+	"scheduled",
+	"searchfolders",
+	"sentitems",
+	"serverfailures",
+	"syncissues",
+] as const;
+
+/** The one property mx writes on a folder it creates or renames. */
+const FolderName = Schema.Struct({ displayName: Schema.String });
+
 export const FolderPage = Schema.Struct({
 	"@odata.nextLink": Schema.optionalKey(Schema.String),
 	value: Schema.Array(Folder),
@@ -181,6 +208,38 @@ export const mail = HttpApiGroup.make("mail")
 		HttpApiEndpoint.get("folder", "/me/mailFolders/:id", {
 			params,
 			success: Folder,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("createFolder", "/me/mailFolders", {
+			payload: FolderName,
+			success: Folder.pipe(HttpApiSchema.status(201)),
+		})
+	)
+	.add(
+		HttpApiEndpoint.post(
+			"createChildFolder",
+			"/me/mailFolders/:id/childFolders",
+			{
+				params,
+				payload: FolderName,
+				success: Folder.pipe(HttpApiSchema.status(201)),
+			}
+		)
+	)
+	.add(
+		HttpApiEndpoint.patch("renameFolder", "/me/mailFolders/:id", {
+			params,
+			payload: FolderName,
+			success: Folder,
+		})
+	)
+	.add(
+		HttpApiEndpoint.post("moveFolder", "/me/mailFolders/:id/move", {
+			params,
+			payload: Schema.Struct({ destinationId: Schema.String }),
+			// Graph answers a folder move with 201, although its docs say 200.
+			success: Folder.pipe(HttpApiSchema.status(201)),
 		})
 	)
 	.add(

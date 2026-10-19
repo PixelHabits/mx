@@ -232,8 +232,14 @@ export class Store extends Context.Service<
 	{
 		readonly folders: Effect.Effect<readonly StoredFolder[]>;
 		readonly hasFolder: (id: string) => Effect.Effect<boolean>;
-		/** Adds or renames one folder, below its parent when the store has the parent. Its delta link stays. */
-		readonly saveFolder: (folder: Folder, sent: boolean) => Effect.Effect<void>;
+		/**
+		 * Adds, renames or moves one folder, below its parent when the store has the parent, and the folders inside it
+		 * with it. Its delta link stays. Answers the path it saved.
+		 */
+		readonly saveFolder: (
+			folder: Folder,
+			sent: boolean
+		) => Effect.Effect<string>;
 		/** Replaces the folder list; a folder no longer listed leaves with its messages. Delta links stay. */
 		readonly saveFolders: (
 			folders: readonly Folder[],
@@ -375,23 +381,39 @@ export class Store extends Context.Service<
 					sql`SELECT id FROM folders WHERE id = ${id}`
 				).pipe(Effect.map(Arr.isReadonlyArrayNonEmpty));
 
-			const saveFolder = Effect.fnUntraced(function* (
-				folder: Folder,
-				sent: boolean
-			) {
-				const parent = yield* all(
-					Schema.Struct({ path: Schema.String }),
-					sql`SELECT path FROM folders WHERE id = ${folder.parentFolderId}`
+			const storedPath = (id: string) =>
+				Effect.map(
+					all(
+						Schema.Struct({ path: Schema.String }),
+						sql`SELECT path FROM folders WHERE id = ${id}`
+					),
+					(rows) => Option.map(Arr.head(rows), ({ path }) => path)
 				);
-				yield* upsertFolder(
-					folder,
-					Option.match(Arr.head(parent), {
-						onNone: () => folder.displayName,
-						onSome: (row) => `${row.path}/${folder.displayName}`,
-					}),
-					sent
+
+			const saveFolder = (folder: Folder, sent: boolean) =>
+				transaction(
+					Effect.gen(function* () {
+						const before = yield* storedPath(folder.id);
+						const saved = Option.match(
+							yield* storedPath(folder.parentFolderId),
+							{
+								onNone: () => folder.displayName,
+								onSome: (parent) => `${parent}/${folder.displayName}`,
+							}
+						);
+						yield* upsertFolder(folder, saved, sent);
+						if (Option.isSome(before)) {
+							yield* run(
+								sql`WITH RECURSIVE inside (id) AS (
+									SELECT id FROM folders WHERE parent_id = ${folder.id}
+									UNION SELECT f.id FROM folders f JOIN inside i ON f.parent_id = i.id
+								)
+								UPDATE folders SET path = ${saved} || substr(path, length(${before.value}) + 1) WHERE id IN (SELECT id FROM inside)`
+							);
+						}
+						return saved;
+					})
 				);
-			});
 
 			const saveFolders = Effect.fnUntraced(function* (
 				listed: readonly Folder[],

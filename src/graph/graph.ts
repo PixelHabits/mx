@@ -47,6 +47,12 @@ export const isNotFound = (error: {
 	readonly _tag: string;
 }): error is GraphRefused => isGraphRefused(error) && error.status === 404;
 
+/** Graph's refusal when the folder that would hold a new, renamed or moved folder already holds one of its name. */
+export const isFolderExists = (error: {
+	readonly _tag: string;
+}): error is GraphRefused =>
+	isGraphRefused(error) && error.code === "ErrorFolderExists";
+
 const graphBase = "https://graph.microsoft.com/v1.0";
 
 /** Plain-text bodies, and message ids that survive a move within the mailbox. */
@@ -209,6 +215,23 @@ export class Graph extends Context.Service<
 		/** Every mail folder, each parent before its children. */
 		readonly folders: Effect.Effect<readonly Folder[], GraphError>;
 		readonly folder: (idOrName: string) => Effect.Effect<Folder, GraphError>;
+		/** Creates a folder named `name` below the folder `parentId`, or at the top of the mailbox. */
+		readonly createFolder: (
+			parentId: Option.Option<string>,
+			name: string
+		) => Effect.Effect<Folder, GraphError>;
+		readonly renameFolder: (
+			id: string,
+			name: string
+		) => Effect.Effect<Folder, GraphError>;
+		/**
+		 * Moves the folder, with the folders and messages in it, below a folder id or a well-known folder name such as
+		 * `deleteditems`.
+		 */
+		readonly moveFolder: (
+			id: string,
+			destination: string
+		) => Effect.Effect<Folder, GraphError>;
 		/** The ids of every message in the folder. */
 		readonly messageIds: (
 			folderId: string
@@ -370,6 +393,41 @@ export class Graph extends Context.Service<
 
 			const folder = Effect.fn("Graph.folder")((idOrName: string) =>
 				settle(mail.folder({ params: { id: idOrName } }))
+			);
+
+			const createFolder = Effect.fn("Graph.createFolder")(
+				(parentId: Option.Option<string>, name: string) =>
+					settle(
+						Option.match(parentId, {
+							onNone: () =>
+								mail.createFolder({ payload: { displayName: name } }),
+							onSome: (id) =>
+								mail.createChildFolder({
+									params: { id },
+									payload: { displayName: name },
+								}),
+						})
+					)
+			);
+
+			const renameFolder = Effect.fn("Graph.renameFolder")(
+				(id: string, name: string) =>
+					settle(
+						mail.renameFolder({
+							params: { id },
+							payload: { displayName: name },
+						})
+					)
+			);
+
+			const moveFolder = Effect.fn("Graph.moveFolder")(
+				(id: string, destination: string) =>
+					settle(
+						mail.moveFolder({
+							params: { id },
+							payload: { destinationId: destination },
+						})
+					)
 			);
 
 			const messageIds = Effect.fn("Graph.messageIds")(function* (
@@ -596,6 +654,7 @@ export class Graph extends Context.Service<
 				attachmentContent,
 				attachments,
 				body,
+				createFolder,
 				delta,
 				draft,
 				folder,
@@ -603,7 +662,9 @@ export class Graph extends Context.Service<
 				message: Effect.fn("Graph.message")(message),
 				messageIds,
 				move,
+				moveFolder,
 				reauthorize,
+				renameFolder,
 				renew,
 				send,
 				sendDraft,
