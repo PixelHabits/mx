@@ -17,8 +17,16 @@ import { PushUnavailable } from "../errors.ts";
 import { policy } from "../http-policy.ts";
 import { Paths } from "../paths.ts";
 
-/** The cloudflared release mx downloads when neither `MX_CLOUDFLARED` nor PATH names one. */
-const version = "2026.10.1";
+/** The cloudflared release mx downloads when `MX_CLOUDFLARED` is unset and PATH holds none at or above `floor`. */
+const version = "2026.10.3";
+
+/** The first cloudflared release that rejects the compromised eMudhra intermediate certificates. */
+const floor = "2026.10.2";
+
+const meetsFloor = (found: string) => Bun.semver.satisfies(found, `>=${floor}`);
+
+/** What `cloudflared --version` prints, as `cloudflared version 2026.10.2 (built 20261020-21:50:43)`. */
+const versionLine = /^cloudflared version (\S+)/u;
 
 /**
  * Each pinned asset's sha256, computed from the official GitHub release. The release ships the binary itself, or for
@@ -36,22 +44,22 @@ const releases: Partial<
 > = {
 	"darwin-arm64": {
 		format: "tarball",
-		sha256: "647615df99d49cd179ea5e13ef760b9bbfb33630f6ae62f87e33dfadda60adcc",
+		sha256: "1165d14b6f6360a3b8c283d7d1100024d6ec7cd9bc9e32519e96150645f3ec55",
 		url: `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-darwin-arm64.tgz`,
 	},
 	"darwin-x64": {
 		format: "tarball",
-		sha256: "3b0dbaf378337e9d7fb6cd235a76d1d6a7dee434c2d8edf9281164fb6a3837ab",
+		sha256: "81b7b85f2376815c4f59b1aa323887b62e16ce8b67555c2e1577dc23f2a82000",
 		url: `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-darwin-amd64.tgz`,
 	},
 	"linux-x64": {
 		format: "binary",
-		sha256: "3bfc539f45d2620c71debb7a86be0efa737ed5ccbad9eb85c787116900e5c586",
+		sha256: "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0",
 		url: `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-amd64`,
 	},
 	"win32-x64": {
 		format: "binary",
-		sha256: "4d2490e74082c5d48dbfedaf92576fa5bd1702379ab88eb7faa0cfbe8dc891b6",
+		sha256: "76b2805253d0d6ffacb092a7acfbee99e7af6917835c0c5410e23f3ef5052da2",
 		url: `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-windows-amd64.exe`,
 	},
 };
@@ -103,8 +111,10 @@ export interface Tunnel {
 }
 
 /**
- * Cloudflare quick tunnels through cloudflared. mx runs the binary `MX_CLOUDFLARED` names, else the one on PATH, else
- * the pinned release it downloads once into its data folder and checks against its sha256.
+ * Cloudflare quick tunnels through cloudflared, at `floor` or newer. mx runs the binary `MX_CLOUDFLARED` names, and
+ * push is unavailable when that one reports an older version or none. Without it, mx runs the one on PATH when that one
+ * reports `floor` or newer, else the pinned release it downloads once into its data folder and checks against its
+ * sha256.
  */
 export class Cloudflared extends Context.Service<
 	Cloudflared,
@@ -175,16 +185,48 @@ export class Cloudflared extends Context.Service<
 				)
 			);
 
+			/** The version a cloudflared mx did not download reports, unless it reports none mx can read. */
+			const reportedVersion = (binary: string) =>
+				spawner
+					.string(
+						ChildProcess.make(binary, ["--version"], {
+							stderr: "ignore",
+							stdin: "ignore",
+						})
+					)
+					.pipe(
+						Effect.map((output) =>
+							Option.fromNullishOr(versionLine.exec(output)?.[1])
+						),
+						Effect.catchTag("PlatformError", () => Effect.succeedNone)
+					);
+
 			const executable = Effect.gen(function* () {
 				if (Option.isSome(override)) {
-					return (yield* fs.exists(override.value))
-						? override.value
-						: yield* unavailable(
-								`MX_CLOUDFLARED names ${override.value}, which does not exist.`
-							);
+					const binary = override.value;
+					if (!(yield* fs.exists(binary))) {
+						return yield* unavailable(
+							`MX_CLOUDFLARED names ${binary}, which does not exist.`
+						);
+					}
+					const found = yield* reportedVersion(binary);
+					if (Option.isNone(found)) {
+						return yield* unavailable(
+							`MX_CLOUDFLARED names ${binary}, whose version mx could not read; mx runs only cloudflared ${floor} or newer.`
+						);
+					}
+					if (!meetsFloor(found.value)) {
+						return yield* unavailable(
+							`MX_CLOUDFLARED names ${binary}, which is cloudflared ${found.value}; mx runs only ${floor} or newer.`
+						);
+					}
+					return binary;
 				}
 				const onPath = Bun.which("cloudflared", { PATH: searchPath });
-				if (onPath !== null) {
+				if (
+					onPath !== null &&
+					Option.exists(yield* reportedVersion(onPath), meetsFloor)
+				) {
 					return onPath;
 				}
 				return (yield* fs.exists(managed)) ? managed : yield* download;
