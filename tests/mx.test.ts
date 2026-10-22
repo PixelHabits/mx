@@ -2687,9 +2687,9 @@ describe("mx", () => {
 				message: lunch,
 			});
 			expect(reply).toMatch(replyDraftLine);
-			expect(graphRequests("/createReply")[0]?.body).toBe(
-				'{"comment":"Friday works for me."}'
-			);
+			expect(
+				yield* parseJson(graphRequests("/createReply")[0]?.body ?? "")
+			).toEqual({ comment: "<p>Friday works for me.</p>\n" });
 			expect(
 				yield* tool("message", { full: true, id: idOf(reply, "Drafts") })
 			).toContain("Lunch on Friday?");
@@ -2742,6 +2742,46 @@ describe("mx", () => {
 			expect((yield* call("draft", { kind: "reply" })).text).toContain(
 				"needs message"
 			);
+		}));
+
+	test("draft writes a Markdown body to Graph as HTML, and update_draft with format html writes the HTML as given", () =>
+		Effect.gen(function* () {
+			const created = yield* tool("draft", {
+				body: "Plan for the picnic:\n\n1. **Catering** is booked\n2. Tents arrive at noon\n\n| Item | Cost |\n| --- | --- |\n| Tents | 400 |\n\nMap at https://example.test/picnic\n\nThanks,\\\nBob",
+				kind: "new",
+				subject: "Picnic plan",
+				to: ["alice@example.test"],
+			});
+			const { body } = yield* Schema.decodeUnknownEffect(
+				Schema.fromJsonString(
+					Schema.Struct({
+						body: Schema.Struct({
+							content: Schema.String,
+							contentType: Schema.String,
+						}),
+					})
+				)
+			)(graphRequests("/me/messages").at(-1)?.body).pipe(Effect.orDie);
+			expect(body.contentType).toBe("html");
+			expect(body.content).toContain("<ol>");
+			expect(body.content).toContain("<strong>Catering</strong>");
+			expect(body.content).toContain("<table>");
+			expect(body.content).toContain('<a href="https://example.test/picnic">');
+			expect(body.content).toContain("Thanks,<br />");
+
+			const html = '<p style="font-family: Georgia">See you there.</p>';
+			yield* tool("update_draft", {
+				body: html,
+				format: "html",
+				id: idOf(created, "Picnic plan"),
+			});
+			const patches = Arr.filter(
+				microsoft.graphRequests(),
+				(request) => request.method === "PATCH"
+			);
+			expect(yield* parseJson(patches.at(-1)?.body ?? "")).toEqual({
+				body: { content: html, contentType: "html" },
+			});
 		}));
 
 	test("update_draft replaces recipients, subject and body and adds files; it and delete_draft refuse a message that is not a draft", () =>
@@ -2863,10 +2903,12 @@ describe("mx", () => {
 					message: budget,
 				})
 			).toBe(`Sent the reply to #${budget}.`);
-			expect(graphRequests("/reply")[0]?.body).toBe('{"comment":"Approved."}');
+			expect(yield* parseJson(graphRequests("/reply")[0]?.body ?? "")).toEqual({
+				comment: "<p>Approved.</p>\n",
+			});
 			expect(
 				Arr.map(microsoft.inFolder("folder-sent"), (sent) => sent.uniqueBody)
-			).toContain("Approved.");
+			).toContain("<p>Approved.</p>\n");
 
 			const fs = yield* FileSystem.FileSystem;
 			const file = `${home}/report.txt`;
