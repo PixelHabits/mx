@@ -151,9 +151,10 @@ export type Attachment = typeof Attachment.Type;
 /** A write's answer; mx reads the message back with `messageSelect`, since a write answers without `uniqueBody`. */
 const Written = Schema.Struct({ id: Schema.String });
 
+/** A body mx writes: HTML, since Outlook keeps a plain-text draft in plain text, where the user cannot format it. */
 const Body = Schema.Struct({
 	content: Schema.String,
-	contentType: Schema.Literal("text"),
+	contentType: Schema.Literal("html"),
 });
 
 const params = { id: Schema.String };
@@ -167,7 +168,7 @@ const NewMessage = Schema.Struct({
 	toRecipients: Schema.Array(Recipient),
 });
 
-/** The body of a reply, reply-all or forward: the new text above the quoted message, and any properties to change. */
+/** The body of a reply, reply-all or forward: the new HTML above the quoted message, and any properties to change. */
 const Reaction = Schema.Struct({
 	comment: Schema.String,
 	message: Schema.optionalKey(
