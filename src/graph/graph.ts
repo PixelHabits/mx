@@ -166,12 +166,12 @@ const recipients = (addresses: readonly string[]): readonly Recipient[] =>
 export interface Fields {
 	readonly bcc?: readonly string[] | undefined;
 	readonly cc?: readonly string[] | undefined;
+	readonly html?: string | undefined;
 	readonly subject?: string | undefined;
-	readonly text?: string | undefined;
 	readonly to?: readonly string[] | undefined;
 }
 
-/** A message to draft or send: a new one, or a reply, reply-all or forward of message `id` that quotes it below `text`. */
+/** A message to draft or send: a new one, or a reply, reply-all or forward of message `id` that quotes it below `html`. */
 export type Compose = Fields &
 	(
 		| { readonly kind: "new" }
@@ -183,14 +183,14 @@ export type Compose = Fields &
 
 const newMessage = (fields: Fields) => ({
 	bccRecipients: recipients(fields.bcc ?? []),
-	body: { content: fields.text ?? "", contentType: "text" as const },
+	body: { content: fields.html ?? "", contentType: "html" as const },
 	ccRecipients: recipients(fields.cc ?? []),
 	subject: fields.subject ?? "",
 	toRecipients: recipients(fields.to ?? []),
 });
 
-const reaction = ({ bcc, cc, subject, text, to }: Fields): Reaction => ({
-	comment: text ?? "",
+const reaction = ({ bcc, cc, html, subject, to }: Fields): Reaction => ({
+	comment: html ?? "",
 	...(Arr.every([to, cc, bcc, subject], (field) => field === undefined)
 		? {}
 		: {
@@ -204,10 +204,10 @@ const reaction = ({ bcc, cc, subject, text, to }: Fields): Reaction => ({
 });
 
 /**
- * Microsoft Graph for the signed-in mailbox. Every request asks for text bodies and immutable ids. Reads retry
- * transient failures and writes retry only Graph's 429, each waiting at least as long as `Retry-After` asks; the
- * policy in `http-policy.ts` owns both. A write answers no more than the id of the message it wrote: Graph answers a
- * write without `uniqueBody`, so `message` reads the message back where a caller needs it.
+ * Microsoft Graph for the signed-in mailbox. Every request asks for text bodies and immutable ids, and every body mx
+ * writes is HTML. Reads retry transient failures and writes retry only Graph's 429, each waiting at least as long as
+ * `Retry-After` asks; the policy in `http-policy.ts` owns both. A write answers no more than the id of the message it
+ * wrote: Graph answers a write without `uniqueBody`, so `message` reads the message back where a caller needs it.
  */
 export class Graph extends Context.Service<
 	Graph,
@@ -258,9 +258,9 @@ export class Graph extends Context.Service<
 				readonly cc?: readonly string[];
 				readonly categories?: readonly string[];
 				readonly flag?: FlagStatus;
+				readonly html?: string;
 				readonly isRead?: boolean;
 				readonly subject?: string;
-				readonly text?: string;
 				readonly to?: readonly string[];
 			}
 		) => Effect.Effect<void, GraphError>;
@@ -271,7 +271,7 @@ export class Graph extends Context.Service<
 		) => Effect.Effect<string, GraphError>;
 		/**
 		 * Creates a draft in Drafts and answers its id; a reply, reply-all or forward quotes the conversation below its
-		 * text.
+		 * `html`.
 		 */
 		readonly draft: (compose: Compose) => Effect.Effect<string, GraphError>;
 		/** Sends at once through `sendMail`, or the reply, reply-all or forward action, which quotes as a draft does. */
@@ -504,9 +504,9 @@ export class Graph extends Context.Service<
 								...(patch.subject === undefined
 									? {}
 									: { subject: patch.subject }),
-								...(patch.text === undefined
+								...(patch.html === undefined
 									? {}
-									: { body: { content: patch.text, contentType: "text" } }),
+									: { body: { content: patch.html, contentType: "html" } }),
 								...(patch.to === undefined
 									? {}
 									: { toRecipients: recipients(patch.to) }),

@@ -79,6 +79,25 @@ const Files = Schema.Array(Schema.String).annotate({
 	description: "Paths of local files to attach.",
 });
 
+const Format = Schema.Literals(["markdown", "html"]).annotate({
+	description:
+		"How body is written: markdown unless given, or html for formatting Markdown has no syntax for, such as a font, colour or size the user asks for.",
+});
+
+/** The body as the HTML Graph takes: Markdown rendered, or HTML as given. */
+const bodyHtml = ({
+	body,
+	format,
+}: {
+	readonly body?: string;
+	readonly format?: typeof Format.Type;
+}) => {
+	if (body === undefined || format === "html") {
+		return body;
+	}
+	return Bun.markdown.html(body, { autolinks: true });
+};
+
 /** The fields that make a message, shared by `draft` and an inline `send`. */
 const composeFields = {
 	attach: Schema.optionalKey(Files),
@@ -86,10 +105,11 @@ const composeFields = {
 	body: Schema.optionalKey(
 		Schema.String.annotate({
 			description:
-				"Plain text. A reply or forward puts it above the quoted conversation.",
+				"Markdown, or HTML when format is html. Leave a blank line between paragraphs, and end a line with a backslash to start a new line inside a paragraph, as in a sign-off. A reply or forward puts it above the quoted conversation.",
 		})
 	),
 	cc: Schema.optionalKey(Addresses),
+	format: Schema.optionalKey(Format),
 	kind: Schema.Literals(["new", "reply", "reply_all", "forward"]).annotate({
 		description:
 			"new, or reply, reply_all or forward, which quote the conversation of message.",
@@ -259,8 +279,14 @@ const updateDraft = Tool.make("update_draft", {
 	parameters: Schema.Struct({
 		attach: Schema.optionalKey(Files),
 		bcc: Schema.optionalKey(Addresses),
-		body: Schema.optionalKey(Schema.String),
+		body: Schema.optionalKey(
+			Schema.String.annotate({
+				description:
+					"Markdown, or HTML when format is html. Leave a blank line between paragraphs, and end a line with a backslash to start a new line inside a paragraph, as in a sign-off.",
+			})
+		),
 		cc: Schema.optionalKey(Addresses),
+		format: Schema.optionalKey(Format),
 		id: Id,
 		subject: Schema.optionalKey(Schema.String),
 		to: Schema.optionalKey(Addresses),
@@ -279,7 +305,7 @@ const deleteDraft = Tool.make("delete_draft", {
 
 const send = Tool.make("send", {
 	description:
-		"Sends mail. Either send a draft with { draft, to, cc, bcc, subject }, where to, cc, bcc and subject repeat the draft's current values, an empty list where it has none; recipients may differ in order and case, and any other mismatch sends nothing. Or send a message at once with the fields of draft: kind, message, to, cc, bcc, subject, body and attach.",
+		"Sends mail. Either send a draft with { draft, to, cc, bcc, subject }, where to, cc, bcc and subject repeat the draft's current values, an empty list where it has none; recipients may differ in order and case, and any other mismatch sends nothing. Or send a message at once with the fields of draft: kind, message, to, cc, bcc, subject, body, format and attach.",
 	parameters: Schema.Struct({
 		...composeFields,
 		draft: Schema.optionalKey(
@@ -901,8 +927,8 @@ export const tools = Layer.effectDiscard(
 			const fields = {
 				bcc: input.bcc,
 				cc: input.cc,
+				html: bodyHtml(input),
 				subject: input.subject,
-				text: input.body,
 				to: input.to,
 			};
 			if (input.kind === "new") {
@@ -1082,28 +1108,30 @@ export const tools = Layer.effectDiscard(
 			Effect.flatMap(drafted(input), savedLine)
 		);
 
-		yield* register(updateDraft, ({ attach, bcc, body, cc, id, subject, to }) =>
-			onDraft(id, (current) =>
-				Effect.gen(function* () {
-					const files = yield* readFiles(attach ?? []);
-					if (
-						Arr.some(
-							[bcc, body, cc, subject, to],
-							(field) => field !== undefined
-						)
-					) {
-						yield* graph.update(current.id, {
-							bcc,
-							cc,
-							subject,
-							text: body,
-							to,
-						});
-					}
-					yield* attachFiles(current.id, files);
-					return current.id;
-				})
-			).pipe(Effect.flatMap(savedLine))
+		yield* register(
+			updateDraft,
+			({ attach, bcc, body, cc, format, id, subject, to }) =>
+				onDraft(id, (current) =>
+					Effect.gen(function* () {
+						const files = yield* readFiles(attach ?? []);
+						if (
+							Arr.some(
+								[bcc, body, cc, subject, to],
+								(field) => field !== undefined
+							)
+						) {
+							yield* graph.update(current.id, {
+								bcc,
+								cc,
+								html: bodyHtml({ body, format }),
+								subject,
+								to,
+							});
+						}
+						yield* attachFiles(current.id, files);
+						return current.id;
+					})
+				).pipe(Effect.flatMap(savedLine))
 		);
 
 		yield* register(deleteDraft, ({ id }) =>
