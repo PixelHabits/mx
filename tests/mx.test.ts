@@ -125,8 +125,9 @@ const clientId = "11111111-2222-4333-8444-555555555555";
 const otherClientId = "66666666-7777-4888-9999-000000000000";
 const tenant = "contoso.com";
 
-/** The cloudflared `MX_CLOUDFLARED` names; the fake processes run it as a quick tunnel. */
+/** The cloudflared `MX_CLOUDFLARED` names; the fake processes run it as a quick tunnel, and it reports 2026.10.3. */
 const cloudflared = join(home, "bin", "cloudflared");
+processes.versions.set(cloudflared, "2026.10.3");
 
 /** The environment of an mx process: its folders under the test home, cloudflared, a client id and a tenant. */
 const environment = {
@@ -873,6 +874,39 @@ command = "other"
 
 /** `mx sync` running as the service does, from the first push test to the last. */
 const services: Fiber.Fiber<unknown, unknown>[] = [];
+
+/** The cloudflared binaries that opened a quick tunnel after the first `before` commands. */
+const tunnelsSince = (before: number) =>
+	Arr.map(
+		Arr.filter(
+			processes.commands.slice(before),
+			([, subcommand]) => subcommand === "tunnel"
+		),
+		([program]) => program
+	);
+
+const cloudflaredName = windows ? "cloudflared.exe" : "cloudflared";
+
+/** A cloudflared on PATH that reports `version`, and mx on a machine that has it there and no `MX_CLOUDFLARED`. */
+const onPathReporting = (version: string) =>
+	Effect.gen(function* () {
+		const fs = yield* FileSystem.FileSystem;
+		const folder = join(home, `path-${version}`);
+		const binary = join(folder, cloudflaredName);
+		yield* fs.makeDirectory(folder, { recursive: true });
+		yield* fs.writeFileString(binary, "");
+		yield* fs.chmod(binary, 0o755);
+		processes.versions.set(binary, version);
+		return {
+			binary,
+			cli: cliOn(
+				platformWith({
+					...Rec.remove(environment, "MX_CLOUDFLARED"),
+					PATH: folder,
+				})
+			),
+		};
+	});
 
 /** The refresh token Microsoft issued `back` tokens ago, 1 for the newest. */
 const issued = (back: number) => microsoft.refreshTokens.at(-back) ?? "none";
@@ -3376,7 +3410,8 @@ describe("mx", () => {
 			expect(
 				Arr.findFirst(
 					processes.commands,
-					([command]) => command === cloudflared
+					([command, subcommand]) =>
+						command === cloudflared && subcommand === "tunnel"
 				)
 			).toEqual(
 				Option.some([
@@ -3503,6 +3538,71 @@ describe("mx", () => {
 				)
 			).toEqual(["https://hooks.example.test/mail"]);
 		}));
+
+	test("mx sync does not run a cloudflared on PATH older than 2026.10.2, and runs the pinned release in its data folder instead", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const old = yield* onPathReporting("2026.10.1");
+			const pinned = join(
+				dataFolder,
+				"cloudflared",
+				"2026.10.3",
+				cloudflaredName
+			);
+			yield* fs.makeDirectory(dirname(pinned), { recursive: true });
+			yield* fs.writeFileString(pinned, "");
+			const before = processes.commands.length;
+			const service = yield* Effect.forkChild(old.cli("sync"));
+			yield* eventually(
+				"a quick tunnel",
+				() => tunnelsSince(before).length > 0
+			);
+			yield* Fiber.interrupt(service);
+			expect(tunnelsSince(before)).toEqual([pinned]);
+		}));
+
+	test("mx sync runs a cloudflared on PATH that reports 2026.10.2", () =>
+		Effect.gen(function* () {
+			const current = yield* onPathReporting("2026.10.2");
+			const before = processes.commands.length;
+			const service = yield* Effect.forkChild(current.cli("sync"));
+			yield* eventually(
+				"a quick tunnel",
+				() => tunnelsSince(before).length > 0
+			);
+			yield* Fiber.interrupt(service);
+			expect(tunnelsSince(before)).toEqual([current.binary]);
+		}));
+
+	test("when MX_CLOUDFLARED names a cloudflared older than 2026.10.2, push is unavailable, and mx sync logs the version it found and the one it needs", () =>
+		Effect.gen(function* () {
+			processes.versions.set(cloudflared, "2026.10.1");
+			const before = processes.commands.length;
+			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"push unavailable in the log",
+				Effect.map(
+					loggedRows("--sync", "--limit", "100"),
+					Arr.some((row) => {
+						const { kind, message } = row as { kind: string; message: string };
+						return (
+							kind === "sync" &&
+							message.startsWith(
+								`Push is unavailable: MX_CLOUDFLARED names ${cloudflared}, which is cloudflared 2026.10.1; mx runs only 2026.10.2 or newer. `
+							)
+						);
+					})
+				)
+			);
+			yield* Fiber.interrupt(service);
+			expect(tunnelsSince(before)).toEqual([]);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					processes.versions.set(cloudflared, "2026.10.3");
+				})
+			)
+		));
 
 	test("without cloudflared, mx sync polls every folder every 60 seconds", () =>
 		Effect.gen(function* () {
