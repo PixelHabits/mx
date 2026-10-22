@@ -56,8 +56,9 @@ const plistLabel = /([^/\\]+)\.plist$/u;
 
 /**
  * Every program mx starts, recorded and faked. `cloudflared tunnel` opens a quick tunnel on the fake internet, named
- * `tunnel-<n>.trycloudflare.com`, that runs until the scope that started it closes or `exit` ends it. The PowerShell
- * that reads the user PATH on Windows prints `userPath` as it does, and the one that writes it sets `userPath`. mxw.exe
+ * `tunnel-<n>.trycloudflare.com`, that runs until the scope that started it closes or `exit` ends it, and `cloudflared
+ * --version` prints the version `versions` holds for that binary, or nothing for one it lacks. The PowerShell that
+ * reads the user PATH on Windows prints `userPath` as it does, and the one that writes it sets `userPath`. mxw.exe
  * starts a background `mx sync` that runs on, and the PowerShell that stops mx sync ends each but the `unstoppable`
  * ones, prints the process id of each one left, and exits 1 when any is left. `launchctl` loads and unloads
  * LaunchAgents and fails as it does on macOS. A program in `missing` fails to start, as one the machine lacks does, one
@@ -76,6 +77,8 @@ export class FakeProcesses {
 	readonly hanging = new Set<string>();
 	/** The programs killed, by their index in `commands`. */
 	readonly killed = new Set<number>();
+	/** The version each cloudflared reports, by its path. */
+	readonly versions = new Map<string, string>();
 	/** The `Path` value under `HKCU\Environment`. */
 	userPath = "";
 	/** Runs as each program starts, for a test that checks what holds at that moment. */
@@ -181,10 +184,17 @@ export class FakeProcesses {
 		return true;
 	}
 
-	/** What the program run as `line` prints. */
-	private printed(line: string) {
+	/** What the program run as `command` prints. */
+	private printed(command: ChildProcess.StandardCommand) {
+		const line = commandLine(command);
 		const text = (output: string) =>
 			Stream.succeed(new Uint8Array(Buffer.from(output)));
+		if (command.args[0] === "--version") {
+			const version = this.versions.get(command.command);
+			return version === undefined
+				? Stream.empty
+				: text(`cloudflared version ${version} (built 20261020-21:50:43)\n`);
+		}
 		if (line === pathRead) {
 			return text(Buffer.from(this.userPath, "utf16le").toString("base64"));
 		}
@@ -236,7 +246,7 @@ export class FakeProcesses {
 		if (startsBackgroundSync(command)) {
 			this.syncs.add(this.commands.length);
 		}
-		const stdout = this.printed(line);
+		const stdout = this.printed(command);
 		return Effect.flatMap(
 			Deferred.make<ChildProcessSpawner.ExitCode>(),
 			(exit) => {
