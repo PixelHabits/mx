@@ -5,7 +5,9 @@ import {
 	FileSystem,
 	Layer,
 	Option,
+	pipe,
 	Schema,
+	String as Str,
 } from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpClient, HttpClientResponse } from "effect/http";
@@ -42,7 +44,7 @@ const pemArmor = /-----[A-Z ]+-----|\s/gu;
 
 /** The DER bytes inside a PEM block, such as a SPKI public key or a PKCS #8 private key. */
 export const pemContents = (pem: string) =>
-	Base64.decode(pem.replaceAll(pemArmor, ""));
+	Base64.decode(pipe(pem, Str.replaceAll(pemArmor, "")));
 
 const sha256Hex = /^[0-9a-f]{64}$/u;
 const semver = /^\d+\.\d+\.\d+$/u;

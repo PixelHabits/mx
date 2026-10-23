@@ -1,4 +1,4 @@
-import { Array as Arr, Record as Rec } from "effect";
+import { Array as Arr, pipe, Record as Rec, String as Str } from "effect";
 import { targets } from "../scripts/build.ts";
 
 /** mx's releases on GitHub: `releases/download/v<version>/<file>`, and `releases/latest/download/<file>`. */
@@ -6,7 +6,8 @@ export const releasesPath = "/PixelHabits/mx/releases/";
 
 /** Whether `url` asks GitHub for a file of mx's releases. */
 export const isReleaseRequest = (url: URL) =>
-	url.hostname === "github.com" && url.pathname.startsWith(releasesPath);
+	url.hostname === "github.com" &&
+	pipe(url.pathname, Str.startsWith(releasesPath));
 
 /** GitHub answers this prefix from the newest published release. */
 const latestDownload = /^latest\/download\//u;
@@ -15,7 +16,7 @@ const latestDownload = /^latest\/download\//u;
 const binaries = Rec.fromEntries(
 	Arr.map(targets, ({ outfile, platform }) => [
 		platform,
-		outfile.slice(outfile.lastIndexOf("/") + 1),
+		Arr.lastNonEmpty(pipe(outfile, Str.split("/"))),
 	])
 );
 
@@ -67,9 +68,11 @@ export class FakeReleases {
 	}
 
 	answer(url: URL) {
-		const path = url.pathname
-			.slice(releasesPath.length)
-			.replace(latestDownload, `download/${this.latest}/`);
+		const path = pipe(
+			url.pathname,
+			Str.slice(releasesPath.length),
+			Str.replace(latestDownload, `download/${this.latest}/`)
+		);
 		const file = this.files.get(path);
 		return file === undefined
 			? new Response(null, { status: 404 })

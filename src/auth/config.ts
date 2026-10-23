@@ -5,6 +5,7 @@ import {
 	FileSystem,
 	Option,
 	Schema,
+	String as Str,
 } from "effect";
 import { CliError, Flag, Prompt } from "effect/cli";
 import { CredentialFailed } from "../errors.ts";
@@ -120,7 +121,7 @@ export const clientIdFlag = Flag.String("client-id").pipe(
 			Prompt.String({
 				message: "Client id",
 				validate: (value) =>
-					Schema.decodeEffect(ClientId)(value.trim()).pipe(
+					Schema.decodeEffect(ClientId)(Str.trim(value)).pipe(
 						Effect.mapError(
 							() =>
 								"A client id is a GUID, such as 00000000-0000-0000-0000-000000000000."
@@ -144,7 +145,7 @@ export const tenantFlag = Flag.String("tenant").pipe(
 			Prompt.String({
 				message: `Tenant: a domain such as contoso.com, or a tenant id. Enter keeps ${organizations}.`,
 				validate: (value) =>
-					Schema.decodeEffect(Tenant)(value.trim() || organizations).pipe(
+					Schema.decodeEffect(Tenant)(Str.trim(value) || organizations).pipe(
 						Effect.mapError(
 							() =>
 								"A tenant is organizations, a tenant id, or a domain such as contoso.com."

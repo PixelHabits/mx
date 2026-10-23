@@ -4,6 +4,8 @@ import {
 	Duration,
 	Effect,
 	Option,
+	pipe,
+	String as Str,
 	Terminal,
 } from "effect";
 
@@ -46,8 +48,8 @@ const frames = ({
 	const envelope = color
 		? `\u001b[36m${glyphs.envelope}\u001b[39m`
 		: glyphs.envelope;
-	const sent = `${" ".repeat(sentAt)}@ ─ ─ ─ ─ ─ ─►${" ".repeat(6)}`;
-	const reply = `${" ".repeat(sentAt)}◄─ ─ ─ ─ ─ ─ @${" ".repeat(6)}`;
+	const sent = `${pipe(" ", Str.repeat(sentAt))}@ ─ ─ ─ ─ ─ ─►${pipe(" ", Str.repeat(6))}`;
+	const reply = `${pipe(" ", Str.repeat(sentAt))}◄─ ─ ─ ─ ─ ─ @${pipe(" ", Str.repeat(6))}`;
 	/** `lane` with the envelope at `at` and only the cells `keep` names. */
 	const draw = (lane: string, at: number, keep: (cell: number) => boolean) =>
 		Arr.join(
@@ -62,11 +64,11 @@ const frames = ({
 	const frame = (top: string, bottom: string) =>
 		Arr.join(
 			[
-				`  ┌───────┐${" ".repeat(laneWidth)}┌───────┐`,
-				`  │${glyphs.fall}     ${glyphs.rise}│${top}│  ${glyphs.tray.repeat(3)}  │`,
+				`  ┌───────┐${pipe(" ", Str.repeat(laneWidth))}┌───────┐`,
+				`  │${glyphs.fall}     ${glyphs.rise}│${top}│  ${pipe(glyphs.tray, Str.repeat(3))}  │`,
 				`  │  ${glyphs.fall} ${glyphs.rise}  │${bottom}│ inbox │`,
-				`  └───────┘${" ".repeat(laneWidth)}└───────┘`,
-				`${" ".repeat(22)}${color ? "\u001b[1mmx\u001b[22m" : "mx"}`,
+				`  └───────┘${pipe(" ", Str.repeat(laneWidth))}└───────┘`,
+				`${pipe(" ", Str.repeat(22))}${color ? "\u001b[1mmx\u001b[22m" : "mx"}`,
 			],
 			"\n"
 		);
@@ -75,7 +77,7 @@ const frames = ({
 		...Arr.map(outward, (at) =>
 			frame(
 				draw(sent, at, (cell) => cell > sentAt && cell < at),
-				" ".repeat(laneWidth)
+				pipe(" ", Str.repeat(laneWidth))
 			)
 		),
 		...Arr.map(back, (at) =>

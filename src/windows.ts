@@ -1,5 +1,5 @@
 import { dlopen, FFIType } from "bun:ffi";
-import { Effect } from "effect";
+import { Effect, String as Str } from "effect";
 import { ChildProcess } from "effect/process";
 
 /**
@@ -66,7 +66,7 @@ export const readUserPath = powershell(
 
 /** The user's PATH that `readUserPath` printed. */
 export const userPathFrom = (output: string) =>
-	Buffer.from(output.trim(), "base64").toString("utf16le");
+	Buffer.from(Str.trim(output), "base64").toString("utf16le");
 
 /**
  * Sets the user's own PATH to `path`, as REG_EXPAND_SZ so its variables expand, and broadcasts WM_SETTINGCHANGE, so a
