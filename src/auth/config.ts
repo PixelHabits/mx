@@ -7,7 +7,7 @@ import {
 	Schema,
 	String as Str,
 } from "effect";
-import { CliError, Flag, Prompt } from "effect/cli";
+import { CliError, Flag, Prompt, TerminalCapabilities } from "effect/cli";
 import { CredentialFailed } from "../errors.ts";
 import { Paths } from "../paths.ts";
 
@@ -101,8 +101,8 @@ export const savedConfig = ConfigProvider.layerAdd(
 
 /** Asks on the terminal with `prompt`; without a terminal it fails with `refusal`. */
 const ask = (prompt: Prompt.Prompt<string>, refusal: string) =>
-	Effect.suspend(() =>
-		process.stdin.isTTY === true
+	Effect.flatMap(TerminalCapabilities.TerminalCapabilities, ({ canPrompt }) =>
+		canPrompt
 			? Effect.succeed(prompt)
 			: Effect.fail(
 					CliError.UserError.make({ cause: undefined, userMessage: refusal })
@@ -128,7 +128,7 @@ export const clientIdFlag = Flag.String("client-id").pipe(
 						)
 					),
 			}),
-			"There is no terminal to ask for the client id. Run mx login --client-id <client id>."
+			"mx can't ask for the client id here. Run mx login --client-id <client id>."
 		)
 	)
 );
@@ -152,7 +152,7 @@ export const tenantFlag = Flag.String("tenant").pipe(
 						)
 					),
 			}),
-			"There is no terminal to ask for the tenant. Run mx login --tenant <tenant>."
+			"mx can't ask for the tenant here. Run mx login --tenant <tenant>."
 		)
 	)
 );

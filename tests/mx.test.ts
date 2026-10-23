@@ -28,7 +28,7 @@ import {
 	String as Str,
 	Terminal,
 } from "effect";
-import { Command } from "effect/cli";
+import { Command, TerminalCapabilities } from "effect/cli";
 import type { ChildProcess } from "effect/process";
 import { SqlClient } from "effect/sql";
 import { TestClock, TestConsole } from "effect/testing";
@@ -160,25 +160,24 @@ const unconfiguredEnvironment = Rec.remove(
 
 /**
  * What every mx process runs on: Microsoft and the internet, Bun with faked child processes, a console that keeps its
- * lines, and Config over `env` and the saved config.json, as `src/main.ts` sets it up.
+ * lines, Config over `env` and the saved config.json, and the terminal's capabilities from `env` and the TTY state of
+ * stdin and stdout, as `src/main.ts` sets it up.
  */
-const platformWith = (env: Record<string, string>) =>
-	Layer.mergeAll(
+const platformWith = (env: Record<string, string>) => {
+	const bunWithEnv = Layer.merge(
+		BunServices.layer,
+		ConfigProvider.layer(ConfigProvider.fromUnknown(env))
+	);
+	return Layer.mergeAll(
 		microsoft.layer,
 		BunServices.layer,
 		processes.layer,
 		TestConsole.layer,
-		savedConfig.pipe(
-			Layer.provide(Paths.layer),
-			Layer.provide(
-				Layer.merge(
-					BunServices.layer,
-					ConfigProvider.layer(ConfigProvider.fromUnknown(env))
-				)
-			)
-		),
+		savedConfig.pipe(Layer.provide(Paths.layer), Layer.provide(bunWithEnv)),
+		TerminalCapabilities.layer.pipe(Layer.provide(bunWithEnv)),
 		Layer.succeed(Home, home)
 	);
+};
 const platform = platformWith(environment);
 
 const unconfigured = platformWith(unconfiguredEnvironment);
@@ -299,15 +298,20 @@ const withTerminalOn =
 				})
 		);
 
-/** mx asks for what a command needs only when stdin is a terminal. */
-const withStdinTerminal = withTerminalOn(process.stdin);
-/** A bare mx plays its banner only when stdout is a terminal. */
+/** A bare mx plays its banner, and progress redraws its line, only when stdout is a terminal. */
 const withStdoutTerminal = withTerminalOn(process.stdout);
-// bun test run in a terminal hands it stdin, so mx's stdin is a terminal only in a test that says so.
-Object.defineProperty(process.stdin, "isTTY", {
-	configurable: true,
-	value: false,
-});
+/** mx asks for what a command needs only when stdin and stdout are terminals. */
+const withTerminal =
+	(isTTY: boolean) =>
+	<A, E, R>(effect: Effect.Effect<A, E, R>) =>
+		effect.pipe(
+			withTerminalOn(process.stdin)(isTTY),
+			withStdoutTerminal(isTTY)
+		);
+// bun test run in a terminal hands it stdin and stdout, so mx's are terminals only in a test that says so.
+for (const stream of [process.stdin, process.stdout]) {
+	Object.defineProperty(stream, "isTTY", { configurable: true, value: false });
+}
 
 /** A key of one character types it, and a longer one, such as `return`, presses the key of that name. */
 const keyPress = (name: string): Terminal.UserInput => ({
@@ -388,7 +392,7 @@ const doubleClicked = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 			Effect.sync(() => {
 				consoleOwned = false;
 			})
-	).pipe(withStdoutTerminal(true), withStdinTerminal(true), onWindows);
+	).pipe(withTerminal(true), onWindows);
 
 /** Where the Arch package installs mx. */
 const packaged = "/usr/bin/mx";
@@ -1240,6 +1244,17 @@ describe("mx", () => {
 			expect(errors).toBe("");
 		}));
 
+	test("a bare mx on a terminal with TERM=dumb prints the help and no banner", () =>
+		Effect.gen(function* () {
+			const { frames, system } = fakeTerminal(
+				platformWith({ ...environment, TERM: "dumb" }),
+				[]
+			);
+			const { output } = yield* withStdoutTerminal(true)(runOn(system)());
+			expect(frames).toEqual([]);
+			expect(output).toContain("SUBCOMMANDS");
+		}));
+
 	test("a bare mx on a terminal plays the banner, leaves its last frame above the help and shows the cursor again", () =>
 		Effect.gen(function* () {
 			const { frames, system } = fakeTerminal(
@@ -1900,7 +1915,7 @@ describe("mx", () => {
 					const { system } = fakeTerminal(platform, ["return"]);
 					const before = processes.commands.length;
 					const { output } = yield* on(
-						withStdinTerminal(true)(cliOn(system)("login"))
+						withTerminal(true)(cliOn(system)("login"))
 					);
 					expect(lines(output).slice(0, 3)).toEqual([
 						`Your sign-in code is ${userCode}. It is on your clipboard.`,
@@ -1921,7 +1936,7 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const { system } = fakeTerminal(platform, []);
 			const before = processes.commands.length;
-			const { output } = yield* withStdinTerminal(true)(cliOn(system)("login"));
+			const { output } = yield* withTerminal(true)(cliOn(system)("login"));
 			expect(lines(output)).toContain("Signed in. The refresh token is saved.");
 			expect(
 				Arr.filter(processes.commands.slice(before), ([program = ""]) =>
@@ -1938,9 +1953,7 @@ describe("mx", () => {
 				processes.failing.add("xclip");
 				const { system } = fakeTerminal(platform, ["return"]);
 				const before = processes.commands.length;
-				const { output } = yield* withStdinTerminal(true)(
-					cliOn(system)("login")
-				);
+				const { output } = yield* withTerminal(true)(cliOn(system)("login"));
 				expect(lines(output).slice(0, 2)).toEqual([
 					`Your sign-in code is ${userCode}.`,
 					`Press Enter to open ${verificationUri} in your browser, then enter the code there.`,
@@ -1960,7 +1973,7 @@ describe("mx", () => {
 				processes.hanging.add("wl-copy");
 				const { system } = fakeTerminal(platform, ["return"]);
 				const before = processes.commands.length;
-				const { output } = yield* withStdinTerminal(true)(
+				const { output } = yield* withTerminal(true)(
 					cliOn(system)("login")
 				).pipe(onTestClock);
 				expect(processes.commands.slice(before, before + 2)).toEqual([
@@ -1983,9 +1996,7 @@ describe("mx", () => {
 			Effect.gen(function* () {
 				processes.failing.add("xdg-open");
 				const { system } = fakeTerminal(platform, ["return"]);
-				const { output } = yield* withStdinTerminal(true)(
-					cliOn(system)("login")
-				);
+				const { output } = yield* withTerminal(true)(cliOn(system)("login"));
 				expect(lines(output).slice(2, 4)).toEqual([
 					`Could not open a browser. Open ${verificationUri} yourself.`,
 					"Signed in. The refresh token is saved.",
@@ -1998,7 +2009,7 @@ describe("mx", () => {
 			const { close, reading, system } = fakeTerminal(platform, []);
 			const tokens = microsoft.refreshTokens.length;
 			const login = yield* Effect.forkChild(
-				withStdinTerminal(true)(runOn(system)("login"))
+				withTerminal(true)(runOn(system)("login"))
 			);
 			yield* eventually("mx to wait for Enter", reading);
 			yield* close;
@@ -2018,7 +2029,7 @@ describe("mx", () => {
 				"return",
 				"return",
 			]);
-			yield* withStdinTerminal(true)(cliOn(system)("login"));
+			yield* withTerminal(true)(cliOn(system)("login"));
 			const drawn = Arr.join(frames, "");
 			expect(drawn).toContain("Client id");
 			expect(drawn).toContain("Tenant");
@@ -2028,7 +2039,7 @@ describe("mx", () => {
 			});
 			expect(tokenForms().at(-1)?.get("client_id")).toBe(clientId);
 			expect(tenantsAsked().at(-1)).toBe("organizations");
-			yield* withStdinTerminal(false)(cliOn(unconfigured)("login"));
+			yield* withTerminal(false)(cliOn(unconfigured)("login"));
 			expect(tokenForms().at(-1)?.get("client_id")).toBe(clientId);
 			expect(tenantsAsked().at(-1)).toBe("organizations");
 			expect(yield* savedRefreshToken).toBe(issued(1));
@@ -4173,9 +4184,24 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
 			const before = processes.commands.length;
-			const { errors, exit } = yield* withStdinTerminal(false)(run("install"));
+			const { errors, exit } = yield* withTerminal(false)(run("install"));
 			expect(Exit.isFailure(exit)).toBe(true);
 			expect(errors).toContain(`--agent: ${offeredAgents}.`);
+			expect(processes.commands).toHaveLength(before);
+			expect(yield* fs.exists(installed)).toBe(false);
+		}));
+
+	test("mx install without --agent, with a terminal on stdin but not on stdout, asks nothing, names the agents it can set up, and changes nothing", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const before = processes.commands.length;
+			const { frames, system } = fakeTerminal(platform, ["return"]);
+			const { errors, exit } = yield* withTerminalOn(process.stdin)(true)(
+				runOn(system)("install")
+			);
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(errors).toContain(`--agent: ${offeredAgents}.`);
+			expect(frames).toEqual([]);
 			expect(processes.commands).toHaveLength(before);
 			expect(yield* fs.exists(installed)).toBe(false);
 		}));
@@ -4201,7 +4227,7 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
 			const { frames, system } = fakeTerminal(platform, ["return"]);
-			const { exit } = yield* withStdinTerminal(true)(runOn(system)("install"));
+			const { exit } = yield* withTerminal(true)(runOn(system)("install"));
 			expect(Exit.isSuccess(exit)).toBe(true);
 			const drawn = Arr.join(frames, "");
 			expect(drawn).toContain("Claude Code");
@@ -4853,9 +4879,7 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
 			const before = processes.commands.length;
-			const failure = yield* Effect.flip(
-				withStdinTerminal(false)(cli("uninstall"))
-			);
+			const failure = yield* Effect.flip(withTerminal(false)(cli("uninstall")));
 			expect(failure.message).toContain("mx uninstall --yes");
 			expect(processes.commands).toHaveLength(before);
 			expect(yield* fs.exists(installed)).toBe(true);
@@ -4868,9 +4892,7 @@ describe("mx", () => {
 			const fs = yield* FileSystem.FileSystem;
 			const before = processes.commands.length;
 			const { frames, system } = fakeTerminal(platform, ["n"]);
-			const { output } = yield* withStdinTerminal(true)(
-				cliOn(system)("uninstall")
-			);
+			const { output } = yield* withTerminal(true)(cliOn(system)("uninstall"));
 			const prompt = Arr.join(frames, "");
 			for (const path of mxFiles) {
 				expect(prompt).toContain(path);
@@ -5170,7 +5192,7 @@ describe("mx", () => {
 					USERPROFILE: root,
 				});
 				const { system: onTerminal } = fakeTerminal(system, ["return"]);
-				yield* withStdinTerminal(true)(cliOn(onTerminal)("install"));
+				yield* withTerminal(true)(cliOn(onTerminal)("install"));
 				expect(yield* readJson(storeConfig)).toEqual({
 					...settings,
 					mcpServers: {

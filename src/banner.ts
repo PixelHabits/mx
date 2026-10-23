@@ -1,13 +1,12 @@
 import {
 	Array as Arr,
-	Config,
 	Duration,
 	Effect,
-	Option,
 	pipe,
 	String as Str,
 	Terminal,
 } from "effect";
+import { TerminalCapabilities } from "effect/cli";
 
 /** The pause between frames: 15 frames play in about a second. */
 const frameDelay = Duration.millis(60);
@@ -97,14 +96,18 @@ const frames = ({
 const height = 5;
 
 /**
- * Plays the banner on a terminal: each frame redraws the last one in place, the last frame stays, and the cursor shows
- * again however the banner ends. `NO_COLOR` turns the colors off.
+ * Plays the banner on a terminal that can redraw in place: each frame redraws the last one, the last frame stays, and
+ * the cursor shows again however the banner ends. Elsewhere it shows nothing. It is in color when Effect's help is.
  */
 export const banner = Effect.gen(function* () {
+	const { canAnimate, canColor } =
+		yield* TerminalCapabilities.TerminalCapabilities;
+	if (!canAnimate) {
+		return;
+	}
 	const terminal = yield* Terminal.Terminal;
-	const noColor = yield* Config.option(Config.NonEmptyString("NO_COLOR"));
 	const [first, ...rest] = frames({
-		color: Option.isNone(noColor),
+		color: canColor,
 		windows: process.platform === "win32",
 	});
 	yield* Effect.acquireUseRelease(

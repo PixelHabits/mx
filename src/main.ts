@@ -1,5 +1,6 @@
 import { BunRuntime, BunServices } from "@effect/platform-bun";
 import { Effect, Layer, Logger } from "effect";
+import { TerminalCapabilities } from "effect/cli";
 import { FetchHttpClient } from "effect/http";
 import { savedConfig } from "./auth/config.ts";
 import { run } from "./cli.ts";
@@ -10,7 +11,8 @@ import { answerQuery, queryWorker } from "./query.ts";
 const platform = Layer.mergeAll(
 	savedConfig.pipe(Layer.provide(Paths.layer)),
 	FetchHttpClient.layer,
-	Layer.succeed(Logger.LogToStderr, true)
+	Layer.succeed(Logger.LogToStderr, true),
+	TerminalCapabilities.layer
 ).pipe(Layer.provideMerge(BunServices.layer));
 
 // `mx query-worker` is the child process of the query tool, so the command line neither lists nor parses it, and it

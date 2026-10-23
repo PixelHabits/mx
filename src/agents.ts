@@ -11,7 +11,7 @@ import {
 	Schema,
 	String as Str,
 } from "effect";
-import { CliError, Flag, Prompt } from "effect/cli";
+import { CliError, Flag, Prompt, TerminalCapabilities } from "effect/cli";
 import { InstallFailed } from "./errors.ts";
 import { type Approval, recommendedApprovals } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
@@ -200,10 +200,10 @@ export const agents = Effect.gen(function* () {
 const ask = Effect.gen(function* () {
 	const fs = yield* FileSystem.FileSystem;
 	const offered = yield* agents;
-	if (process.stdin.isTTY !== true) {
+	if (!(yield* TerminalCapabilities.TerminalCapabilities).canPrompt) {
 		return yield* CliError.UserError.make({
 			cause: undefined,
-			userMessage: `There is no terminal to ask which agents to set up. Name each with --agent: ${Arr.join(
+			userMessage: `mx can't ask which agents to set up here. Name each with --agent: ${Arr.join(
 				Arr.map(offered, (agent) => agent.id),
 				", "
 			)}.`,
