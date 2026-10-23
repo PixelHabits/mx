@@ -54,10 +54,12 @@ const desktopFile = "claude_desktop_config.json";
 
 /**
  * Claude Desktop's config files, on Windows and macOS only. Anthropic documents one, in `%APPDATA%\Claude` on Windows
- * and in `~/Library/Application Support/Claude` on macOS. Claude Desktop from the Microsoft Store is a packaged app, so
- * Windows keeps a file it creates below `%APPDATA%` in `LocalCache\Roaming` of its package, `Claude_<publisher id>`,
- * and the app opens the file there before the one in `%APPDATA%`. These are each config that exists, the packaged ones
- * first, or the documented one when none does. Claude Desktop keeps tool approvals outside them, so mx sets none there.
+ * and in `~/Library/Application Support/Claude` on macOS. Claude Desktop from the Microsoft Store keeps its config in
+ * `%LOCALAPPDATA%\Claude-Data\claude_<publisher id>`. Some of its builds keep it in their package instead, in
+ * `%LOCALAPPDATA%\Packages\Claude_<publisher id>`: Windows keeps a file a packaged app creates below `%APPDATA%` in
+ * `LocalCache\Roaming` of its package, and the app opens the file there before the one in `%APPDATA%`. These are each
+ * config that exists, those in Claude-Data first, then the packaged ones, then the documented one; or the documented
+ * one when none does. Claude Desktop keeps tool approvals outside them, so mx sets none there.
  */
 const desktopConfigs = Effect.gen(function* () {
 	if (process.platform !== "win32" && process.platform !== "darwin") {
@@ -65,33 +67,35 @@ const desktopConfigs = Effect.gen(function* () {
 	}
 	const fs = yield* FileSystem.FileSystem;
 	const path = yield* Path.Path;
-	const { appPackages, config } = yield* Paths;
-	const packaged = yield* Option.match(appPackages, {
+	const { config, localAppData } = yield* Paths;
+	/** The config in each folder of `parent` whose name starts with `prefix`, at `inner` below that folder. */
+	const inFolders = (parent: string, prefix: string, inner: string[]) =>
+		Effect.gen(function* () {
+			if (!(yield* fs.exists(parent))) {
+				return [];
+			}
+			return Arr.map(
+				Arr.filter(yield* fs.readDirectory(parent), Str.startsWith(prefix)),
+				(name) => path.join(parent, name, ...inner, desktopFile)
+			);
+		});
+	const stored = yield* Option.match(localAppData, {
 		onNone: () => Effect.succeed([]),
 		onSome: (folder) =>
-			Effect.gen(function* () {
-				if (!(yield* fs.exists(folder))) {
-					return [];
-				}
-				return Arr.map(
-					Arr.filter(
-						yield* fs.readDirectory(folder),
-						Str.startsWith("Claude_")
-					),
-					(name) =>
-						path.join(
-							folder,
-							name,
-							"LocalCache",
-							"Roaming",
-							"Claude",
-							desktopFile
-						)
-				);
-			}),
+			Effect.map(
+				Effect.all([
+					inFolders(path.join(folder, "Claude-Data"), "claude_", []),
+					inFolders(path.join(folder, "Packages"), "Claude_", [
+						"LocalCache",
+						"Roaming",
+						"Claude",
+					]),
+				]),
+				Arr.flatten
+			),
 	});
 	const documented = path.join(config, "Claude", desktopFile);
-	const found = yield* Effect.filter([...packaged, documented], (file) =>
+	const found = yield* Effect.filter([...stored, documented], (file) =>
 		fs.exists(file)
 	);
 	return Option.some(Arr.isArrayNonEmpty(found) ? found : Arr.of(documented));

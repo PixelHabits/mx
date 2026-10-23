@@ -36,8 +36,8 @@ export class Paths extends Context.Service<
 		readonly packaged: boolean;
 		/** `$XDG_CONFIG_HOME`, `~/Library/Application Support` on macOS, or `%APPDATA%` on Windows, where other programs keep their settings. */
 		readonly config: string;
-		/** `%LOCALAPPDATA%\Packages` on Windows, with a folder of files for each packaged app, as one from the Microsoft Store; none elsewhere. */
-		readonly appPackages: Option.Option<string>;
+		/** `%LOCALAPPDATA%` on Windows, where other programs keep the files that stay on this machine; none elsewhere. */
+		readonly localAppData: Option.Option<string>;
 		/** The user's home folder. */
 		readonly home: string;
 	}
@@ -69,18 +69,18 @@ export class Paths extends Context.Service<
 			});
 			return Paths.of({
 				...own,
-				appPackages: Option.some(path.join(localAppData, "Packages")),
 				bin: path.join(localAppData, "Programs", "mx", "mx.exe"),
 				config: appData,
+				localAppData: Option.some(localAppData),
 				packaged: false,
 			});
 		}
 		if (process.platform === "darwin") {
 			return Paths.of({
 				...own,
-				appPackages: Option.none(),
 				bin: path.join(home, ".local", "bin", "mx"),
 				config: path.join(home, "Library", "Application Support"),
+				localAppData: Option.none(),
 				packaged: false,
 			});
 		}
@@ -90,9 +90,9 @@ export class Paths extends Context.Service<
 		const packaged = path.resolve(process.execPath) === packagedBin;
 		return Paths.of({
 			...own,
-			appPackages: Option.none(),
 			bin: packaged ? packagedBin : path.join(home, ".local", "bin", "mx"),
 			config: Option.getOrElse(shared, () => path.join(home, ".config")),
+			localAppData: Option.none(),
 			packaged,
 		});
 	});
