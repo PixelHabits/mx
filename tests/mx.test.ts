@@ -5198,6 +5198,73 @@ describe("mx", () => {
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
 		}));
 
+	test("mx uninstall that the Keychain stops at one account's sign-in, where config.json shares its folder with the mail store as on macOS, finds every other account's sign-in when the user runs it again", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const asInstalled = runningAs(installed);
+			const shared = join(home, "Library", "Application Support");
+			const oneFolder = cliOn(
+				platformWith({
+					...environment,
+					XDG_CONFIG_HOME: shared,
+					XDG_DATA_HOME: shared,
+					XDG_STATE_HOME: shared,
+				})
+			);
+			yield* oneFolder("install", "--agent", "codex");
+			secrets.machine = "keychain";
+			microsoft.signingIn = microsoft.addMailbox("pat", {
+				address: "pat@example.org",
+				name: "Pat Example",
+			});
+			yield* asInstalled(
+				oneFolder(
+					"login",
+					"--account",
+					"personal",
+					"--client-id",
+					otherClientId,
+					"--tenant",
+					"example.org"
+				)
+			);
+			yield* Effect.flip(asInstalled(oneFolder("uninstall", "--yes")));
+			secrets.entries.delete("mx/refresh-token");
+			const { output } = yield* asInstalled(oneFolder("uninstall", "--yes"));
+			expect(lines(output)).toContain("Removed the saved sign-in of personal.");
+			expect(
+				Arr.filter([...secrets.entries.keys()], Str.startsWith("mx/"))
+			).toEqual([]);
+			expect(yield* fs.exists(installed)).toBe(windows);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					secrets.machine = "store";
+					microsoft.signingIn = microsoft.mailbox;
+				})
+			)
+		));
+
+	test("mx uninstall run from the installed mx deletes the sign-in that mx saved while the program is still on disk, as the macOS Keychain requires, and removes the program last", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const asInstalled = runningAs(installed);
+			yield* cli("install", "--agent", "codex");
+			secrets.entries.delete("mx/refresh-token");
+			secrets.machine = "keychain";
+			yield* asInstalled(cli("login"));
+			yield* asInstalled(cli("uninstall", "--yes"));
+			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
+			// On Windows the installed mx.exe goes once the mx that runs it exits.
+			expect(yield* fs.exists(installed)).toBe(windows);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					secrets.machine = "store";
+				})
+			)
+		));
+
 	test(
 		"mx install from the Arch package copies no binary and writes no unit, enables the package's unit and registers /usr/bin/mx",
 		() =>

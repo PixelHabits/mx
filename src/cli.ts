@@ -618,7 +618,7 @@ const uninstall = Command.make(
 ).pipe(
 	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
 	Command.withDescription(
-		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, the installed binary, the mail store, each account's saved sign-in, the attachment cache, the state folder with the tool call log, and the accounts with their client ids and tenants. It lists them and asks first; --yes removes them without asking."
+		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, each account's saved sign-in, the mail store, the attachment cache, the state folder with the tool call log, the accounts with their client ids and tenants, and last the installed binary. It lists them and asks first; --yes removes them without asking."
 	)
 );
 

@@ -937,8 +937,10 @@ export class Installer extends Context.Service<
 			/**
 			 * Sync stops first, so nothing writes to the store as it goes. On Linux and macOS it deletes its Graph
 			 * subscriptions as it stops, while its sign-in is still saved; on Windows nothing can ask it to stop, so they stay
-			 * until they expire, on a tunnel that is gone. config.json goes last: it names the accounts, so an uninstall run
-			 * again after one that stopped partway still finds each sign-in.
+			 * until they expire, on a tunnel that is gone. The sign-ins go before mx's folders: config.json names the accounts,
+			 * and on macOS it shares its folder with the mail store, so an uninstall run again after one that stopped partway
+			 * still finds each sign-in. The program goes last: the macOS Keychain deletes a sign-in only while the program that
+			 * deletes it is on disk, and an uninstall that stops partway leaves an mx to run again.
 			 */
 			const removals = Effect.gen(function* () {
 				const registration = yield* syncAtSignIn.removals;
@@ -993,15 +995,15 @@ export class Installer extends Context.Service<
 				return Arr.flatten([
 					registration,
 					agentRemovals,
-					yield* programRemovals,
-					yield* removeStore,
 					signInRemovals,
+					yield* removeStore,
 					yield* removeFile("the attachment cache", cache),
 					yield* removeFile("the state folder with the tool call log", state),
 					yield* removeFile(
 						"the accounts with their client ids and tenants",
 						configFile
 					),
+					yield* programRemovals,
 				]);
 			}).pipe(
 				Effect.catchTags({
