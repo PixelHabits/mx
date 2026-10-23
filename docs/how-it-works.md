@@ -65,7 +65,7 @@ The saved sign-in is one record in the system's secret store, or in a file only 
 
 An absolute `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` or `XDG_CACHE_HOME` moves that folder on macOS and Windows too.
 
-On Windows, Claude Desktop from the Microsoft Store keeps its config inside its app package, in `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`. `mx install` and `mx uninstall` change that file, and also `%APPDATA%\Claude\claude_desktop_config.json` when it exists.
+On Windows, Claude Desktop from the Microsoft Store keeps its config in `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json`. Some of its builds keep it inside their app package instead, in `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`. `mx install` and `mx uninstall` change each of these files that exists, and also `%APPDATA%\Claude\claude_desktop_config.json` when it exists.
 
 On Linux the background service is the systemd user unit `mx-sync`. It writes its log lines to `log.sqlite` and to the journal. Follow them with `mx log --sync --follow` or `journalctl --user -u mx-sync -f`.
 
