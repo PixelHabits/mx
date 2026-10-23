@@ -8,6 +8,7 @@ import {
 	Ref,
 	Terminal,
 } from "effect";
+import { TerminalCapabilities } from "effect/cli";
 import { type Pass, type Progress, summary } from "./sync.ts";
 
 /** Without a terminal, a progress line at most this often. */
@@ -48,7 +49,8 @@ const show =
 		) => Effect.Effect<Pass, E>
 	) =>
 		Effect.gen(function* () {
-			const onTerminal = process.stdout.isTTY === true;
+			const { canAnimate: onTerminal } =
+				yield* TerminalCapabilities.TerminalCapabilities;
 			/** On a terminal, draws the line over the last one; elsewhere, prints it. */
 			const write = (text: string) =>
 				onTerminal
@@ -98,8 +100,8 @@ const show =
 		});
 
 /**
- * A function that runs `pass` and shows how far it has got. On a terminal one line is redrawn at each report; without
- * one a line is printed at the first report and then at most every 30 seconds. Once anything was shown, the pass's
- * summary ends it.
+ * A function that runs `pass` and shows how far it has got. On a terminal that can redraw in place one line is redrawn
+ * at each report; elsewhere a line is printed at the first report and then at most every 30 seconds. Once anything was
+ * shown, the pass's summary ends it.
  */
 export const showProgress = Effect.map(Terminal.Terminal, show);

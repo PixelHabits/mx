@@ -1,4 +1,4 @@
-import { Array as Arr } from "effect";
+import { Array as Arr, pipe, String as Str } from "effect";
 
 type Json = Record<string, unknown>;
 
@@ -180,7 +180,10 @@ export class FakeSubscriptions {
 		const response = await this.tunnels.fetch("POST", target, null);
 		const valid =
 			response.status === 200 &&
-			(response.headers.get("content-type") ?? "").startsWith("text/plain") &&
+			pipe(
+				response.headers.get("content-type") ?? "",
+				Str.startsWith("text/plain")
+			) &&
 			(await response.text()) === token;
 		if (valid) {
 			this.validated.push(url);

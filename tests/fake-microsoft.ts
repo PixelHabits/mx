@@ -1,4 +1,12 @@
-import { Array as Arr, Duration, Effect, Layer, Option } from "effect";
+import {
+	Array as Arr,
+	Duration,
+	Effect,
+	Layer,
+	Option,
+	pipe,
+	String as Str,
+} from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { FakeSubscriptions, FakeTunnels } from "./fake-push.ts";
@@ -339,9 +347,10 @@ export class FakeMicrosoft {
 	 */
 	private paced<A>(request: Request, answer: Effect.Effect<A>) {
 		const url = new URL(request.url);
-		const [, , , collection, id = "", messages, delta] = decodeURIComponent(
-			url.pathname
-		).split("/");
+		const [, , , collection, id = "", messages, delta] = pipe(
+			decodeURIComponent(url.pathname),
+			Str.split("/")
+		);
 		const read = this.heldReads.get(id);
 		if (
 			collection === "messages" &&
@@ -626,10 +635,10 @@ export class FakeMicrosoft {
 		if (this.outage > 0) {
 			return graphError(this.outage, "ServiceUnavailable", "Synthetic outage.");
 		}
-		const asText =
-			request.headers
-				.get("prefer")
-				?.includes('outlook.body-content-type="text"') ?? false;
+		const asText = pipe(
+			request.headers.get("prefer") ?? "",
+			Str.includes('outlook.body-content-type="text"')
+		);
 		return this.graph(
 			request.method,
 			url,
@@ -639,7 +648,7 @@ export class FakeMicrosoft {
 	}
 
 	private login(url: URL, form: URLSearchParams) {
-		if (url.pathname.endsWith("/oauth2/v2.0/devicecode")) {
+		if (pipe(url.pathname, Str.endsWith("/oauth2/v2.0/devicecode"))) {
 			return json({
 				device_code: "synthetic-device-code",
 				expires_in: 900,
@@ -851,8 +860,8 @@ export class FakeMicrosoft {
 		body: Json,
 		folder: "folder-drafts" | "folder-sent"
 	) {
-		const forward = action.toLowerCase().includes("forward");
-		const all = action.toLowerCase().includes("replyall");
+		const forward = pipe(action, Str.toLowerCase, Str.includes("forward"));
+		const all = pipe(action, Str.toLowerCase, Str.includes("replyall"));
 		const comment = String(body.comment ?? "");
 		const changes = (body.message ?? {}) as Json;
 		const from = Option.toArray(Option.fromNullishOr(message.from));
@@ -907,7 +916,7 @@ export class FakeMicrosoft {
 		body: Json,
 		asText: boolean
 	): Response | Promise<Response> {
-		const parts = decodeURIComponent(url.pathname).split("/");
+		const parts = pipe(decodeURIComponent(url.pathname), Str.split("/"));
 		if (parts[2] === "subscriptions") {
 			return this.subscriptions.answer(method, parts[3], parts[4], body);
 		}
@@ -1020,7 +1029,7 @@ export class FakeMicrosoft {
 			([other, folder]) =>
 				other !== id &&
 				folder.parentFolderId === parentFolderId &&
-				folder.displayName.toLowerCase() === displayName.toLowerCase()
+				Str.toLowerCase(folder.displayName) === Str.toLowerCase(displayName)
 		);
 		if (taken) {
 			return graphError(
@@ -1179,7 +1188,9 @@ export class FakeMicrosoft {
 	}
 
 	private upload(url: URL, request: Request, bytes: Uint8Array) {
-		const session = this.uploads.get(url.pathname.split("/").at(-1) ?? "");
+		const session = this.uploads.get(
+			Arr.lastNonEmpty(pipe(url.pathname, Str.split("/")))
+		);
 		if (
 			session === undefined ||
 			request.headers.get("authorization") !== null

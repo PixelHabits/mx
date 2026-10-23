@@ -12,6 +12,7 @@ import {
 	SynchronizedRef,
 	type Terminal,
 } from "effect";
+import { TerminalCapabilities } from "effect/cli";
 import { Hex } from "effect/encoding";
 import {
 	HttpClient,
@@ -393,7 +394,7 @@ export const signIn = Effect.fnUntraced(function* (
 	config: SignInConfig
 ) {
 	const { complete, url, userCode } = yield* auth.startLogin(config);
-	if (process.stdin.isTTY === true) {
+	if ((yield* TerminalCapabilities.TerminalCapabilities).canPrompt) {
 		const copied = yield* copyToClipboard(spawner, userCode);
 		yield* Console.log(
 			copied

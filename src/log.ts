@@ -12,7 +12,9 @@ import {
 	Logger,
 	LogLevel,
 	Option,
+	pipe,
 	Schema,
+	String as Str,
 } from "effect";
 import { Paths } from "./paths.ts";
 import { localTime } from "./temporal.ts";
@@ -343,7 +345,7 @@ export class Log extends Context.Service<
 
 /** Text whose every line after the first is indented by `indent`, so it reads as one block. */
 const block = (text: string, indent: string) =>
-	text.replaceAll("\n", `\n${indent}`);
+	pipe(text, Str.replaceAll("\n", `\n${indent}`));
 
 /**
  * `mx log`'s text for one entry, in the local time zone. A call is a header line, then what the agent sent and what mx
@@ -353,7 +355,7 @@ export const entryText = (entry: Logged) =>
 	Effect.gen(function* () {
 		const at = localTime(entry.at, "second");
 		if (entry.kind === "sync") {
-			return `${at} sync ${entry.level.toLowerCase()}: ${block(entry.message, "  ")}`;
+			return `${at} sync ${Str.toLowerCase(entry.level)}: ${block(entry.message, "  ")}`;
 		}
 		const agent = Option.match(entry.agent, {
 			onNone: () => "unknown agent",

@@ -8,7 +8,9 @@ import {
 	Layer,
 	Option,
 	Path,
+	pipe,
 	Schema,
+	String as Str,
 } from "effect";
 import { SqlClient, type SqlError, type Statement } from "effect/sql";
 import type { Folder, Message, Recipient } from "./graph/api.ts";
@@ -196,8 +198,8 @@ const likeWildcards = /[!%_]/gu;
 const ftsQuery = (text: string) =>
 	Arr.join(
 		Arr.map(
-			Arr.filter(text.split(whitespace), (word) => word !== ""),
-			(word) => `"${word.replaceAll('"', '""')}"`
+			Arr.filter(pipe(text, Str.split(whitespace)), (word) => word !== ""),
+			(word) => `"${pipe(word, Str.replaceAll('"', '""'))}"`
 		),
 		" "
 	);
@@ -556,7 +558,7 @@ export class Store extends Context.Service<
 				const from = Option.getOrNull(
 					Option.map(
 						filter.from,
-						(text) => `%${text.replaceAll(likeWildcards, (c) => `!${c}`)}%`
+						(text) => `%${pipe(text, Str.replaceAll(likeWildcards, "!$&"))}%`
 					)
 				);
 				const since = Option.getOrNull(

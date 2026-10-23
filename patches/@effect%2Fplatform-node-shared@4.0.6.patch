@@ -1,0 +1,16 @@
+diff --git a/dist/NodeTerminal.js b/dist/NodeTerminal.js
+index b928f4ee4b13167924ca66191f5bfb9cfc792e5b..a9606b832aa21d2f9acc68a4385ad2ece9197838 100644
+--- a/dist/NodeTerminal.js
++++ b/dist/NodeTerminal.js
+@@ -112,8 +112,10 @@ export const make = /*#__PURE__*/Effect.fnUntraced(function* (shouldQuit = defau
+     if (inputEnded) {
+       handleEnd();
+     } else {
+-      yield* RcRef.get(rlRef);
++      // Raw mode before readline reads: on Windows, Bun leaves a line-mode console read pending when raw mode comes
++      // after reading starts, and that read swallows the next Enter.
+       yield* RcRef.get(rawModeRef);
++      yield* RcRef.get(rlRef);
+       stdin.once("end", handleEnd);
+     }
+     return queue;

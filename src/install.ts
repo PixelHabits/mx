@@ -11,7 +11,9 @@ import {
 	Layer,
 	Option,
 	Path,
+	pipe,
 	Schedule,
+	String as Str,
 	Stream,
 	Terminal,
 } from "effect";
@@ -328,9 +330,9 @@ export class Installer extends Context.Service<
 					yield* fs.rename(staged, target);
 					return;
 				}
-				const old = target.replace(
-					exeSuffix,
-					`.old-${yield* randomUUIDv4()}.exe`
+				const old = pipe(
+					target,
+					Str.replace(exeSuffix, `.old-${yield* randomUUIDv4()}.exe`)
 				);
 				if (yield* fs.exists(target)) {
 					yield* fs.rename(target, old);
@@ -466,12 +468,12 @@ export class Installer extends Context.Service<
 					if (code === 0) {
 						return;
 					}
-					const running = output.trim();
+					const running = Str.trim(output);
 					return yield* InstallFailed.make({
 						message:
 							running === ""
 								? `The PowerShell that stops mx sync exited with code ${code}.`
-								: `Could not stop mx sync: mxw.exe still runs as PID ${Arr.join(running.split(whitespace), ", ")}. End it in Task Manager, then try again.`,
+								: `Could not stop mx sync: mxw.exe still runs as PID ${Arr.join(pipe(running, Str.split(whitespace)), ", ")}. End it in Task Manager, then try again.`,
 					});
 				}).pipe(
 					Effect.catchTag("PlatformError", (error) =>
@@ -643,19 +645,19 @@ export class Installer extends Context.Service<
 
 			/** Whether a PATH entry names the program folder; Windows compares paths without case. */
 			const isProgramFolder = (entry: string) =>
-				entry.replace(trailingBackslashes, "").toLowerCase() ===
-				folder.toLowerCase();
+				pipe(entry, Str.replace(trailingBackslashes, ""), Str.toLowerCase) ===
+				Str.toLowerCase(folder);
 
 			/** Puts the program folder on the user's PATH after every entry it holds, unless it is there. */
 			const addToPath = Effect.gen(function* () {
 				const current = yield* userPath;
-				if (Arr.some(current.split(";"), isProgramFolder)) {
+				if (Arr.some(pipe(current, Str.split(";")), isProgramFolder)) {
 					return;
 				}
 				yield* execute(
 					`The PowerShell that adds ${folder} to your PATH`,
 					writeUserPath(
-						current === "" || current.endsWith(";")
+						current === "" || pipe(current, Str.endsWith(";"))
 							? `${current}${folder}`
 							: `${current};${folder}`
 					)
@@ -672,7 +674,7 @@ export class Installer extends Context.Service<
 			const pathHint = Effect.gen(function* () {
 				if (
 					Arr.some(
-						searchPath.split(":"),
+						pipe(searchPath, Str.split(":")),
 						(entry) => entry !== "" && path.resolve(entry) === folder
 					)
 				) {
@@ -847,7 +849,8 @@ export class Installer extends Context.Service<
 
 			/** Whether `file` is the exe this process runs; Windows compares paths without case. */
 			const isThisExe = (file: string) =>
-				file.toLowerCase() === path.resolve(process.execPath).toLowerCase();
+				Str.toLowerCase(file) ===
+				Str.toLowerCase(path.resolve(process.execPath));
 
 			/**
 			 * The program folder on Windows, with mx.exe, mxw.exe and the copies a reinstall or an update moved aside. Windows
@@ -904,7 +907,7 @@ export class Installer extends Context.Service<
 			/** The program folder on the user's PATH, which `mx install` puts there on Windows. */
 			const removeFromPath: Removal = {
 				remove: Effect.gen(function* () {
-					const entries = (yield* userPath).split(";");
+					const entries = pipe(yield* userPath, Str.split(";"));
 					if (!Arr.some(entries, isProgramFolder)) {
 						return;
 					}
@@ -1005,14 +1008,7 @@ export class Installer extends Context.Service<
 					yield* removeStore,
 					signInRemoval,
 					yield* removeFile("the attachment cache", cache),
-					yield* removeFile(
-						onSystem({
-							darwin: "the log folder with the tool call log",
-							linux: "the state folder with the tool call log",
-							win32: "the state folder with the tool call log",
-						}),
-						state
-					),
+					yield* removeFile("the state folder with the tool call log", state),
 				]);
 			}).pipe(
 				Effect.catchTags({

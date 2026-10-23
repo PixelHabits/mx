@@ -13,7 +13,13 @@ import {
 	Stream,
 	Terminal,
 } from "effect";
-import { CliError, Command, Flag, Prompt } from "effect/cli";
+import {
+	CliError,
+	Command,
+	Flag,
+	Prompt,
+	TerminalCapabilities,
+} from "effect/cli";
 import { ChildProcessSpawner } from "effect/process";
 import packageJson from "../package.json" with { type: "json" };
 import { agentFlag } from "./agents.ts";
@@ -192,22 +198,24 @@ const install = Command.make(
 
 /** Asks on the terminal whether to remove everything in `removals`; without a terminal it fails and names `--yes`. */
 const confirmed = (removals: readonly Removal[]) =>
-	process.stdin.isTTY === true
-		? Prompt.run(
-				Prompt.Confirm({
-					message: `mx uninstall removes:\n${Arr.join(
-						Arr.map(removals, ({ what }) => `  - ${what}`),
-						"\n"
-					)}\nRemove all of this?`,
-				})
-			).pipe(Effect.catchTag("QuitError", () => Effect.succeed(false)))
-		: Effect.fail(
-				CliError.UserError.make({
-					cause: undefined,
-					userMessage:
-						"There is no terminal to confirm the uninstall. Run mx uninstall --yes to remove everything mx uninstall lists.",
-				})
-			);
+	Effect.flatMap(TerminalCapabilities.TerminalCapabilities, ({ canPrompt }) =>
+		canPrompt
+			? Prompt.run(
+					Prompt.Confirm({
+						message: `mx uninstall removes:\n${Arr.join(
+							Arr.map(removals, ({ what }) => `  - ${what}`),
+							"\n"
+						)}\nRemove all of this?`,
+					})
+				).pipe(Effect.catchTag("QuitError", () => Effect.succeed(false)))
+			: Effect.fail(
+					CliError.UserError.make({
+						cause: undefined,
+						userMessage:
+							"mx can't ask you to confirm the uninstall here. Run mx uninstall --yes to remove everything mx uninstall lists.",
+					})
+				)
+	);
 
 const uninstall = Command.make(
 	"uninstall",
@@ -403,13 +411,10 @@ const reindex = Command.make("reindex", {}, () =>
 	)
 );
 
-/**
- * A bare `mx` shows the help, as Effect's command line does for a command without a handler, after the banner when
- * stdout is a terminal.
- */
+/** A bare `mx` shows the help, as Effect's command line does for a command without a handler, after the banner. */
 export const mx = Command.make("mx", {}, () =>
 	Effect.andThen(
-		process.stdout.isTTY === true ? banner : Effect.void,
+		banner,
 		Effect.fail(CliError.ShowHelp.make({ commandPath: ["mx"], errors: [] }))
 	)
 ).pipe(

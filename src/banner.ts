@@ -1,11 +1,12 @@
 import {
 	Array as Arr,
-	Config,
 	Duration,
 	Effect,
-	Option,
+	pipe,
+	String as Str,
 	Terminal,
 } from "effect";
+import { TerminalCapabilities } from "effect/cli";
 
 /** The pause between frames: 15 frames play in about a second. */
 const frameDelay = Duration.millis(60);
@@ -46,8 +47,8 @@ const frames = ({
 	const envelope = color
 		? `\u001b[36m${glyphs.envelope}\u001b[39m`
 		: glyphs.envelope;
-	const sent = `${" ".repeat(sentAt)}@ ─ ─ ─ ─ ─ ─►${" ".repeat(6)}`;
-	const reply = `${" ".repeat(sentAt)}◄─ ─ ─ ─ ─ ─ @${" ".repeat(6)}`;
+	const sent = `${pipe(" ", Str.repeat(sentAt))}@ ─ ─ ─ ─ ─ ─►${pipe(" ", Str.repeat(6))}`;
+	const reply = `${pipe(" ", Str.repeat(sentAt))}◄─ ─ ─ ─ ─ ─ @${pipe(" ", Str.repeat(6))}`;
 	/** `lane` with the envelope at `at` and only the cells `keep` names. */
 	const draw = (lane: string, at: number, keep: (cell: number) => boolean) =>
 		Arr.join(
@@ -62,11 +63,11 @@ const frames = ({
 	const frame = (top: string, bottom: string) =>
 		Arr.join(
 			[
-				`  ┌───────┐${" ".repeat(laneWidth)}┌───────┐`,
-				`  │${glyphs.fall}     ${glyphs.rise}│${top}│  ${glyphs.tray.repeat(3)}  │`,
+				`  ┌───────┐${pipe(" ", Str.repeat(laneWidth))}┌───────┐`,
+				`  │${glyphs.fall}     ${glyphs.rise}│${top}│  ${pipe(glyphs.tray, Str.repeat(3))}  │`,
 				`  │  ${glyphs.fall} ${glyphs.rise}  │${bottom}│ inbox │`,
-				`  └───────┘${" ".repeat(laneWidth)}└───────┘`,
-				`${" ".repeat(22)}${color ? "\u001b[1mmx\u001b[22m" : "mx"}`,
+				`  └───────┘${pipe(" ", Str.repeat(laneWidth))}└───────┘`,
+				`${pipe(" ", Str.repeat(22))}${color ? "\u001b[1mmx\u001b[22m" : "mx"}`,
 			],
 			"\n"
 		);
@@ -75,7 +76,7 @@ const frames = ({
 		...Arr.map(outward, (at) =>
 			frame(
 				draw(sent, at, (cell) => cell > sentAt && cell < at),
-				" ".repeat(laneWidth)
+				pipe(" ", Str.repeat(laneWidth))
 			)
 		),
 		...Arr.map(back, (at) =>
@@ -95,14 +96,18 @@ const frames = ({
 const height = 5;
 
 /**
- * Plays the banner on a terminal: each frame redraws the last one in place, the last frame stays, and the cursor shows
- * again however the banner ends. `NO_COLOR` turns the colors off.
+ * Plays the banner on a terminal that can redraw in place: each frame redraws the last one, the last frame stays, and
+ * the cursor shows again however the banner ends. Elsewhere it shows nothing. It is in color when Effect's help is.
  */
 export const banner = Effect.gen(function* () {
+	const { canAnimate, canColor } =
+		yield* TerminalCapabilities.TerminalCapabilities;
+	if (!canAnimate) {
+		return;
+	}
 	const terminal = yield* Terminal.Terminal;
-	const noColor = yield* Config.option(Config.NonEmptyString("NO_COLOR"));
 	const [first, ...rest] = frames({
-		color: Option.isNone(noColor),
+		color: canColor,
 		windows: process.platform === "win32",
 	});
 	yield* Effect.acquireUseRelease(

@@ -58,16 +58,18 @@ The saved sign-in is one record in the system's secret store, or in a file only 
 
 | Linux | macOS | Windows | Holds |
 | --- | --- | --- | --- |
-| `$XDG_CONFIG_HOME/mx/config.json` | `~/Library/Application Support/mx/config.json` | `%LOCALAPPDATA%\mx\config.json` | The client id and tenant from `mx login` |
-| `$XDG_DATA_HOME/mx/` | `~/Library/Application Support/mx/data/` | `%LOCALAPPDATA%\mx\data\` | The mail store and a downloaded `cloudflared` |
-| `$XDG_STATE_HOME/mx/` | `~/Library/Logs/mx/` | `%LOCALAPPDATA%\mx\state\` | `log.sqlite`, the log of every tool call, prompt and sync line that `mx log` prints; the sign-in file on machines without a secret store; on macOS, `sync.log` with what mx prints when `mx sync` fails |
-| `$XDG_CACHE_HOME/mx/` | `~/Library/Caches/mx/` | `%LOCALAPPDATA%\mx\cache\` | Saved attachments |
+| `$XDG_CONFIG_HOME/mx/config.json` | `~/Library/Application Support/mx/config.json` | `%APPDATA%\mx\config.json` | The client id and tenant from `mx login` |
+| `$XDG_DATA_HOME/mx/` | `~/Library/Application Support/mx/` | `%APPDATA%\mx\` | The mail store and a downloaded `cloudflared` |
+| `$XDG_STATE_HOME/mx/` | `~/Library/Application Support/mx/` | `%LOCALAPPDATA%\mx\` | `log.sqlite`, the log of every tool call, prompt and sync line that `mx log` prints; the sign-in file on machines without a secret store; on macOS, `sync.log` with what mx prints when `mx sync` fails |
+| `$XDG_CACHE_HOME/mx/` | `~/Library/Caches/mx/` | `%LOCALAPPDATA%\mx\Cache\` | Saved attachments |
+
+An absolute `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` or `XDG_CACHE_HOME` moves that folder on macOS and Windows too.
 
 On Windows, Claude Desktop from the Microsoft Store keeps its config inside its app package, in `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`. `mx install` and `mx uninstall` change that file, and also `%APPDATA%\Claude\claude_desktop_config.json` when it exists.
 
 On Linux the background service is the systemd user unit `mx-sync`. It writes its log lines to `log.sqlite` and to the journal. Follow them with `mx log --sync --follow` or `journalctl --user -u mx-sync -f`.
 
-On macOS it is the LaunchAgent `io.github.pixelhabits.mx.sync`, in `~/Library/LaunchAgents/io.github.pixelhabits.mx.sync.plist`. launchd starts it at sign-in, and again after it fails, at most once every 5 minutes. It writes its log lines to `log.sqlite` alone, since launchd never caps `~/Library/Logs/mx/sync.log`. That file keeps only what mx prints when it fails. Follow the log lines with `mx log --sync --follow`.
+On macOS it is the LaunchAgent `io.github.pixelhabits.mx.sync`, in `~/Library/LaunchAgents/io.github.pixelhabits.mx.sync.plist`. launchd starts it at sign-in, and again after it fails, at most once every 5 minutes. It writes its log lines to `log.sqlite` alone, since launchd never caps `sync.log` in the state folder. That file keeps only what mx prints when it fails. Follow the log lines with `mx log --sync --follow`.
 
 ## Trying the MCP server by hand
 

@@ -20,13 +20,15 @@ import {
 	Order,
 	Path,
 	PlatformError,
+	pipe,
 	Queue,
 	Record as Rec,
 	Scheduler,
 	Schema,
+	String as Str,
 	Terminal,
 } from "effect";
-import { Command } from "effect/cli";
+import { Command, TerminalCapabilities } from "effect/cli";
 import type { ChildProcess } from "effect/process";
 import { SqlClient } from "effect/sql";
 import { TestClock, TestConsole } from "effect/testing";
@@ -78,7 +80,7 @@ mock.module("../src/windows.ts", () => ({
 
 /** The version this checkout builds, and the releases above it. */
 const running = packageJson.version;
-const [major, minor] = running.split(".");
+const [major, minor] = pipe(running, Str.split("."));
 const later = (step: number) => `${major}.${Number(minor) + step}.0`;
 const microsoft = new FakeMicrosoft(releases);
 const processes = new FakeProcesses(microsoft.tunnels);
@@ -158,25 +160,24 @@ const unconfiguredEnvironment = Rec.remove(
 
 /**
  * What every mx process runs on: Microsoft and the internet, Bun with faked child processes, a console that keeps its
- * lines, and Config over `env` and the saved config.json, as `src/main.ts` sets it up.
+ * lines, Config over `env` and the saved config.json, and the terminal's capabilities from `env` and the TTY state of
+ * stdin and stdout, as `src/main.ts` sets it up.
  */
-const platformWith = (env: Record<string, string>) =>
-	Layer.mergeAll(
+const platformWith = (env: Record<string, string>) => {
+	const bunWithEnv = Layer.merge(
+		BunServices.layer,
+		ConfigProvider.layer(ConfigProvider.fromUnknown(env))
+	);
+	return Layer.mergeAll(
 		microsoft.layer,
 		BunServices.layer,
 		processes.layer,
 		TestConsole.layer,
-		savedConfig.pipe(
-			Layer.provide(Paths.layer),
-			Layer.provide(
-				Layer.merge(
-					BunServices.layer,
-					ConfigProvider.layer(ConfigProvider.fromUnknown(env))
-				)
-			)
-		),
+		savedConfig.pipe(Layer.provide(Paths.layer), Layer.provide(bunWithEnv)),
+		TerminalCapabilities.layer.pipe(Layer.provide(bunWithEnv)),
 		Layer.succeed(Home, home)
 	);
+};
 const platform = platformWith(environment);
 
 const unconfigured = platformWith(unconfiguredEnvironment);
@@ -297,15 +298,20 @@ const withTerminalOn =
 				})
 		);
 
-/** mx asks for what a command needs only when stdin is a terminal. */
-const withStdinTerminal = withTerminalOn(process.stdin);
-/** A bare mx plays its banner only when stdout is a terminal. */
+/** A bare mx plays its banner, and progress redraws its line, only when stdout is a terminal. */
 const withStdoutTerminal = withTerminalOn(process.stdout);
-// bun test run in a terminal hands it stdin, so mx's stdin is a terminal only in a test that says so.
-Object.defineProperty(process.stdin, "isTTY", {
-	configurable: true,
-	value: false,
-});
+/** mx asks for what a command needs only when stdin and stdout are terminals. */
+const withTerminal =
+	(isTTY: boolean) =>
+	<A, E, R>(effect: Effect.Effect<A, E, R>) =>
+		effect.pipe(
+			withTerminalOn(process.stdin)(isTTY),
+			withStdoutTerminal(isTTY)
+		);
+// bun test run in a terminal hands it stdin and stdout, so mx's are terminals only in a test that says so.
+for (const stream of [process.stdin, process.stdout]) {
+	Object.defineProperty(stream, "isTTY", { configurable: true, value: false });
+}
 
 /** A key of one character types it, and a longer one, such as `return`, presses the key of that name. */
 const keyPress = (name: string): Terminal.UserInput => ({
@@ -386,7 +392,7 @@ const doubleClicked = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 			Effect.sync(() => {
 				consoleOwned = false;
 			})
-	).pipe(withStdoutTerminal(true), withStdinTerminal(true), onWindows);
+	).pipe(withTerminal(true), onWindows);
 
 /** Where the Arch package installs mx. */
 const packaged = "/usr/bin/mx";
@@ -421,7 +427,7 @@ const cutOffWrites = (folder: string) =>
 				FileSystem.FileSystem.of({
 					...fs,
 					writeFile: (file, data, options) =>
-						file.startsWith(folder)
+						pipe(file, Str.startsWith(folder))
 							? fs
 									.writeFile(file, data.subarray(0, 4), options)
 									.pipe(Effect.andThen(Effect.die("The machine stopped.")))
@@ -481,7 +487,7 @@ const savedWhileInstalling = (
 				FileSystem.FileSystem.of({
 					...fs,
 					writeFile: (file, data, options) =>
-						file.startsWith(dirname(installed))
+						pipe(file, Str.startsWith(dirname(installed)))
 							? Effect.andThen(save(fs), fs.writeFile(file, data, options))
 							: fs.writeFile(file, data, options),
 				})
@@ -506,7 +512,7 @@ const refusal = (name: string, args: Record<string, unknown>) =>
 		isError ? Effect.succeed(text) : Effect.die(`${name} succeeded: ${text}`)
 	);
 
-const lines = (text: string) => text.split("\n");
+const lines = (text: string): string[] => pipe(text, Str.split("\n"));
 
 /** The sha256 of `bytes` in hex. Tests compare binaries by it, so a mismatch prints one line instead of every byte. */
 const sha256 = (bytes: Uint8Array) =>
@@ -522,9 +528,7 @@ const listedId = /^#(\d+) /u;
 
 /** The local id of the one listed message whose line contains `needle`. */
 const idOf = (listing: string, needle: string) => {
-	const [line, ...others] = Arr.filter(lines(listing), (candidate) =>
-		candidate.includes(needle)
-	);
+	const [line, ...others] = Arr.filter(lines(listing), Str.includes(needle));
 	const id = listedId.exec(line ?? "")?.[1];
 	if (id === undefined || others.length > 0) {
 		throw new Error(`Expected one line with ${needle} in:\n${listing}`);
@@ -541,37 +545,21 @@ const tokenForms = () =>
 	Arr.map(loginRequests(), (request) => new URLSearchParams(request.body));
 /** The tenant each sign-in request named in its path, `/<tenant>/oauth2/v2.0/...`. */
 const tenantsAsked = () =>
-	Arr.map(loginRequests(), (request) => request.url.pathname.split("/")[1]);
+	Arr.map(
+		loginRequests(),
+		(request) => pipe(request.url.pathname, Str.split("/"))[1]
+	);
 
 const graphRequests = (suffix: string) =>
 	Arr.filter(microsoft.graphRequests(), (request) =>
-		request.url.pathname.endsWith(suffix)
+		pipe(request.url.pathname, Str.endsWith(suffix))
 	);
 
-/** Where mx keeps its files: below `%LOCALAPPDATA%\\mx` on Windows, below `~/Library` on macOS, in the XDG folders on Linux. */
-const local = join(home, "AppData", "Local", "mx");
-const library = join(home, "Library");
-const support = join(library, "Application Support", "mx");
-const { cacheFolder, configFile, dataFolder, stateFolder } = onThisSystem({
-	darwin: {
-		cacheFolder: join(library, "Caches", "mx"),
-		configFile: join(support, "config.json"),
-		dataFolder: join(support, "data"),
-		stateFolder: join(library, "Logs", "mx"),
-	},
-	linux: {
-		cacheFolder: join(home, "cache", "mx"),
-		configFile: join(home, "config", "mx", "config.json"),
-		dataFolder: join(home, "data", "mx"),
-		stateFolder: join(home, "state", "mx"),
-	},
-	win32: {
-		cacheFolder: join(local, "cache"),
-		configFile: join(local, "config.json"),
-		dataFolder: join(local, "data"),
-		stateFolder: join(local, "state"),
-	},
-});
+/** Where mx keeps its files: the XDG folders `environment` names, which mx follows on every system. */
+const cacheFolder = join(home, "cache", "mx");
+const configFile = join(home, "config", "mx", "config.json");
+const dataFolder = join(home, "data", "mx");
+const stateFolder = join(home, "state", "mx");
 const tokenFile = join(stateFolder, "refresh-token");
 /** The sign-in's entry in the system's secret store. */
 const credential = { name: "refresh-token", service: "mx" };
@@ -590,7 +578,7 @@ const savedRefreshToken = Effect.suspend(() =>
 
 const devicecodeRequests = () =>
 	Arr.filter(microsoft.received, (request) =>
-		request.url.pathname.endsWith("/devicecode")
+		pipe(request.url.pathname, Str.endsWith("/devicecode"))
 	).length;
 
 /** Runs `check` on the real clock until it answers true, for up to 10 seconds. */
@@ -615,7 +603,7 @@ const settleBriefly = Effect.promise(() => Bun.sleep(100));
 
 const deltaRequests = (folderId: string) =>
 	Arr.filter(graphRequests("/messages/delta"), (request) =>
-		request.url.pathname.includes(`/${folderId}/`)
+		pipe(request.url.pathname, Str.includes(`/${folderId}/`))
 	).length;
 
 /** The requests that listed the ids of the messages in a folder. */
@@ -625,7 +613,7 @@ const idListings = () =>
 	);
 const inboxIdListings = () =>
 	Arr.filter(idListings(), (request) =>
-		request.url.pathname.includes("/folder-inbox/")
+		pipe(request.url.pathname, Str.includes("/folder-inbox/"))
 	).length;
 
 const allFolders = [
@@ -668,7 +656,10 @@ const otherBinary = syntheticExe("synthetic binary nobody released");
 /** How often mx downloaded the binary of `version`. */
 const downloads = (version: string) =>
 	Arr.filter(microsoft.received, (request) =>
-		request.url.pathname.startsWith(`${releasesPath}download/v${version}/`)
+		pipe(
+			request.url.pathname,
+			Str.startsWith(`${releasesPath}download/v${version}/`)
+		)
 	).length;
 const unitFile = join(home, "config", "systemd", "user", "mx-sync.service");
 const mxEntry = { args: ["mcp"], command: installed };
@@ -795,7 +786,7 @@ const desktopConfig = join(
 
 const codexConfig = join(home, ".codex", "config.toml");
 /** The `command` line of `[mcp_servers.mx]`, with the installed binary quoted as TOML quotes it. */
-const codexCommand = Bun.TOML.stringify({ command: installed }).trim();
+const codexCommand = Str.trim(Bun.TOML.stringify({ command: installed }));
 const codexSettings = `# Codex settings for the test machine.
 model = "gpt-6.1-sol"
 
@@ -851,9 +842,12 @@ ${codexApprovals(recommended)}# A server mx leaves alone.
 command = "other"
 `;
 /** `codexSettings` where the user already lets Codex run `send` without asking. */
-const codexSendApproved = codexSettings.replace(
-	"# A server mx leaves alone.",
-	`${codexApprovals([["send", "approve"]])}# A server mx leaves alone.`
+const codexSendApproved = pipe(
+	codexSettings,
+	Str.replace(
+		"# A server mx leaves alone.",
+		`${codexApprovals([["send", "approve"]])}# A server mx leaves alone.`
+	)
 );
 
 /** Claude Code's user settings, linked into a dotfiles folder, where the user denies mx's `delete`. */
@@ -926,8 +920,8 @@ const writeJson = (file: string, value: unknown) =>
 	);
 
 /**
- * `platform` on a machine where mx never synced: a store of its own, and Claude Code's config in a folder of its own,
- * since on Windows the store sits below the same folder as the installed program, and on macOS below the home folder.
+ * `platform` on a machine where mx never synced: a store, a home and a program folder of its own, and Claude Code's
+ * config in a folder of its own.
  */
 const neverSynced = (name: string) =>
 	Effect.gen(function* () {
@@ -950,24 +944,8 @@ const neverSynced = (name: string) =>
 const ownStore = (name: string) => {
 	const root = join(home, name);
 	return {
-		database: onThisSystem({
-			darwin: join(
-				root,
-				"Library",
-				"Application Support",
-				"mx",
-				"data",
-				"mx.sqlite"
-			),
-			linux: join(root, "data", "mx", "mx.sqlite"),
-			win32: join(root, "Local", "mx", "data", "mx.sqlite"),
-		}),
-		system: platformWith({
-			...environment,
-			HOME: root,
-			LOCALAPPDATA: join(root, "Local"),
-			XDG_DATA_HOME: join(root, "data"),
-		}),
+		database: join(root, "data", "mx", "mx.sqlite"),
+		system: platformWith({ ...environment, XDG_DATA_HOME: join(root, "data") }),
 	};
 };
 
@@ -1231,6 +1209,17 @@ describe("mx", () => {
 			expect(errors).toBe("");
 		}));
 
+	test("a bare mx on a terminal with TERM=dumb prints the help and no banner", () =>
+		Effect.gen(function* () {
+			const { frames, system } = fakeTerminal(
+				platformWith({ ...environment, TERM: "dumb" }),
+				[]
+			);
+			const { output } = yield* withStdoutTerminal(true)(runOn(system)());
+			expect(frames).toEqual([]);
+			expect(output).toContain("SUBCOMMANDS");
+		}));
+
 	test("a bare mx on a terminal plays the banner, leaves its last frame above the help and shows the cursor again", () =>
 		Effect.gen(function* () {
 			const { frames, system } = fakeTerminal(
@@ -1254,11 +1243,13 @@ describe("mx", () => {
 			// Windows draws the envelope, the tray and the flap in code page 437 glyphs.
 			expect(frames.at(-2)).toContain(
 				windows
-					? banner
-							.replaceAll("✉", "≡")
-							.replaceAll("▤", "≡")
-							.replaceAll("╲", "\\")
-							.replaceAll("╱", "/")
+					? pipe(
+							banner,
+							Str.replaceAll("✉", "≡"),
+							Str.replaceAll("▤", "≡"),
+							Str.replaceAll("╲", "\\"),
+							Str.replaceAll("╱", "/")
+						)
 					: banner
 			);
 			expect(output).toContain("SUBCOMMANDS");
@@ -1524,9 +1515,7 @@ describe("mx", () => {
 			expect(answer.isError).toBe(false);
 			expect(lines(answer.text).slice(-2)).toEqual(["call", "unlogged"]);
 			const errors = Arr.map(yield* TestConsole.errorLines, String);
-			expect(Arr.filter(errors, (line) => line.includes(logFile))).toHaveLength(
-				1
-			);
+			expect(Arr.filter(errors, Str.includes(logFile))).toHaveLength(1);
 			const [newest] = yield* loggedRows("--limit", "1");
 			expect(newest).not.toMatchObject({
 				arguments: { sql: "SELECT 'unlogged' AS call" },
@@ -1550,11 +1539,13 @@ describe("mx", () => {
 				yield* loggedRows("--tool", "query", "--limit", "2"),
 				(row) => {
 					const { at, durationMs } = row as { at: string; durationMs: number };
-					const shown = Temporal.Instant.from(at)
-						.toZonedDateTimeISO(Temporal.Now.timeZoneId())
-						.toPlainDateTime()
-						.toString({ smallestUnit: "second" })
-						.replace("T", " ");
+					const shown = pipe(
+						Temporal.Instant.from(at)
+							.toZonedDateTimeISO(Temporal.Now.timeZoneId())
+							.toPlainDateTime()
+							.toString({ smallestUnit: "second" }),
+						Str.replace("T", " ")
+					);
 					return `${shown} mx-test 1.0.0 tool query (ok, ${durationMs} ms)`;
 				}
 			);
@@ -1611,8 +1602,9 @@ describe("mx", () => {
 			yield* tool("query", { sql: "SELECT 'followed' AS call" });
 			yield* eventually(
 				"the call made while mx log follows",
-				Effect.map(output, (text) =>
-					text.includes(`arguments: {"sql":"SELECT 'followed' AS call"}`)
+				Effect.map(
+					output,
+					Str.includes(`arguments: {"sql":"SELECT 'followed' AS call"}`)
 				)
 			);
 			yield* Fiber.interrupt(following);
@@ -1716,7 +1708,7 @@ describe("mx", () => {
 	test("the log keeps at most 50 MB of live data: after a call it deletes the oldest rows until it fits, and the newest rows stay", () =>
 		Effect.gen(function* () {
 			const seeds = 60;
-			const megabyte = "x".repeat(1024 * 1024);
+			const megabyte = pipe("x", Str.repeat(1024 * 1024));
 			yield* withDatabase(logFile, (db) => {
 				const insert = db.prepare(
 					"INSERT INTO entries (at, pid, kind, name, arguments, result, is_error, duration_ms) VALUES (?, 1, 'tool', ?, '{}', ?, 0, 1)"
@@ -1783,7 +1775,7 @@ describe("mx", () => {
 					Promise.all([version.exited, new Response(version.stdout).text()])
 				);
 				expect(code).toBe(0);
-				expect(answer.trim()).toBe(`mx v${running}`);
+				expect(Str.trim(answer)).toBe(`mx v${running}`);
 				const client = yield* spawnClient([built.file], env);
 				const { tools: listed } = (yield* client.request("tools/list")) as {
 					tools: { name: string }[];
@@ -1888,7 +1880,7 @@ describe("mx", () => {
 					const { system } = fakeTerminal(platform, ["return"]);
 					const before = processes.commands.length;
 					const { output } = yield* on(
-						withStdinTerminal(true)(cliOn(system)("login"))
+						withTerminal(true)(cliOn(system)("login"))
 					);
 					expect(lines(output).slice(0, 3)).toEqual([
 						`Your sign-in code is ${userCode}. It is on your clipboard.`,
@@ -1909,7 +1901,7 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const { system } = fakeTerminal(platform, []);
 			const before = processes.commands.length;
-			const { output } = yield* withStdinTerminal(true)(cliOn(system)("login"));
+			const { output } = yield* withTerminal(true)(cliOn(system)("login"));
 			expect(lines(output)).toContain("Signed in. The refresh token is saved.");
 			expect(
 				Arr.filter(processes.commands.slice(before), ([program = ""]) =>
@@ -1926,9 +1918,7 @@ describe("mx", () => {
 				processes.failing.add("xclip");
 				const { system } = fakeTerminal(platform, ["return"]);
 				const before = processes.commands.length;
-				const { output } = yield* withStdinTerminal(true)(
-					cliOn(system)("login")
-				);
+				const { output } = yield* withTerminal(true)(cliOn(system)("login"));
 				expect(lines(output).slice(0, 2)).toEqual([
 					`Your sign-in code is ${userCode}.`,
 					`Press Enter to open ${verificationUri} in your browser, then enter the code there.`,
@@ -1948,7 +1938,7 @@ describe("mx", () => {
 				processes.hanging.add("wl-copy");
 				const { system } = fakeTerminal(platform, ["return"]);
 				const before = processes.commands.length;
-				const { output } = yield* withStdinTerminal(true)(
+				const { output } = yield* withTerminal(true)(
 					cliOn(system)("login")
 				).pipe(onTestClock);
 				expect(processes.commands.slice(before, before + 2)).toEqual([
@@ -1971,9 +1961,7 @@ describe("mx", () => {
 			Effect.gen(function* () {
 				processes.failing.add("xdg-open");
 				const { system } = fakeTerminal(platform, ["return"]);
-				const { output } = yield* withStdinTerminal(true)(
-					cliOn(system)("login")
-				);
+				const { output } = yield* withTerminal(true)(cliOn(system)("login"));
 				expect(lines(output).slice(2, 4)).toEqual([
 					`Could not open a browser. Open ${verificationUri} yourself.`,
 					"Signed in. The refresh token is saved.",
@@ -1986,7 +1974,7 @@ describe("mx", () => {
 			const { close, reading, system } = fakeTerminal(platform, []);
 			const tokens = microsoft.refreshTokens.length;
 			const login = yield* Effect.forkChild(
-				withStdinTerminal(true)(runOn(system)("login"))
+				withTerminal(true)(runOn(system)("login"))
 			);
 			yield* eventually("mx to wait for Enter", reading);
 			yield* close;
@@ -2006,7 +1994,7 @@ describe("mx", () => {
 				"return",
 				"return",
 			]);
-			yield* withStdinTerminal(true)(cliOn(system)("login"));
+			yield* withTerminal(true)(cliOn(system)("login"));
 			const drawn = Arr.join(frames, "");
 			expect(drawn).toContain("Client id");
 			expect(drawn).toContain("Tenant");
@@ -2016,7 +2004,7 @@ describe("mx", () => {
 			});
 			expect(tokenForms().at(-1)?.get("client_id")).toBe(clientId);
 			expect(tenantsAsked().at(-1)).toBe("organizations");
-			yield* withStdinTerminal(false)(cliOn(unconfigured)("login"));
+			yield* withTerminal(false)(cliOn(unconfigured)("login"));
 			expect(tokenForms().at(-1)?.get("client_id")).toBe(clientId);
 			expect(tenantsAsked().at(-1)).toBe("organizations");
 			expect(yield* savedRefreshToken).toBe(issued(1));
@@ -2212,8 +2200,8 @@ describe("mx", () => {
 				Effect.map(
 					status,
 					({ output: report }) =>
-						report.includes("Mode: poll") &&
-						!report.includes("Last sync: never")
+						pipe(report, Str.includes("Mode: poll")) &&
+						!pipe(report, Str.includes("Last sync: never"))
 				)
 			);
 			yield* Fiber.interrupt(service);
@@ -2273,7 +2261,7 @@ describe("mx", () => {
 						(row) => (row as { kind: string }).kind === "sync"
 					)
 				).toEqual([]);
-				expect(yield* fs.exists(join(local, "state", "sync.log"))).toBe(false);
+				expect(yield* fs.exists(join(stateFolder, "sync.log"))).toBe(false);
 			})
 		));
 
@@ -2284,7 +2272,10 @@ describe("mx", () => {
 			const deltas = graphRequests("/messages/delta");
 			expect(
 				new Set(
-					Arr.map(deltas, (request) => request.url.pathname.split("/")[4])
+					Arr.map(
+						deltas,
+						(request) => pipe(request.url.pathname, Str.split("/"))[4]
+					)
 				)
 			).toEqual(
 				new Set([
@@ -2460,15 +2451,17 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const id = idOf(yield* tool("search", { query: "travel cap" }), "RE:");
 			const thread = yield* tool("thread", { id });
-			const order = Arr.map(
-				[
-					"Please review the quarterly budget.",
-					"Looks fine. One question about travel.",
-					"Travel stays under the cap.",
-				],
-				(text) => thread.indexOf(text)
+			const order = Arr.getSomes(
+				Arr.map(
+					[
+						"Please review the quarterly budget.",
+						"Looks fine. One question about travel.",
+						"Travel stays under the cap.",
+					],
+					(text) => pipe(thread, Str.indexOf(text))
+				)
 			);
-			expect(Arr.every(order, (index) => index >= 0)).toBe(true);
+			expect(order).toHaveLength(3);
 			expect(order).toEqual([...order].sort((a, b) => a - b));
 			expect(thread).toMatch(ownSentLine);
 			expect(thread).not.toContain("From: Sam Example");
@@ -2487,7 +2480,7 @@ describe("mx", () => {
 			const budget = yield* tool("thread", {
 				id: idOf(yield* tool("search", { query: "travel cap" }), "RE:"),
 			});
-			expect(budget.match(outlookLine)).toHaveLength(3);
+			expect([...pipe(budget, Str.matchAll(outlookLine))]).toHaveLength(3);
 		}));
 
 	test("query answers a GROUP BY over mail as a tab-separated table with a header: messages per sender", () =>
@@ -2586,7 +2579,10 @@ describe("mx", () => {
 			).toBe(
 				"last_link\nhttps://outlook.cloud.microsoft/mail/deeplink?ItemID=message%2Fanswer&exvsurl=1&viewmodel=ReadMessageItem"
 			);
-			const longer = lunchLink.replace("ItemID=", `ItemID=${"A".repeat(100)}`);
+			const longer = pipe(
+				lunchLink,
+				Str.replace("ItemID=", `ItemID=${pipe("A", Str.repeat(100))}`)
+			);
 			expect(yield* tool("query", { sql: `SELECT '${longer}' AS link` })).toBe(
 				`link\n${longer}`
 			);
@@ -2648,7 +2644,7 @@ describe("mx", () => {
 					sql: "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n LIMIT 150) SELECT i, printf('%.*c', 1000, 'x') AS filler FROM n",
 				})
 			);
-			expect(wide[1]).toBe(`1\t${"x".repeat(199)}…`);
+			expect(wide[1]).toBe(`1\t${pipe("x", Str.repeat(199))}…`);
 			expect(wide.at(-1)).toMatch(cutAtCharacters);
 			expect(Arr.join(wide.slice(0, -1), "\n").length).toBeLessThanOrEqual(
 				20_000
@@ -2708,7 +2704,7 @@ describe("mx", () => {
 			expect(listing[0]).toMatch(imageLine);
 			expect(listing[1]).toMatch(sheetLine);
 			const saved = yield* tool("attachment", { id, n: 1 });
-			expect(saved.startsWith(cacheFolder)).toBe(true);
+			expect(saved).toStartWith(cacheFolder);
 			expect(yield* fileSha256(saved)).toBe(sha256(inlineImage));
 		}));
 
@@ -2751,7 +2747,7 @@ describe("mx", () => {
 			const small = `${home}/agenda.txt`;
 			const large = `${home}/minutes.txt`;
 			yield* fs.writeFileString(small, "synthetic agenda");
-			yield* fs.writeFileString(large, "m".repeat(5_000_000));
+			yield* fs.writeFileString(large, pipe("m", Str.repeat(5_000_000)));
 			const created = yield* tool("draft", {
 				attach: [small, large],
 				bcc: ["carol@example.test"],
@@ -3431,7 +3427,7 @@ describe("mx", () => {
 			yield* eventually(
 				"push mode in mx status",
 				Effect.map(status, ({ output: report }) =>
-					report.includes("Mode: push")
+					pipe(report, Str.includes("Mode: push"))
 				)
 			);
 			const { exit, output } = yield* status;
@@ -3446,7 +3442,12 @@ describe("mx", () => {
 			yield* eventually(
 				"the pushed message in the store",
 				Effect.map(call("search", { query: "push arrives" }), ({ text }) =>
-					text.includes("Inbox | Bob Example <bob@example.test> | Push arrives")
+					pipe(
+						text,
+						Str.includes(
+							"Inbox | Bob Example <bob@example.test> | Push arrives"
+						)
+					)
 				)
 			);
 		}));
@@ -3474,7 +3475,10 @@ describe("mx", () => {
 			const inbox = Arr.findFirst(
 				microsoft.subscriptions.on("inbox"),
 				(subscription) =>
-					subscription.notificationUrl.endsWith(".trycloudflare.com/graph")
+					pipe(
+						subscription.notificationUrl,
+						Str.endsWith(".trycloudflare.com/graph")
+					)
 			).pipe(
 				Option.map((subscription) => subscription.id),
 				Option.getOrElse(() => "none")
@@ -3499,7 +3503,10 @@ describe("mx", () => {
 			const url = "https://tunnel-2.trycloudflare.com/graph";
 			const onTunnels = (folder: string) =>
 				Arr.filter(microsoft.subscriptions.on(folder), (subscription) =>
-					subscription.notificationUrl.endsWith(".trycloudflare.com/graph")
+					pipe(
+						subscription.notificationUrl,
+						Str.endsWith(".trycloudflare.com/graph")
+					)
 				);
 			yield* eventually("the subscriptions on the new host", () =>
 				Arr.every(["inbox", "sentitems"], (folder) => {
@@ -3587,8 +3594,11 @@ describe("mx", () => {
 						const { kind, message } = row as { kind: string; message: string };
 						return (
 							kind === "sync" &&
-							message.startsWith(
-								`Push is unavailable: MX_CLOUDFLARED names ${cloudflared}, which is cloudflared 2026.10.1; mx runs only 2026.10.2 or newer. `
+							pipe(
+								message,
+								Str.startsWith(
+									`Push is unavailable: MX_CLOUDFLARED names ${cloudflared}, which is cloudflared 2026.10.1; mx runs only 2026.10.2 or newer. `
+								)
 							)
 						);
 					})
@@ -3687,7 +3697,7 @@ describe("mx", () => {
 					const moved = yield* call("message", { id: compostId });
 					const purged = yield* call("message", { id: seedsId });
 					return (
-						hedge.text.includes("Hedge trimming moved") &&
+						pipe(hedge.text, Str.includes("Hedge trimming moved")) &&
 						lineIn(compostId, "Archive").test(moved.text) &&
 						purged.isError
 					);
@@ -3757,7 +3767,7 @@ describe("mx", () => {
 			microsoft.release("folder-seeds");
 			const lastError = (text: string) =>
 				Effect.map(status, ({ output }) =>
-					output.includes(`Last error: ${text}`)
+					pipe(output, Str.includes(`Last error: ${text}`))
 				);
 			yield* eventually(
 				"the pass that skipped Seed library",
@@ -3821,7 +3831,7 @@ describe("mx", () => {
 			const service = yield* Effect.forkChild(cli("sync"));
 			const lastError = (text: string) =>
 				Effect.map(status, ({ output }) =>
-					output.includes(`Last error: ${text}`)
+					pipe(output, Str.includes(`Last error: ${text}`))
 				);
 			yield* eventually(
 				"the pass that skipped Trellis",
@@ -3834,7 +3844,7 @@ describe("mx", () => {
 			);
 			yield* eventually("the check listing the ids of Trellis", () =>
 				Arr.some(idListings().slice(listed), (request) =>
-					request.url.pathname.includes("/folder-trellis/")
+					pipe(request.url.pathname, Str.includes("/folder-trellis/"))
 				)
 			);
 			microsoft.readable("folder-trellis");
@@ -3997,7 +4007,7 @@ describe("mx", () => {
 			yield* eventually(
 				"a pass 3 hours ago",
 				Effect.map(call("search", { limit: 1 }), ({ text }) =>
-					text.startsWith("⚠ Mail last synced 3 h ago")
+					pipe(text, Str.startsWith("⚠ Mail last synced 3 h ago"))
 				)
 			);
 			microsoft.outage = 503;
@@ -4007,7 +4017,7 @@ describe("mx", () => {
 				TestClock.adjust("5 seconds").pipe(
 					Effect.andThen(status),
 					Effect.map(({ output: report }) =>
-						report.includes("Last error: Microsoft")
+						pipe(report, Str.includes("Last error: Microsoft"))
 					)
 				)
 			);
@@ -4023,7 +4033,7 @@ describe("mx", () => {
 				TestClock.adjust("1 minute").pipe(
 					Effect.andThen(status),
 					Effect.map(({ output: report }) =>
-						report.includes("Last error: none")
+						pipe(report, Str.includes("Last error: none"))
 					)
 				)
 			);
@@ -4139,9 +4149,24 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
 			const before = processes.commands.length;
-			const { errors, exit } = yield* withStdinTerminal(false)(run("install"));
+			const { errors, exit } = yield* withTerminal(false)(run("install"));
 			expect(Exit.isFailure(exit)).toBe(true);
 			expect(errors).toContain(`--agent: ${offeredAgents}.`);
+			expect(processes.commands).toHaveLength(before);
+			expect(yield* fs.exists(installed)).toBe(false);
+		}));
+
+	test("mx install without --agent, with a terminal on stdin but not on stdout, asks nothing, names the agents it can set up, and changes nothing", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const before = processes.commands.length;
+			const { frames, system } = fakeTerminal(platform, ["return"]);
+			const { errors, exit } = yield* withTerminalOn(process.stdin)(true)(
+				runOn(system)("install")
+			);
+			expect(Exit.isFailure(exit)).toBe(true);
+			expect(errors).toContain(`--agent: ${offeredAgents}.`);
+			expect(frames).toEqual([]);
 			expect(processes.commands).toHaveLength(before);
 			expect(yield* fs.exists(installed)).toBe(false);
 		}));
@@ -4167,12 +4192,12 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
 			const { frames, system } = fakeTerminal(platform, ["return"]);
-			const { exit } = yield* withStdinTerminal(true)(runOn(system)("install"));
+			const { exit } = yield* withTerminal(true)(runOn(system)("install"));
 			expect(Exit.isSuccess(exit)).toBe(true);
 			const drawn = Arr.join(frames, "");
 			expect(drawn).toContain("Claude Code");
 			expect(drawn).toContain("Codex");
-			expect(drawn.includes("Claude Desktop")).toBe(windows || mac);
+			expect(pipe(drawn, Str.includes("Claude Desktop"))).toBe(windows || mac);
 			expect(yield* readJson(claudeCodeConfig)).toEqual({
 				...claudeCodeSettings,
 				mcpServers: {
@@ -4303,7 +4328,7 @@ describe("mx", () => {
 	);
 
 	test(
-		"mx install writes a LaunchAgent that runs the installed binary at sign-in, starts it again at most every 5 minutes after it fails, and logs to ~/Library/Logs/mx, and makes the binary executable",
+		"mx install writes a LaunchAgent that runs the installed binary at sign-in, starts it again at most every 5 minutes after it fails, and logs to its state folder, and makes the binary executable",
 		() =>
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
@@ -4356,7 +4381,7 @@ describe("mx", () => {
 				);
 				expect(code).toBe(0);
 				// mx install copied the Bun that runs the tests, as mx.exe and mxw.exe.
-				expect(version.trim()).toBe(Bun.version);
+				expect(Str.trim(version)).toBe(Bun.version);
 			}),
 		{ because: "it runs the installed exe", systems: ["win32"] }
 	);
@@ -4409,7 +4434,9 @@ describe("mx", () => {
 			expect(
 				Arr.every(
 					frames.slice(0, -1),
-					(frame) => frame.startsWith("\r") && !frame.includes("\n")
+					(frame) =>
+						pipe(frame, Str.startsWith("\r")) &&
+						!pipe(frame, Str.includes("\n"))
 				)
 			).toBe(true);
 			expect(frames.slice(-2)).toEqual([
@@ -4437,9 +4464,7 @@ describe("mx", () => {
 				"claude-code"
 			).pipe(onTestClock, withStdoutTerminal(false));
 			const pages = graphRequests("/messages/delta").length - before;
-			const progress = Arr.filter(lines(output), (line) =>
-				line.startsWith("Syncing ")
-			);
+			const progress = Arr.filter(lines(output), Str.startsWith("Syncing "));
 			expect(progress[0]).toBe(`Syncing 6 folders: 0 of ${total} messages`);
 			expect(progress.length).toBeGreaterThan(1);
 			expect(progress.length).toBeLessThan(pages);
@@ -4480,12 +4505,12 @@ describe("mx", () => {
 			);
 			const deltas = Arr.filter(
 				microsoft.graphRequests().slice(asked),
-				(request) => request.url.pathname.endsWith("/messages/delta")
+				(request) => pipe(request.url.pathname, Str.endsWith("/messages/delta"))
 			);
 			const resumed = (folder: string) =>
 				Arr.map(
 					Arr.filter(deltas, (request) =>
-						request.url.pathname.includes(`/${folder}/`)
+						pipe(request.url.pathname, Str.includes(`/${folder}/`))
 					),
 					(request) => request.url.searchParams.has("$deltatoken")
 				);
@@ -4548,12 +4573,15 @@ describe("mx", () => {
 			yield* cli("install", "--agent", "codex", "--agent", "claude-code");
 			yield* cli("install", "--agent", "claude-code", "--agent", "codex");
 			expect(yield* fs.readFileString(codexConfig)).toBe(
-				codexWithMx.replace(
-					codexApprovals(recommended),
-					codexApprovals([
-						["send", "approve"],
-						...Arr.filter(recommended, ([name]) => name !== "send"),
-					])
+				pipe(
+					codexWithMx,
+					Str.replace(
+						codexApprovals(recommended),
+						codexApprovals([
+							["send", "approve"],
+							...Arr.filter(recommended, ([name]) => name !== "send"),
+						])
+					)
 				)
 			);
 			expect(yield* fs.readLink(claudeCodeSettingsFile)).toBe(dotfile);
@@ -4647,7 +4675,10 @@ describe("mx", () => {
 				const { frames, press, system } = fakeTerminal(platform, []);
 				const started = yield* Effect.forkChild(runOn(system)());
 				yield* eventually("mx to ask which agents to set up", () =>
-					Arr.join(frames, "").includes("Which agents should use mx?")
+					pipe(
+						Arr.join(frames, ""),
+						Str.includes("Which agents should use mx?")
+					)
 				);
 				// Ctrl+C makes Bun's runtime interrupt mx as this does.
 				const stopping = yield* Effect.forkChild(Fiber.interrupt(started));
@@ -4740,7 +4771,7 @@ describe("mx", () => {
 			yield* Effect.promise(() =>
 				releases.publish({
 					binary: otherBinary,
-					manifestSha256: "0".repeat(64),
+					manifestSha256: pipe("0", Str.repeat(64)),
 					version: later(3),
 				})
 			);
@@ -4760,7 +4791,7 @@ describe("mx", () => {
 				yield* eventually(
 					"a pass 3 hours ago",
 					Effect.map(call("search", { limit: 1 }), ({ text }) =>
-						text.startsWith("⚠ Mail last synced 3 h ago")
+						pipe(text, Str.startsWith("⚠ Mail last synced 3 h ago"))
 					)
 				);
 				yield* Fiber.interrupt(service);
@@ -4813,9 +4844,7 @@ describe("mx", () => {
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
 			const before = processes.commands.length;
-			const failure = yield* Effect.flip(
-				withStdinTerminal(false)(cli("uninstall"))
-			);
+			const failure = yield* Effect.flip(withTerminal(false)(cli("uninstall")));
 			expect(failure.message).toContain("mx uninstall --yes");
 			expect(processes.commands).toHaveLength(before);
 			expect(yield* fs.exists(installed)).toBe(true);
@@ -4828,9 +4857,7 @@ describe("mx", () => {
 			const fs = yield* FileSystem.FileSystem;
 			const before = processes.commands.length;
 			const { frames, system } = fakeTerminal(platform, ["n"]);
-			const { output } = yield* withStdinTerminal(true)(
-				cliOn(system)("uninstall")
-			);
+			const { output } = yield* withTerminal(true)(cliOn(system)("uninstall"));
 			const prompt = Arr.join(frames, "");
 			for (const path of mxFiles) {
 				expect(prompt).toContain(path);
@@ -4894,8 +4921,11 @@ describe("mx", () => {
 				expect(yield* fs.exists(path)).toBe(windows && path === dataFolder);
 			}
 			expect(
-				output.includes(
-					`Could not delete ${dataFolder} while mx mcp has it open.`
+				pipe(
+					output,
+					Str.includes(
+						`Could not delete ${dataFolder} while mx mcp has it open.`
+					)
 				)
 			).toBe(windows);
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
@@ -5040,9 +5070,8 @@ describe("mx", () => {
 				const movedAside = Effect.map(
 					fs.readDirectory(windowsFolder),
 					(names) =>
-						Arr.map(
-							Arr.filter(names, (name) => name.includes(".old")),
-							(name) => join(windowsFolder, name)
+						Arr.map(Arr.filter(names, Str.includes(".old")), (name) =>
+							join(windowsFolder, name)
 						)
 				);
 				yield* install("install", "--agent", "codex");
@@ -5128,7 +5157,7 @@ describe("mx", () => {
 					USERPROFILE: root,
 				});
 				const { system: onTerminal } = fakeTerminal(system, ["return"]);
-				yield* withStdinTerminal(true)(cliOn(onTerminal)("install"));
+				yield* withTerminal(true)(cliOn(onTerminal)("install"));
 				expect(yield* readJson(storeConfig)).toEqual({
 					...settings,
 					mcpServers: {
@@ -5148,20 +5177,21 @@ describe("mx", () => {
 		));
 
 	test(
-		"on macOS, mx install loads the LaunchAgent with launchctl bootstrap once it unloads the one loaded before, mx login restarts it with kickstart, and mx uninstall unloads it and deletes it with the log folder",
+		"on macOS, mx install loads the LaunchAgent with launchctl bootstrap once it unloads the one loaded before, mx login restarts it with kickstart, and mx uninstall unloads it and deletes it with the state folder",
 		() =>
 			onMac(
 				Effect.gen(function* () {
 					const fs = yield* FileSystem.FileSystem;
-					const logs = join(library, "Logs", "mx");
 					const bin = join(home, ".local", "bin", "mx");
 					const before = processes.commands.length;
 					yield* cli("install", "--agent", "codex");
 					yield* cli("install", "--agent", "codex");
 					const plist = yield* fs.readFileString(agentFile);
 					expect(plist).toContain(`<string>${bin}</string>`);
-					expect(plist).toContain(`<string>${join(logs, "sync.log")}</string>`);
-					expect(yield* fs.exists(logs)).toBe(true);
+					expect(plist).toContain(
+						`<string>${join(stateFolder, "sync.log")}</string>`
+					);
+					expect(yield* fs.exists(stateFolder)).toBe(true);
 					yield* cliOn(unconfigured)("login");
 					yield* cli("uninstall", "--yes");
 					const bootout = `launchctl bootout ${agentTarget}`;
@@ -5184,10 +5214,10 @@ describe("mx", () => {
 					]);
 					for (const path of [
 						agentFile,
-						logs,
+						stateFolder,
 						bin,
-						join(support, "config.json"),
-						join(support, "data"),
+						configFile,
+						dataFolder,
 					]) {
 						expect(yield* fs.exists(path)).toBe(false);
 					}
@@ -5195,8 +5225,8 @@ describe("mx", () => {
 			),
 		{
 			because:
-				"on macOS the install, login and uninstall tests above run these steps",
-			systems: ["linux", "win32"],
+				"on macOS the install, login and uninstall tests above run these steps, and on Windows the fake home starts with a drive letter, which UserDirectories does not take as an absolute macOS path",
+			systems: ["linux"],
 		}
 	);
 });
