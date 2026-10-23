@@ -1,4 +1,4 @@
-import { Array as Arr, Option } from "effect";
+import { Array as Arr, Option, pipe, String as Str } from "effect";
 import type { Attachment } from "../graph/api.ts";
 import type { Address, Found, Stored } from "../store.ts";
 import { localTime } from "../temporal.ts";
@@ -38,20 +38,26 @@ const markers = (message: Stored) =>
 
 /** The content ids a text body references, each once, in the order the body first shows them. */
 const referencedImages = (text: string) =>
-	Arr.dedupe(Arr.map([...text.matchAll(cidReference)], ([, cid]) => cid ?? ""));
+	Arr.dedupe(
+		Arr.map([...pipe(text, Str.matchAll(cidReference))], ([, cid]) => cid ?? "")
+	);
 
 /** The body with CRLF line ends, trailing space and runs of blank lines cut, and each inline image as `[img N]`. */
 const bodyText = (text: string) => {
 	const images = referencedImages(text);
-	return text
-		.replaceAll("\r\n", "\n")
-		.replaceAll(
-			cidReference,
-			(_, cid: string) => `[img ${images.indexOf(cid) + 1}]`
-		)
-		.replaceAll(/[ \t]+$/gmu, "")
-		.replaceAll(/\n{3,}/gu, "\n\n")
-		.trim();
+	return pipe(
+		text,
+		Str.replaceAll("\r\n", "\n"),
+		(body) =>
+			// @effect-diagnostics-next-line preferEffectString:off - each image's number comes from a lookup, which no replacement pattern can express.
+			body.replaceAll(
+				cidReference,
+				(_, cid: string) => `[img ${images.indexOf(cid) + 1}]`
+			),
+		Str.replaceAll(/[ \t]+$/gmu, ""),
+		Str.replaceAll(/\n{3,}/gu, "\n\n"),
+		Str.trim
+	);
 };
 
 /** One line per message: `#id date folder | sender | subject | markers`; a draft names its recipients instead. */
@@ -111,7 +117,9 @@ export const threadText = (
 ) => {
 	const isOwn = (stored: Stored) =>
 		stored.inSentItems ||
-		Option.exists(stored.from, ({ address }) => own.has(address.toLowerCase()));
+		Option.exists(stored.from, ({ address }) =>
+			own.has(Str.toLowerCase(address))
+		);
 	const entries = Arr.map(messages, (stored) =>
 		Arr.join(
 			[
@@ -144,7 +152,7 @@ export const threadText = (
 };
 
 const contentId = (attachment: Attachment) =>
-	(attachment.contentId ?? "").replaceAll(/^<|>$/gu, "");
+	pipe(attachment.contentId ?? "", Str.replaceAll(/^<|>$/gu, ""));
 
 /** The attachments, inline images in the order the body shows them first, then the rest in Graph's order. */
 export const inBodyOrder = (

@@ -1,4 +1,12 @@
-import { Array as Arr, Effect, Option, Order, Schema } from "effect";
+import {
+	Array as Arr,
+	Effect,
+	Option,
+	Order,
+	pipe,
+	Schema,
+	String as Str,
+} from "effect";
 import packageJson from "../package.json" with { type: "json" };
 
 /** The file `bun run build` writes next to the binaries; every release and the Arch packages ship it. */
@@ -17,9 +25,9 @@ const Package = Schema.Struct({
 });
 const decodePackage = Schema.decodeEffect(Schema.fromJsonString(Package));
 
-const rule = "=".repeat(78);
+const rule = pipe("=", Str.repeat(78));
 const section = (title: string, body: string) =>
-	`${rule}\n${title}\n${rule}\n\n${body.trimEnd()}\n`;
+	`${rule}\n${title}\n${rule}\n\n${Str.trimEnd(body)}\n`;
 
 const byName = Order.mapInput(
 	Order.String,
@@ -45,7 +53,7 @@ export const notices = Effect.fnUntraced(function* (inputs: readonly string[]) {
 		Arr.getSomes(
 			Arr.map(inputs, (input) =>
 				Option.fromNullishOr(
-					packageFolder.exec(input.replaceAll("\\", "/"))?.[1]
+					packageFolder.exec(pipe(input, Str.replaceAll("\\", "/")))?.[1]
 				)
 			)
 		)

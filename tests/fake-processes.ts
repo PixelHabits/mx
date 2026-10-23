@@ -5,7 +5,9 @@ import {
 	Effect,
 	Layer,
 	PlatformError,
+	pipe,
 	Sink,
+	String as Str,
 	Stream,
 } from "effect";
 import { type ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -49,7 +51,7 @@ const syncStop = commandLine(stopSync(0));
 
 /** Whether `command` starts the background `mx sync`, as mxw.exe. */
 const startsBackgroundSync = (command: ChildProcess.StandardCommand) =>
-	command.command.endsWith("mxw.exe") && command.args[0] === "sync";
+	pipe(command.command, Str.endsWith("mxw.exe")) && command.args[0] === "sync";
 
 /** A LaunchAgent's label: its plist's name without `.plist`. */
 const plistLabel = /([^/\\]+)\.plist$/u;

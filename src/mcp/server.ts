@@ -12,8 +12,10 @@ import {
 	Order,
 	Path,
 	Predicate,
+	pipe,
 	Result,
 	Schema,
+	String as Str,
 } from "effect";
 import { McpProtocol, McpSchema, McpServer, Tool } from "effect/ai";
 import {
@@ -137,13 +139,7 @@ const SendDraft = Schema.Struct({
 /** The same addresses in any order and case. */
 const sameAddresses = (a: readonly string[], b: readonly string[]) => {
 	const key = (list: readonly string[]) =>
-		Arr.join(
-			Arr.sort(
-				Arr.map(list, (address) => address.toLowerCase()),
-				Order.String
-			),
-			"\n"
-		);
+		Arr.join(Arr.sort(Arr.map(list, Str.toLowerCase), Order.String), "\n");
 	return key(a) === key(b);
 };
 
@@ -532,25 +528,28 @@ const register = Effect.fnUntraced(function* <
 
 /** Refuses a name no path could hold: a blank one, or one with `/`, which separates the folders of a path. */
 const checkFolderName = (name: string) =>
-	name.trim() === "" || name.includes("/")
+	Str.trim(name) === "" || pipe(name, Str.includes("/"))
 		? Refused.make({
 				message: `"${name}" is not a folder name: a name is not blank and holds no /, which separates the folders of a path.`,
 			})
 		: Effect.void;
 
 /** The path of the folder that holds the folder at `path`, or none at the top of the mailbox. */
-const parentOf = (path: string) => {
-	const end = path.lastIndexOf("/");
-	return end === -1 ? Option.none<string>() : Option.some(path.slice(0, end));
-};
+const parentOf = (path: string) =>
+	Option.map(pipe(path, Str.lastIndexOf("/")), (end) =>
+		pipe(path, Str.slice(0, end))
+	);
 
 const unsafeInFileName = /[/\\\0]/gu;
 const leadingDots = /^\.+/u;
 
 /** An attachment name safe to write in the cache: no directory parts and no leading dot. */
 const fileName = (name: string) =>
-	name.replaceAll(unsafeInFileName, "_").replace(leadingDots, "_") ||
-	"attachment";
+	pipe(
+		name,
+		Str.replaceAll(unsafeInFileName, "_"),
+		Str.replace(leadingDots, "_")
+	) || "attachment";
 
 /** The day triage starts from unless the agent names one: 7 days before the user's today. */
 const weekAgo = Effect.map(Clock.currentTimeMillis, (now) =>
@@ -718,18 +717,18 @@ export const tools = Layer.effectDiscard(
 		});
 
 		const folderNamed = Effect.fnUntraced(function* (name: string) {
-			const wanted = name.toLowerCase();
+			const wanted = Str.toLowerCase(name);
 			const folders = yield* store.folders;
 			const byPath = Arr.filter(
 				folders,
-				(folder) => folder.path.toLowerCase() === wanted
+				(folder) => Str.toLowerCase(folder.path) === wanted
 			);
 			const matches =
 				byPath.length > 0
 					? byPath
 					: Arr.filter(
 							folders,
-							(folder) => folder.name.toLowerCase() === wanted
+							(folder) => Str.toLowerCase(folder.name) === wanted
 						);
 			const [first, ...others] = matches;
 			if (first === undefined) {
@@ -772,7 +771,8 @@ export const tools = Layer.effectDiscard(
 			return Arr.some(
 				yield* store.folders,
 				(deleted) =>
-					deleted.id === id && `${folder.path}/`.startsWith(`${deleted.path}/`)
+					deleted.id === id &&
+					pipe(`${folder.path}/`, Str.startsWith(`${deleted.path}/`))
 			);
 		});
 
@@ -804,17 +804,17 @@ export const tools = Layer.effectDiscard(
 
 		/** Creates each folder of the path `wanted` below the deepest one the store has; answers the paths it created. */
 		const createFolders = Effect.fnUntraced(function* (wanted: string) {
-			const names = wanted.split("/");
+			const names = pipe(wanted, Str.split("/"));
 			yield* Effect.forEach(names, checkFolderName, { discard: true });
 			const byPath = new Map(
 				Arr.map(yield* store.folders, (folder) => [
-					folder.path.toLowerCase(),
+					Str.toLowerCase(folder.path),
 					folder,
 				])
 			);
 			const known = Arr.takeWhile(
 				Arr.map(names, (_, last) =>
-					byPath.get(Arr.join(names.slice(0, last + 1), "/").toLowerCase())
+					byPath.get(Str.toLowerCase(Arr.join(names.slice(0, last + 1), "/")))
 				),
 				Predicate.isNotUndefined
 			);
@@ -1003,7 +1003,7 @@ export const tools = Layer.effectDiscard(
 			}
 			return input.kind === "new"
 				? `Sent to ${recipientsText({ bcc: input.bcc ?? [], cc: input.cc ?? [], to: input.to ?? [] })}: ${input.subject || "(no subject)"}`
-				: `Sent the ${input.kind.replace("_", "-")} to #${input.message}.`;
+				: `Sent the ${pipe(input.kind, Str.replace("_", "-"))} to #${input.message}.`;
 		});
 
 		/** Runs `one` for each id and answers a line per id; any failure makes the whole answer an error. */
@@ -1044,7 +1044,7 @@ export const tools = Layer.effectDiscard(
 					),
 					text: Option.filter(
 						Option.fromUndefinedOr(params.query),
-						(query) => query.trim() !== ""
+						(query) => Str.trim(query) !== ""
 					),
 				});
 				return listing(found);

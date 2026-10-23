@@ -1,4 +1,11 @@
-import { Effect, Schema, SchemaGetter, SchemaIssue } from "effect";
+import {
+	Effect,
+	pipe,
+	Schema,
+	SchemaGetter,
+	SchemaIssue,
+	String as Str,
+} from "effect";
 
 /** ISO calendar date text such as `2026-10-14`; an impossible date such as 2026-02-30 is invalid, not clamped. */
 export const PlainDateFromString = Schema.String.pipe(
@@ -36,8 +43,10 @@ export const localTime = (
 	instant: Temporal.Instant,
 	smallestUnit: "minute" | "second" = "minute"
 ) =>
-	instant
-		.toZonedDateTimeISO(Temporal.Now.timeZoneId())
-		.toPlainDateTime()
-		.toString({ smallestUnit })
-		.replace("T", " ");
+	pipe(
+		instant
+			.toZonedDateTimeISO(Temporal.Now.timeZoneId())
+			.toPlainDateTime()
+			.toString({ smallestUnit }),
+		Str.replace("T", " ")
+	);

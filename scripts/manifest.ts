@@ -4,9 +4,11 @@ import {
 	Config,
 	Console,
 	Effect,
+	pipe,
 	Record as Rec,
 	Redacted,
 	Schema,
+	String as Str,
 } from "effect";
 import packageJson from "../package.json" with { type: "json" };
 import { assetUrl, Manifest, pemContents } from "../src/update.ts";
@@ -52,7 +54,7 @@ export const writeManifest = Effect.fnUntraced(function* (key: CryptoKey) {
 				bytes,
 				platform,
 				sha256: new Bun.CryptoHasher("sha256").update(bytes).digest("hex"),
-				url: assetUrl(version, outfile.slice(outfile.lastIndexOf("/") + 1)),
+				url: assetUrl(version, Arr.lastNonEmpty(pipe(outfile, Str.split("/")))),
 			})
 		)
 	);

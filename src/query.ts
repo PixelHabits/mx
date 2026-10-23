@@ -6,7 +6,9 @@ import {
 	Effect,
 	Layer,
 	Path,
+	pipe,
 	Schema,
+	String as Str,
 	Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -52,9 +54,9 @@ const cell = (value: unknown) => {
 	if (value instanceof Uint8Array) {
 		return `(blob, ${value.byteLength} bytes)`;
 	}
-	const text = String(value).replaceAll(lineBreaks, " ");
+	const text = pipe(String(value), Str.replaceAll(lineBreaks, " "));
 	return text.length > maxValueLength && !isOutlookLink(text)
-		? `${text.slice(0, maxValueLength - 1)}…`
+		? `${pipe(text, Str.slice(0, maxValueLength - 1))}…`
 		: text;
 };
 

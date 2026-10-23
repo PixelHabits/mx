@@ -65,6 +65,8 @@
 					"effect/Logger#toFile",
 					// XDG paths and file names.
 					"effect/Path",
+					// mx's config, data, cache and state folders.
+					"effect/persistence/UserDirectories",
 					// systemd-creds for the saved sign-in.
 					"effect/process",
 					// The mail store in SQLite, and its transactions.
@@ -84,6 +86,7 @@
 					"classSelfMismatch": "error",
 					"duplicatePackage": "error",
 					"effectFnImplicitAny": "error",
+					"errorPayloadShadowsName": "error",
 					"experimentalApiUsage": "error",
 					"floatingEffect": "error",
 					"floatingEffectInVitest": "error",
@@ -98,6 +101,7 @@
 					"overriddenSchemaConstructor": "error",
 					"promiseInEffectSuccess": "error",
 					"schemaClassMissingBrand": "error",
+					"schemaClassObjectLiteral": "error",
 					"schemaLiteralNonFinite": "error",
 					"schemaOpaqueInstanceMember": "error",
 					"unsafeEffectTypeAssertion": "error",
@@ -143,6 +147,7 @@
 					"nodeBuiltinImport": "error",
 					"preferEffectArray": "error",
 					"preferEffectRecord": "error",
+					"preferEffectString": "error",
 					"preferSchemaOverJson": "error",
 					"processEnv": "error",
 					"processEnvInEffect": "error",
@@ -180,6 +185,8 @@
 					"nestedEffectGenYield": "error",
 					"newSchemaClass": "error",
 					"optionMatchToFromOption": "error",
+					"preferBarrelImport": "error",
+					"preferNamespaceImport": "error",
 					"preferSchemaTaggedError": "error",
 					"preferSchemaTypeProperty": "error",
 					"preferSucceedSomeOrNone": "error",

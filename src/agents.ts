@@ -5,11 +5,13 @@ import {
 	FileSystem,
 	Option,
 	Path,
+	pipe,
 	Record as Rec,
 	Result,
 	Schema,
+	String as Str,
 } from "effect";
-import { CliError, Flag, Prompt } from "effect/cli";
+import { CliError, Flag, Prompt, TerminalCapabilities } from "effect/cli";
 import { InstallFailed } from "./errors.ts";
 import { type Approval, recommendedApprovals } from "./mcp/server.ts";
 import { Paths } from "./paths.ts";
@@ -72,8 +74,9 @@ const desktopConfigs = Effect.gen(function* () {
 					return [];
 				}
 				return Arr.map(
-					Arr.filter(yield* fs.readDirectory(folder), (name) =>
-						name.startsWith("Claude_")
+					Arr.filter(
+						yield* fs.readDirectory(folder),
+						Str.startsWith("Claude_")
 					),
 					(name) =>
 						path.join(
@@ -197,10 +200,10 @@ export const agents = Effect.gen(function* () {
 const ask = Effect.gen(function* () {
 	const fs = yield* FileSystem.FileSystem;
 	const offered = yield* agents;
-	if (process.stdin.isTTY !== true) {
+	if (!(yield* TerminalCapabilities.TerminalCapabilities).canPrompt) {
 		return yield* CliError.UserError.make({
 			cause: undefined,
-			userMessage: `There is no terminal to ask which agents to set up. Name each with --agent: ${Arr.join(
+			userMessage: `mx can't ask which agents to set up here. Name each with --agent: ${Arr.join(
 				Arr.map(offered, (agent) => agent.id),
 				", "
 			)}.`,
@@ -308,17 +311,22 @@ const quotedBareKey = /"([\w-]+)"/gu;
 
 const tableName = (line: string) =>
 	Option.map(Option.fromNullishOr(tableHeader.exec(line)?.[1]), (name) =>
-		name.trim().replaceAll(dotSpacing, ".").replaceAll(quotedBareKey, "$1")
+		pipe(
+			name,
+			Str.trim,
+			Str.replaceAll(dotSpacing, "."),
+			Str.replaceAll(quotedBareKey, "$1")
+		)
 	);
 
 const isMxTable = (name: string) =>
-	name === "mcp_servers.mx" || name.startsWith("mcp_servers.mx.");
+	name === "mcp_servers.mx" || pipe(name, Str.startsWith("mcp_servers.mx."));
 
-const isBlank = (line: string) => line.trim() === "";
+const isBlank = (line: string) => Str.trim(line) === "";
 
 /** A line that holds a key or a value, not only space or a comment. */
 const holdsValue = (line: string) =>
-	!(isBlank(line) || line.trim().startsWith("#"));
+	!(isBlank(line) || pipe(line, Str.trim, Str.startsWith("#")));
 
 /**
  * The text with every `[mcp_servers.mx]` and `[mcp_servers.mx.*]` table cut out and `section` where the first one stood,
@@ -326,7 +334,7 @@ const holdsValue = (line: string) =>
  * they stay.
  */
 const replaceMxTables = (text: string, section: readonly string[]) => {
-	const eol = text.includes("\r\n") ? "\r\n" : "\n";
+	const eol = pipe(text, Str.includes("\r\n")) ? "\r\n" : "\n";
 	const kept: string[] = [];
 	let table: string[] | undefined;
 	let placed = false;
@@ -345,7 +353,7 @@ const replaceMxTables = (text: string, section: readonly string[]) => {
 				: trailing)
 		);
 	};
-	for (const line of text.split(eol)) {
+	for (const line of pipe(text, Str.split(eol))) {
 		const name = tableName(line);
 		if (Option.isSome(name)) {
 			if (table !== undefined) {
@@ -369,7 +377,7 @@ const replaceMxTables = (text: string, section: readonly string[]) => {
 	if (placed || section.length === 0) {
 		return Arr.join(kept, eol);
 	}
-	const before = text.trimEnd();
+	const before = Str.trimEnd(text);
 	return `${before}${before === "" ? "" : `${eol}${eol}`}${Arr.join(section, eol)}${eol}`;
 };
 
@@ -474,7 +482,11 @@ const editToml = ({ entry, file, text }: Edit) =>
 		const section = Option.match(wanted, {
 			onNone: () => [],
 			onSome: (mx) =>
-				Bun.TOML.stringify({ mcp_servers: { mx } }).trimEnd().split("\n"),
+				pipe(
+					Bun.TOML.stringify({ mcp_servers: { mx } }),
+					Str.trimEnd,
+					Str.split("\n")
+				),
 		});
 		const edited = replaceMxTables(text, section);
 		const after = yield* parseToml(edited).pipe(
@@ -530,7 +542,7 @@ const ruleFor = (tool: string) => `mcp__mx__${tool}`;
  */
 const covers = (rule: string, tool: string) =>
 	rule === "mcp__mx" ||
-	(!rule.includes("(") && new Bun.Glob(rule).match(ruleFor(tool)));
+	(!pipe(rule, Str.includes("(")) && new Bun.Glob(rule).match(ruleFor(tool)));
 
 type Rules = Readonly<Record<Approval, readonly string[]>>;
 
@@ -588,7 +600,7 @@ const presetPermissions = ({
 
 /** Whether a Claude Code permission rule names mx: `mcp__mx`, or one of its tools as `mcp__mx__<tool>` or `mcp__mx__*`. */
 const namesMx = (rule: string) =>
-	rule === "mcp__mx" || rule.startsWith("mcp__mx__");
+	rule === "mcp__mx" || pipe(rule, Str.startsWith("mcp__mx__"));
 
 /** The lists of Claude Code's permission rules. */
 const ruleLists = ["allow", "ask", "deny"] as const;
