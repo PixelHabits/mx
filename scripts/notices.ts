@@ -46,7 +46,7 @@ export const notices = Effect.fnUntraced(function* (inputs: readonly string[]) {
 	const bun = pinnedBun.exec(packageJson.packageManager)?.[1];
 	if (bun === undefined) {
 		return yield* Effect.die(
-			`packageManager in package.json is ${packageJson.packageManager}; the notices need it to pin one Bun, as bun@1.4.3.`
+			`packageManager in package.json is ${packageJson.packageManager}; the notices need it to pin one Bun, as bun@1.4.4.`
 		);
 	}
 	const folders = Arr.dedupe(
