@@ -949,6 +949,16 @@ const ownStore = (name: string) => {
 	};
 };
 
+/** `platform` on a Windows machine of its own below `root`: its home, `%APPDATA%` and `%LOCALAPPDATA%` are there. */
+const ownWindows = (root: string) =>
+	platformWith({
+		...environment,
+		APPDATA: join(root, "Roaming"),
+		HOME: root,
+		LOCALAPPDATA: join(root, "Local"),
+		USERPROFILE: root,
+	});
+
 /** The schema that mx 0.1.0 created at every start, before the store recorded its migrations. */
 const schemaBeforeMigrations = `
 PRAGMA journal_mode = WAL;
@@ -5129,36 +5139,25 @@ describe("mx", () => {
 			})
 		));
 
-	test("on Windows, mx install selects Claude Desktop from the Microsoft Store when its package holds its config, and sets up mx there, and mx uninstall takes mx out", () =>
+	test("on Windows, mx install --agent claude-desktop sets up mx in the config Claude Desktop from the Microsoft Store keeps in Claude-Data, and mx uninstall takes mx out", () =>
 		onWindows(
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
-				// A machine of its own, where the packaged Claude Desktop wrote its config and the documented one is absent.
-				const root = join(home, "store-desktop");
-				const storeConfig = join(
+				// A machine of its own, where Claude Desktop keeps its only config in Claude-Data.
+				const root = join(home, "claude-data-desktop");
+				const dataConfig = join(
 					root,
 					"Local",
-					"Packages",
-					"Claude_0test0publisher",
-					"LocalCache",
-					"Roaming",
-					"Claude",
+					"Claude-Data",
+					"claude_0test0publisher",
 					"claude_desktop_config.json"
 				);
 				const settings = { preferences: { sidebarMode: "chat" } };
-				yield* fs.makeDirectory(dirname(storeConfig), { recursive: true });
-				yield* writeJson(storeConfig, settings);
-				yield* writeJson(join(root, ".claude.json"), { numStartups: 1 });
-				const system = platformWith({
-					...environment,
-					APPDATA: join(root, "Roaming"),
-					HOME: root,
-					LOCALAPPDATA: join(root, "Local"),
-					USERPROFILE: root,
-				});
-				const { system: onTerminal } = fakeTerminal(system, ["return"]);
-				yield* withTerminal(true)(cliOn(onTerminal)("install"));
-				expect(yield* readJson(storeConfig)).toEqual({
+				yield* fs.makeDirectory(dirname(dataConfig), { recursive: true });
+				yield* writeJson(dataConfig, settings);
+				const system = ownWindows(root);
+				yield* cliOn(system)("install", "--agent", "claude-desktop");
+				expect(yield* readJson(dataConfig)).toEqual({
 					...settings,
 					mcpServers: {
 						mx: {
@@ -5169,10 +5168,71 @@ describe("mx", () => {
 				});
 				expect(yield* fs.exists(join(root, "Roaming", "Claude"))).toBe(false);
 				yield* cliOn(system)("uninstall", "--yes");
-				expect(yield* readJson(storeConfig)).toEqual({
+				expect(yield* readJson(dataConfig)).toEqual({
 					...settings,
 					mcpServers: {},
 				});
+			})
+		));
+
+	test("on Windows, mx install selects Claude Desktop from the Microsoft Store when Claude-Data and its package hold its configs, and sets up mx in both, and mx uninstall takes mx out of both", () =>
+		onWindows(
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				// A machine of its own, where Claude Desktop wrote a config in Claude-Data and in its package, and the documented one is absent.
+				const root = join(home, "store-desktop");
+				const configs = [
+					{
+						file: join(
+							root,
+							"Local",
+							"Claude-Data",
+							"claude_0test0publisher",
+							"claude_desktop_config.json"
+						),
+						settings: { preferences: { sidebarMode: "chat" } },
+					},
+					{
+						file: join(
+							root,
+							"Local",
+							"Packages",
+							"Claude_0test0publisher",
+							"LocalCache",
+							"Roaming",
+							"Claude",
+							"claude_desktop_config.json"
+						),
+						settings: { preferences: { sidebarMode: "code" } },
+					},
+				];
+				for (const { file, settings } of configs) {
+					yield* fs.makeDirectory(dirname(file), { recursive: true });
+					yield* writeJson(file, settings);
+				}
+				yield* writeJson(join(root, ".claude.json"), { numStartups: 1 });
+				const system = ownWindows(root);
+				const { system: onTerminal } = fakeTerminal(system, ["return"]);
+				yield* withTerminal(true)(cliOn(onTerminal)("install"));
+				for (const { file, settings } of configs) {
+					expect(yield* readJson(file)).toEqual({
+						...settings,
+						mcpServers: {
+							mx: {
+								args: ["mcp"],
+								command: join(root, "Local", "Programs", "mx", "mx.exe"),
+							},
+						},
+					});
+				}
+				expect(yield* fs.exists(join(root, "Roaming", "Claude"))).toBe(false);
+				yield* cliOn(system)("uninstall", "--yes");
+				for (const { file, settings } of configs) {
+					expect(yield* readJson(file)).toEqual({
+						...settings,
+						mcpServers: {},
+					});
+				}
 			})
 		));
 
