@@ -1,14 +1,20 @@
 import { Schema } from "effect";
 
-/** No saved sign-in, or Microsoft refused it; only a new device-code sign-in helps. */
+/**
+ * No saved sign-in, or Microsoft refused it; only a new device-code sign-in helps. `account` names the account to sign in
+ * to again when mx has several.
+ */
 export class LoginRequired extends Schema.TaggedError<
 	LoginRequired,
 	{ readonly brand: unique symbol }
 >("mx/errors/LoginRequired")("LoginRequired", {
+	account: Schema.optionalKey(Schema.String),
 	reason: Schema.String,
 }) {
 	override get message() {
-		return `${this.reason} Run mx login.`;
+		return this.account === undefined
+			? `${this.reason} Run mx login.`
+			: `${this.reason} Run mx login --account ${this.account}.`;
 	}
 }
 
@@ -86,7 +92,10 @@ export class NotFound extends Schema.TaggedError<
 	message: Schema.String,
 }) {}
 
-/** A tool refuses a request it could carry out, such as deleting a message that is not a draft through `delete_draft`. */
+/**
+ * mx refuses a request it could carry out, such as deleting a message that is not a draft through `delete_draft`, or
+ * adding a mailbox that is already an account.
+ */
 export class Refused extends Schema.TaggedError<
 	Refused,
 	{ readonly brand: unique symbol }
@@ -127,6 +136,14 @@ export class NewerStore extends Schema.TaggedError<
 		return "This mail store was written by a newer mx. Run mx update.";
 	}
 }
+
+/** `mx sync --once` could not sync some of several accounts; `message` names each, a line apiece, and why. */
+export class SyncFailed extends Schema.TaggedError<
+	SyncFailed,
+	{ readonly brand: unique symbol }
+>("mx/errors/SyncFailed")("SyncFailed", {
+	message: Schema.String,
+}) {}
 
 /** `mx status` found mx sync stopped or reporting an error; `message` says which. */
 export class SyncUnhealthy extends Schema.TaggedError<

@@ -59,8 +59,9 @@ export interface FakeSubscription {
 }
 
 /**
- * Graph's subscriptions for the signed-in user. Creating one validates both URLs as Graph does: a POST with a
- * `validationToken` that must come back as text within the request.
+ * Graph's subscriptions for the user of one mailbox. Creating one validates both URLs as Graph does: a POST with a
+ * `validationToken` that must come back as text within the request. Every id starts with the mailbox's `prefix`, so no
+ * id is in two mailboxes.
  */
 export class FakeSubscriptions {
 	readonly byId = new Map<string, FakeSubscription>();
@@ -71,15 +72,17 @@ export class FakeSubscriptions {
 	private next = 0;
 
 	private readonly tunnels: FakeTunnels;
+	private readonly prefix: string;
 
-	constructor(tunnels: FakeTunnels) {
+	constructor(tunnels: FakeTunnels, prefix: string) {
 		this.tunnels = tunnels;
+		this.prefix = prefix;
 	}
 
 	/** Adds a subscription another run left behind. */
 	seed(subscription: Omit<FakeSubscription, "id">) {
 		this.next += 1;
-		const id = `subscription-stale-${this.next}`;
+		const id = `${this.prefix}subscription-stale-${this.next}`;
 		this.byId.set(id, { ...subscription, id });
 		return id;
 	}
@@ -211,7 +214,7 @@ export class FakeSubscriptions {
 			changeType: String(body.changeType),
 			clientState: String(body.clientState),
 			expirationDateTime: String(body.expirationDateTime),
-			id: `subscription-${this.next}`,
+			id: `${this.prefix}subscription-${this.next}`,
 			lifecycleNotificationUrl,
 			notificationUrl,
 			resource: String(body.resource),

@@ -60,6 +60,8 @@
 					"effect/FileSystem",
 					// Microsoft's token endpoint and Graph.
 					"effect/http",
+					// Each account's Graph and Sync, built once for its account id.
+					"effect/LayerMap",
 					// The Graph mail endpoints as an HttpApi.
 					"effect/http-api",
 					"effect/Logger#toFile",

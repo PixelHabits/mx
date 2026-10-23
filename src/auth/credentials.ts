@@ -9,19 +9,17 @@ import {
 } from "effect";
 import { CredentialFailed, LoginRequired } from "../errors.ts";
 import { Paths } from "../paths.ts";
-import {
-	ClientId,
-	encodeConfigFile,
-	readSaved,
-	type SignInConfig,
-	Tenant,
-} from "./config.ts";
+import { ClientId, Tenant } from "./config.ts";
 
-/** The sign-in's entry in the secret store: Windows Credential Manager, the macOS Keychain or libsecret. */
-const entry = { name: "refresh-token", service: "mx" };
+/**
+ * The name of an account's sign-in: its entry in the secret store, Windows Credential Manager, the macOS Keychain or
+ * libsecret, and its plain-text file on a machine without one. Account 1's is `refresh-token`, the name an mx mcp of an
+ * earlier release, which an update leaves running, reads.
+ */
+const nameOf = (account: number) =>
+	account === 1 ? "refresh-token" : `refresh-token-${account}`;
 
-/** The plain-text file that holds the sign-in on a machine without a secret store. */
-const fileName = "refresh-token";
+const service = "mx";
 
 /**
  * A saved sign-in: the refresh token, the client id and the tenant Microsoft issued it for, and the id `mx login` gave
@@ -72,25 +70,22 @@ const inSecretStore = <A>(run: () => Promise<A>) =>
 	});
 
 /**
- * The sign-in, in the system's secret store through `Bun.secrets`, or in a file only the user can read when the machine
- * has no secret store, and the client id and tenant `mx login` asks with, in config.json. Each process reads the
- * sign-in and writes its rotated token back; the last write wins. Each file is written by renaming a complete file over
- * the old one, so a reader never sees half of one.
+ * Each account's sign-in, in the system's secret store through `Bun.secrets`, or in a file only the user can read when
+ * the machine has no secret store. Each process reads a sign-in and writes its rotated token back; the last write wins.
+ * Each file is written by renaming a complete file over the old one, so a reader never sees half of one.
  */
 export class Credentials extends Context.Service<
 	Credentials,
 	{
-		readonly read: Effect.Effect<SignIn, LoginRequired | CredentialFailed>;
-		readonly write: (signIn: SignIn) => Effect.Effect<void, CredentialFailed>;
-		/** Deletes the saved sign-in. */
-		readonly remove: Effect.Effect<void, CredentialFailed>;
-		/**
-		 * Saves the client id and the tenant to sign in with. A refresh token works only with the client id and the
-		 * tenant it was issued for, so a change to either deletes the saved sign-in.
-		 */
-		readonly use: (
-			config: SignInConfig
+		readonly read: (
+			account: number
+		) => Effect.Effect<SignIn, LoginRequired | CredentialFailed>;
+		readonly write: (
+			account: number,
+			signIn: SignIn
 		) => Effect.Effect<void, CredentialFailed>;
+		/** Deletes the account's saved sign-in. */
+		readonly remove: (account: number) => Effect.Effect<void, CredentialFailed>;
 	}
 >()("mx/auth/credentials") {
 	static readonly layer = Layer.effect(
@@ -98,45 +93,48 @@ export class Credentials extends Context.Service<
 		Effect.gen(function* () {
 			const fs = yield* FileSystem.FileSystem;
 			const path = yield* Path.Path;
-			const { configFile, state } = yield* Paths;
-			const file = path.join(state, fileName);
+			const { state } = yield* Paths;
+			const fileOf = (account: number) => path.join(state, nameOf(account));
+			const entryOf = (account: number) => ({ name: nameOf(account), service });
 			const failed = (error: { readonly message: string }) =>
 				CredentialFailed.make({ message: error.message });
 
-			const readFile = Effect.gen(function* () {
+			const readFile = Effect.fnUntraced(function* (file: string) {
 				if (!(yield* fs.exists(file))) {
 					return Option.none<string>();
 				}
 				return Option.some(yield* fs.readFileString(file));
 			});
 
-			const read = Effect.gen(function* () {
-				const stored = yield* inSecretStore(() => Bun.secrets.get(entry));
-				const saved = Option.isSome(stored)
-					? Option.fromNullishOr(stored.value)
-					: yield* readFile;
-				if (Option.isNone(saved)) {
-					return yield* LoginRequired.make({ reason: "No saved sign-in." });
-				}
-				// The decoding error quotes what it read, and that holds the refresh token.
-				return yield* decodeSignIn(saved.value).pipe(
-					Effect.mapError(() =>
-						CredentialFailed.make({
-							message:
-								"The saved sign-in is not one mx can read. Run mx login.",
-						})
-					)
-				);
-			}).pipe(
-				Effect.catchTag("PlatformError", (error) => Effect.fail(failed(error))),
-				Effect.withSpan("Credentials.read")
+			const read = Effect.fn("Credentials.read")(
+				function* (account: number) {
+					const stored = yield* inSecretStore(() =>
+						Bun.secrets.get(entryOf(account))
+					);
+					const saved = Option.isSome(stored)
+						? Option.fromNullishOr(stored.value)
+						: yield* readFile(fileOf(account));
+					if (Option.isNone(saved)) {
+						return yield* LoginRequired.make({ reason: "No saved sign-in." });
+					}
+					// The decoding error quotes what it read, and that holds the refresh token.
+					return yield* decodeSignIn(saved.value).pipe(
+						Effect.mapError(() =>
+							CredentialFailed.make({
+								message:
+									"The saved sign-in is not one mx can read. Run mx login.",
+							})
+						)
+					);
+				},
+				Effect.catchTag("PlatformError", (error) => Effect.fail(failed(error)))
 			);
 
 			const write = Effect.fn("Credentials.write")(
-				function* (signIn: SignIn) {
+				function* (account: number, signIn: SignIn) {
 					const value = yield* encodeSignIn(signIn).pipe(Effect.orDie);
 					const stored = yield* inSecretStore(() =>
-						Bun.secrets.set({ ...entry, value })
+						Bun.secrets.set({ ...entryOf(account), value })
 					);
 					if (Option.isSome(stored)) {
 						return;
@@ -145,47 +143,21 @@ export class Credentials extends Context.Service<
 					const staged = yield* fs.makeTempFileScoped({ directory: state });
 					yield* fs.chmod(staged, 0o600);
 					yield* fs.writeFileString(staged, value);
-					yield* fs.rename(staged, file);
+					yield* fs.rename(staged, fileOf(account));
 				},
 				Effect.scoped,
 				Effect.catchTag("PlatformError", (error) => Effect.fail(failed(error)))
 			);
 
-			const remove = Effect.gen(function* () {
-				yield* inSecretStore(() => Bun.secrets.delete(entry));
-				yield* fs.remove(file, { force: true });
-			}).pipe(
-				Effect.catchTag("PlatformError", (error) => Effect.fail(failed(error))),
-				Effect.withSpan("Credentials.remove")
-			);
-
-			const use = Effect.fn("Credentials.use")(
-				function* (config: SignInConfig) {
-					const saved = yield* readSaved({ configFile, fs });
-					if (
-						Option.exists(
-							saved,
-							({ clientId, tenant }) =>
-								clientId === config.clientId && tenant === config.tenant
-						)
-					) {
-						return;
-					}
-					yield* remove;
-					const folder = path.dirname(configFile);
-					yield* fs.makeDirectory(folder, { recursive: true });
-					const staged = yield* fs.makeTempFileScoped({ directory: folder });
-					yield* fs.writeFileString(
-						staged,
-						yield* encodeConfigFile(config).pipe(Effect.orDie)
-					);
-					yield* fs.rename(staged, configFile);
+			const remove = Effect.fn("Credentials.remove")(
+				function* (account: number) {
+					yield* inSecretStore(() => Bun.secrets.delete(entryOf(account)));
+					yield* fs.remove(fileOf(account), { force: true });
 				},
-				Effect.scoped,
 				Effect.catchTag("PlatformError", (error) => Effect.fail(failed(error)))
 			);
 
-			return Credentials.of({ read, remove, use, write });
+			return Credentials.of({ read, remove, write });
 		})
 	);
 }

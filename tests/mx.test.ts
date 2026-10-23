@@ -33,9 +33,7 @@ import type { ChildProcess } from "effect/process";
 import { SqlClient } from "effect/sql";
 import { TestClock, TestConsole } from "effect/testing";
 import packageJson from "../package.json" with { type: "json" };
-import { savedConfig } from "../src/auth/config.ts";
 import { mx, run as runMx } from "../src/cli.ts";
-import { Paths } from "../src/paths.ts";
 import { migrate, migrations } from "../src/store/migrations.ts";
 import {
 	deleteAfterExit,
@@ -160,20 +158,18 @@ const unconfiguredEnvironment = Rec.remove(
 
 /**
  * What every mx process runs on: Microsoft and the internet, Bun with faked child processes, a console that keeps its
- * lines, Config over `env` and the saved config.json, and the terminal's capabilities from `env` and the TTY state of
- * stdin and stdout, as `src/main.ts` sets it up.
+ * lines, Config over `env`, and the terminal's capabilities from `env` and the TTY state of stdin and stdout, as
+ * `src/main.ts` sets it up.
  */
 const platformWith = (env: Record<string, string>) => {
-	const bunWithEnv = Layer.merge(
-		BunServices.layer,
-		ConfigProvider.layer(ConfigProvider.fromUnknown(env))
-	);
+	const config = ConfigProvider.layer(ConfigProvider.fromUnknown(env));
+	const bunWithEnv = Layer.merge(BunServices.layer, config);
 	return Layer.mergeAll(
 		microsoft.layer,
 		BunServices.layer,
-		processes.layer,
+		processes.layer(env),
 		TestConsole.layer,
-		savedConfig.pipe(Layer.provide(Paths.layer), Layer.provide(bunWithEnv)),
+		config,
 		TerminalCapabilities.layer.pipe(Layer.provide(bunWithEnv)),
 		Layer.succeed(Home, home)
 	);
@@ -940,12 +936,19 @@ const neverSynced = (name: string) =>
 		});
 	});
 
-/** `platform` on a machine of its own below `name`, and where mx keeps the mail store there. */
+/** `platform` on a machine of its own below `name`, and where mx keeps config.json and the mail store there. */
 const ownStore = (name: string) => {
 	const root = join(home, name);
 	return {
+		configFile: join(root, "config", "mx", "config.json"),
 		database: join(root, "data", "mx", "mx.sqlite"),
-		system: platformWith({ ...environment, XDG_DATA_HOME: join(root, "data") }),
+		system: platformWith({
+			...environment,
+			XDG_CACHE_HOME: join(root, "cache"),
+			XDG_CONFIG_HOME: join(root, "config"),
+			XDG_DATA_HOME: join(root, "data"),
+			XDG_STATE_HOME: join(root, "state"),
+		}),
 	};
 };
 
@@ -1055,7 +1058,7 @@ const onStore =
  * may, so the next pass reads each folder from the start.
  */
 const laterMigration = {
-	"0002_resync_every_folder": Effect.flatMap(SqlClient.SqlClient, (sql) =>
+	"0003_resync_every_folder": Effect.flatMap(SqlClient.SqlClient, (sql) =>
 		Effect.asVoid(sql`UPDATE folders SET delta_link = NULL`)
 	),
 };
@@ -1147,6 +1150,7 @@ const replyDraftLine = /^#\d+ .* Drafts \| to Carol Example/u;
 const permanent = /permanentDelete/u;
 const runningLine = /^mx sync: running, last heard from \d+ s ago$/u;
 const lastSyncLine = /^Last sync: \d{4}-\d{2}-\d{2} \d{2}:\d{2}, \d+ s ago$/u;
+const modeLine = /^Mode: /u;
 /** The line mx sync logs as it starts, when push comes up or cannot. */
 const pushModeLine = /^Push is (up through|unavailable:) /u;
 const loopbackUrl = /^http:\/\/127\.0\.0\.1:\d+$/u;
@@ -1159,6 +1163,7 @@ const bookClubReplyLine =
 	/ \| Jonas Example <jonas@example\.com> \| RE: Book club: the next novel \| unread \(\+1 in thread\)$/u;
 const recipeSwapLine = /Recipe swap \| unread \(\+3 in thread\)$/u;
 const idListingPath = /^\/v1\.0\/me\/mailFolders\/[^/]+\/messages$/u;
+const reconciledLine = /^contoso: Reconciled \d+ folders: /u;
 const seedOrderLine = /^#2 .* \| Garden supplies order \| unread$/mu;
 const rotaInArchiveLine =
 	/ Archive \| Rosa Example <rosa@example\.com> \| Garden plot rota /u;
@@ -1846,7 +1851,7 @@ describe("mx", () => {
 			const forms = tokenForms();
 			expect(forms[0]?.get("client_id")).toBe(clientId);
 			expect(forms[0]?.get("scope")).toBe(
-				"https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send offline_access"
+				"https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send offline_access openid email profile"
 			);
 			expect(
 				Arr.filter(
@@ -2009,8 +2014,17 @@ describe("mx", () => {
 			expect(drawn).toContain("Client id");
 			expect(drawn).toContain("Tenant");
 			expect(yield* readJson(configFile)).toEqual({
-				clientId,
-				tenant: "organizations",
+				accounts: [
+					{
+						address: "sam@example.test",
+						alias: "main",
+						clientId,
+						id: 1,
+						oid: microsoft.mailbox.oid,
+						tenant: "organizations",
+						tid: microsoft.mailbox.tid,
+					},
+				],
 			});
 			expect(tokenForms().at(-1)?.get("client_id")).toBe(clientId);
 			expect(tenantsAsked().at(-1)).toBe("organizations");
@@ -2030,8 +2044,14 @@ describe("mx", () => {
 			yield* eventually("a device code", () => devicecodeRequests() > asked);
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
 			expect(yield* readJson(configFile)).toEqual({
-				clientId: otherClientId,
-				tenant: "organizations",
+				accounts: [
+					{
+						alias: "main",
+						clientId: otherClientId,
+						id: 1,
+						tenant: "organizations",
+					},
+				],
 			});
 			yield* Fiber.join(login);
 			expect(tokenForms().at(-1)?.get("client_id")).toBe(otherClientId);
@@ -2048,8 +2068,7 @@ describe("mx", () => {
 			yield* eventually("a device code", () => devicecodeRequests() > asked);
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
 			expect(yield* readJson(configFile)).toEqual({
-				clientId: otherClientId,
-				tenant,
+				accounts: [{ alias: "main", clientId: otherClientId, id: 1, tenant }],
 			});
 			yield* Fiber.join(login);
 			expect(tenantsAsked().at(-1)).toBe(tenant);
@@ -2202,9 +2221,23 @@ describe("mx", () => {
 			expect(lines(output).at(-1)).toBe("Restarted mx sync.");
 		}));
 
-	test("mx sync records a heartbeat after its first pass, and mx status reports it running with its mode, both versions, a saved sign-in, the client id and the tenant, and no error", () =>
+	test("mx status shows how far the first sync has got while it runs, and once mx sync records a heartbeat after its first pass, reports it running with its mode, both versions, a saved sign-in, the client id and the tenant, and no error", () =>
 		Effect.gen(function* () {
+			const firstSync = `First sync: ${allFolders.length - 1} of ${allFolders.length} folders done`;
+			microsoft.hold("folder-inbox");
 			const service = yield* Effect.forkChild(cli("sync"));
+			yield* eventually(
+				"mx status to show every folder but Inbox synced",
+				Effect.map(status, ({ output: report }) =>
+					lines(report).includes(firstSync)
+				)
+			);
+			expect(lines((yield* status).output).slice(1, 4)).toEqual([
+				"Last sync: never",
+				firstSync,
+				expect.stringMatching(modeLine),
+			]);
+			microsoft.release("folder-inbox");
 			yield* eventually(
 				"a heartbeat after the first pass",
 				Effect.map(
@@ -2222,12 +2255,19 @@ describe("mx", () => {
 				expect.stringMatching(lastSyncLine),
 				"Mode: poll",
 				`Version: mx sync ${running}, this binary ${running}`,
+				"Account main: sam@example.test",
 				"Sign-in: saved",
-				"Client id: set",
+				`Client id: ${otherClientId}`,
 				`Tenant: ${tenant}`,
 				"Last error: none",
 			]);
-		}));
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					microsoft.release("folder-inbox");
+				})
+			)
+		));
 
 	test("mx sync writes each line it logs to the log as it logs it, where mx log --sync shows it, and on Windows it writes no sync.log", () =>
 		onWindows(
@@ -2659,6 +2699,35 @@ describe("mx", () => {
 			expect(Arr.join(wide.slice(0, -1), "\n").length).toBeLessThanOrEqual(
 				20_000
 			);
+		}));
+
+	test("mx query-worker answers the request of an mx mcp from 0.3.0, which an update leaves running on the new binary", () =>
+		Effect.gen(function* () {
+			// The request as mx 0.3.0 writes it.
+			const request = yield* Schema.encodeEffect(
+				Schema.fromJsonString(
+					Schema.Struct({ database: Schema.String, sql: Schema.String })
+				)
+			)({
+				database: join(dataFolder, "mx.sqlite"),
+				sql: "SELECT DISTINCT account FROM mail",
+			}).pipe(Effect.orDie);
+			const worker = Bun.spawn(
+				[process.execPath, "--no-env-file", "src/main.ts", "query-worker"],
+				{
+					cwd: `${import.meta.dir}/..`,
+					// The worker reads the aliases in config.json, which it finds through the environment of the mx mcp that starts it.
+					env: { ...environment, ...Rec.getSomes({ SystemRoot: systemRoot }) },
+					stderr: "inherit",
+					stdin: new TextEncoder().encode(request),
+					stdout: "pipe",
+				}
+			);
+			const [code, answer] = yield* Effect.promise(() =>
+				Promise.all([worker.exited, new Response(worker.stdout).text()])
+			);
+			expect(code).toBe(0);
+			expect(yield* parseJson(answer)).toEqual({ table: "account\nmain" });
 		}));
 
 	test("query stops a query that runs past 10 seconds and says so, while mx mcp answers other calls", () =>
@@ -4082,7 +4151,9 @@ describe("mx", () => {
 				);
 			});
 			const contents = withDatabase(database, (db) => ({
-				folders: db.query("SELECT * FROM folders").all(),
+				folders: db
+					.query<Record<string, unknown>, []>("SELECT * FROM folders")
+					.all(),
 				localIds: db.query("SELECT * FROM local_ids").all(),
 				messages: db.query("SELECT * FROM messages").all(),
 			}));
@@ -4102,8 +4173,15 @@ describe("mx", () => {
 			expect(found.text).toMatch(seedOrderLine);
 			expect(yield* recordedMigrations(database)).toEqual([
 				{ id: 1, name: "initial" },
+				{ id: 2, name: "accounts" },
 			]);
-			expect(yield* contents).toEqual(before);
+			expect(yield* contents).toEqual({
+				...before,
+				folders: Arr.map(before.folders, (folder) => ({
+					...folder,
+					account_id: 1,
+				})),
+			});
 		}));
 
 	test("a later migration runs once: the store records it, and the next start runs nothing", () =>
@@ -4126,7 +4204,8 @@ describe("mx", () => {
 			expect(yield* links).toEqual([{ link: null }]);
 			const recorded = [
 				{ id: 1, name: "initial" },
-				{ id: 2, name: "resync_every_folder" },
+				{ id: 2, name: "accounts" },
+				{ id: 3, name: "resync_every_folder" },
 			];
 			expect(yield* recordedMigrations(database)).toEqual(recorded);
 			yield* withDatabase(database, (db) =>
@@ -4151,7 +4230,185 @@ describe("mx", () => {
 			expect(Bun.hash(yield* fs.readFile(database))).toBe(before);
 			expect(yield* recordedMigrations(database)).toEqual([
 				{ id: 1, name: "initial" },
-				{ id: 2, name: "resync_every_folder" },
+				{ id: 2, name: "accounts" },
+				{ id: 3, name: "resync_every_folder" },
+			]);
+		}));
+
+	test("a store that mx 0.2.0 wrote opens with every folder, message, local id, search row and delta link kept, all under account 1, which takes the heartbeat's last sync and error, and query shows the mail in account main", () =>
+		Effect.gen(function* () {
+			const { database, system } = ownStore("store-0.2.0");
+			yield* (yield* FileSystem.FileSystem).makeDirectory(dirname(database), {
+				recursive: true,
+			});
+			yield* onStore(database)(
+				migrate({ "0001_initial": migrations["0001_initial"] })
+			);
+			const received = Temporal.Instant.from(
+				"2026-10-03T09:30:00Z"
+			).epochMilliseconds;
+			const lastSuccess = Temporal.Instant.from(
+				"2026-10-03T10:00:00Z"
+			).epochMilliseconds;
+			const lastError = "Skipped folder Archive: Graph refused the request.";
+			yield* withDatabase(database, (db) => {
+				db.run(
+					"INSERT INTO folders (id, parent_id, name, path, sent, delta_link) VALUES ('folder-inbox', 'root', 'Inbox', 'Inbox', 0, 'delta-link-inbox'), ('folder-sent', 'root', 'Sent Items', 'Sent Items', 1, 'delta-link-sent')"
+				);
+				db.run(
+					"INSERT INTO local_ids (id, graph_id) VALUES (1, 'message-gone'), (2, 'message-seeds'), (3, 'message-thanks')"
+				);
+				db.run(
+					`INSERT INTO messages (id, graph_id, folder_id, conversation_id, internet_message_id, from_name, from_address, to_list, cc_list, bcc_list, subject, received_at, sent_at, is_read, is_draft, flag, categories, importance, has_attachments, body)
+					VALUES (2, 'message-seeds', 'folder-inbox', 'conversation-garden', NULL, 'Marta Example', 'marta@example.com', '[]', '[]', '[]', 'Garden supplies order', ${received}, ${received}, 0, 0, 'notFlagged', '[]', 'normal', 0, 'The seed order was approved this morning.'),
+					(3, 'message-thanks', 'folder-sent', 'conversation-garden', NULL, 'Sam Example', 'sam@example.test', '[]', '[]', '[]', 'RE: Garden supplies order', ${received + 60_000}, ${received + 60_000}, 1, 0, 'notFlagged', '[]', 'normal', 0, 'Thanks, Marta.')`
+				);
+				db.query(
+					"INSERT INTO heartbeat (id, written_at, last_success_at, mode, version, last_error) VALUES (1, $success, $success, 'push', '0.2.0', $error)"
+				).run({ error: lastError, success: lastSuccess });
+			});
+			const contents = withDatabase(database, (db) => ({
+				folders: db
+					.query<Record<string, unknown>, []>("SELECT * FROM folders")
+					.all(),
+				heartbeat: db.query("SELECT * FROM heartbeat").all(),
+				localIds: db.query("SELECT * FROM local_ids").all(),
+				messages: db.query("SELECT * FROM messages").all(),
+				search: db
+					.query("SELECT rowid, subject, sender, body FROM search")
+					.all(),
+			}));
+			const before = yield* contents;
+			const { found, views } = yield* Effect.gen(function* () {
+				const { client, stdio } = yield* connect();
+				yield* Command.runWith(mx, { version: "0.0.0-test" })(["mcp"]).pipe(
+					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+					Effect.provide(stdio),
+					// @effect-diagnostics-next-line strictEffectProvide:off - the entry point of this mx mcp process.
+					Effect.provide(system, { local: true }),
+					Effect.forkScoped
+				);
+				return {
+					found: yield* client.call("search", { query: "approve" }),
+					views: yield* client.call("query", {
+						sql: "SELECT 'mail' AS view, account, count(*) AS n FROM mail GROUP BY account UNION ALL SELECT 'folders', account, count(*) FROM folders GROUP BY account UNION ALL SELECT 'conversations', account, count(*) FROM conversations GROUP BY account",
+					}),
+				};
+			}).pipe(Effect.scoped);
+			expect(found.text).toContain(
+				"| Garden supplies order | unread (+1 in thread)"
+			);
+			expect(views.isError).toBe(false);
+			expect(views.text).toEndWith(
+				"view\taccount\tn\nmail\tmain\t2\nfolders\tmain\t2\nconversations\tmain\t1"
+			);
+			expect(yield* contents).toEqual({
+				...before,
+				folders: Arr.map(before.folders, (folder) => ({
+					...folder,
+					account_id: 1,
+				})),
+			});
+			expect(
+				yield* withDatabase(database, (db) =>
+					db.query("SELECT * FROM accounts").all()
+				)
+			).toEqual([
+				{
+					id: 1,
+					last_error: lastError,
+					last_success_at: lastSuccess,
+					mode: "push",
+				},
+			]);
+			expect(yield* recordedMigrations(database)).toEqual([
+				{ id: 1, name: "initial" },
+				{ id: 2, name: "accounts" },
+			]);
+		}));
+
+	test("mx sync lists the folders and checks the store against Graph within its own account, so another account's folders and mail stay", () =>
+		Effect.gen(function* () {
+			const {
+				configFile: ownConfigFile,
+				database,
+				system,
+			} = ownStore("store-two-accounts");
+			const fs = yield* FileSystem.FileSystem;
+			yield* fs.makeDirectory(dirname(database), { recursive: true });
+			yield* onStore(database)(migrate(migrations));
+			const received = Temporal.Instant.from(
+				"2026-10-05T18:00:00Z"
+			).epochMilliseconds;
+			// mx sync drops the mail of an account config.json does not name, so it names the second account, which has no
+			// saved sign-in: mx sync stops it and syncs the first. Its folder and mail go straight into the store.
+			yield* fs.makeDirectory(dirname(ownConfigFile), { recursive: true });
+			yield* writeJson(ownConfigFile, {
+				accounts: [
+					{ alias: "contoso", clientId, id: 1, tenant },
+					{ alias: "other", clientId, id: 2, tenant },
+				],
+			});
+			yield* withDatabase(database, (db) => {
+				db.run("INSERT INTO accounts (id, mode) VALUES (2, 'push')");
+				db.run(
+					"INSERT INTO folders (id, parent_id, name, path, sent, delta_link, account_id) VALUES ('other-inbox', 'other-root', 'Inbox', 'Inbox', 0, 'other-delta-link', 2)"
+				);
+				db.run("INSERT INTO local_ids (graph_id) VALUES ('other-message')");
+				db.run(
+					`INSERT INTO messages (id, graph_id, folder_id, conversation_id, internet_message_id, from_name, from_address, to_list, cc_list, bcc_list, subject, received_at, sent_at, is_read, is_draft, flag, categories, importance, has_attachments, body)
+					VALUES ((SELECT id FROM local_ids WHERE graph_id = 'other-message'), 'other-message', 'other-inbox', 'conversation-loan', NULL, 'Rosa Example', 'rosa@example.com', '[]', '[]', '[]', 'Library loan reminder', ${received}, ${received}, 0, 0, 'notFlagged', '[]', 'normal', 0, 'The pruning book is due back on Friday.')`
+				);
+			});
+			const otherAccount = withDatabase(database, (db) => ({
+				folders: db.query("SELECT * FROM folders WHERE account_id = 2").all(),
+				messages: db
+					.query(
+						"SELECT m.* FROM messages m JOIN folders f ON f.id = m.folder_id WHERE f.account_id = 2"
+					)
+					.all(),
+				search: db
+					.query(
+						"SELECT rowid, subject FROM search WHERE rowid IN (SELECT id FROM local_ids WHERE graph_id = 'other-message')"
+					)
+					.all(),
+			}));
+			const before = yield* otherAccount;
+			expect(before.messages).toHaveLength(1);
+			expect(before.search).toHaveLength(1);
+			/** The ids of the lines that end a check against Graph, among the newest in the log. */
+			const checks = Effect.map(
+				loggedRowsOn(system)("--sync", "--limit", "100"),
+				(rows) =>
+					Arr.map(
+						Arr.filter(rows, (row) =>
+							reconciledLine.test((row as { message?: string }).message ?? "")
+						),
+						(row) => (row as { id: number }).id
+					)
+			);
+			const earlier = yield* checks;
+			const service = yield* Effect.forkChild(cliOn(system)("sync"));
+			yield* eventually(
+				"a check against Graph",
+				Effect.map(
+					checks,
+					Arr.some((id) => !earlier.includes(id))
+				)
+			);
+			yield* Fiber.interrupt(service);
+			expect(yield* otherAccount).toEqual(before);
+			expect(
+				yield* withDatabase(database, (db) =>
+					db
+						.query(
+							"SELECT account_id, count(*) AS folders FROM folders GROUP BY account_id ORDER BY account_id"
+						)
+						.all()
+				)
+			).toEqual([
+				{ account_id: 1, folders: allFolders.length },
+				{ account_id: 2, folders: 1 },
 			]);
 		}));
 
@@ -5212,8 +5469,21 @@ describe("mx", () => {
 				}
 				yield* writeJson(join(root, ".claude.json"), { numStartups: 1 });
 				const system = ownWindows(root);
-				const { system: onTerminal } = fakeTerminal(system, ["return"]);
-				yield* withTerminal(true)(cliOn(onTerminal)("install"));
+				// Enter picks the agents mx offers, and keeps the alias mx offers for the first account.
+				const {
+					frames,
+					press,
+					system: onTerminal,
+				} = fakeTerminal(system, ["return", "return"]);
+				const installing = yield* Effect.forkChild(
+					withTerminal(true)(cliOn(onTerminal)("install"))
+				);
+				yield* eventually("the offer of another account", () =>
+					Arr.some(frames, Str.includes("Add another Microsoft 365 account?"))
+				);
+				// Enter adds no other account.
+				yield* press("return");
+				yield* Fiber.join(installing);
 				for (const { file, settings } of configs) {
 					expect(yield* readJson(file)).toEqual({
 						...settings,

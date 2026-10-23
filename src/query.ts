@@ -5,6 +5,7 @@ import {
 	Duration,
 	Effect,
 	Layer,
+	Option,
 	Path,
 	pipe,
 	Schema,
@@ -12,10 +13,11 @@ import {
 	Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { AccountsFile, type Named, unnamed } from "./auth/config.ts";
 import { Refused } from "./errors.ts";
 import { isOutlookLink } from "./outlook.ts";
 import { Paths } from "./paths.ts";
-import { views } from "./store/views.ts";
+import { aliasesTable, views } from "./store/views.ts";
 
 /** The argument that makes mx answer one query: `mx query-worker`, the child process the `query` tool runs. */
 export const queryWorker = "query-worker";
@@ -31,9 +33,17 @@ const maxRows = 200;
 const maxCharacters = 20_000;
 const maxValueLength = 200;
 
-/** What the worker reads on stdin: the store to open and the agent's SQL. */
+/**
+ * What the worker reads on stdin: the store to open, the agent's SQL, and the id of the account whose mail alone the
+ * views hold, if any. The worker answers the mx mcp of an older release, which an update leaves running on the new
+ * binary, so the request only gains optional fields.
+ */
 const Request = Schema.fromJsonString(
-	Schema.Struct({ database: Schema.String, sql: Schema.String })
+	Schema.Struct({
+		account: Schema.optionalKey(Schema.Int),
+		database: Schema.String,
+		sql: Schema.String,
+	})
 );
 
 /** What the worker writes on stdout: the table, or why SQLite or mx refused the SQL. */
@@ -98,9 +108,19 @@ const table = (
  * first part and drops the rest unread, so SQL that ends the statement early, as with a `)` that closes mx's
  * parenthesis, is refused. A comment can still hide mx's LIMIT, so the table stops at `maxRows` itself.
  */
-const select = ({ database, sql }: typeof Request.Type): typeof Answer.Type => {
+const select = (
+	{ account, database, sql }: typeof Request.Type,
+	accounts: readonly Named[]
+): typeof Answer.Type => {
 	const db = new Database(database, { readonly: true });
-	for (const view of views) {
+	db.run(aliasesTable);
+	for (const { alias, id } of accounts) {
+		db.run("INSERT INTO aliases (account_id, alias) VALUES (?, ?)", [
+			id,
+			alias,
+		]);
+	}
+	for (const view of views(Option.fromUndefinedOr(account))) {
 		db.run(view);
 	}
 	// The line break ends a `--` comment at the end of the SQL before mx's parenthesis.
@@ -120,10 +140,13 @@ const select = ({ database, sql }: typeof Request.Type): typeof Answer.Type => {
 	return { table: table(statement.columnNames, statement.iterate()) };
 };
 
-/** The answer to the request, with SQLite's own message when it refused the SQL. */
-const answer = (request: typeof Request.Type): typeof Answer.Type => {
+/** The answer to the request over the views of `accounts`, with SQLite's own message when it refused the SQL. */
+const answer = (
+	request: typeof Request.Type,
+	accounts: readonly Named[]
+): typeof Answer.Type => {
 	try {
-		return select(request);
+		return select(request, accounts);
 	} catch (error) {
 		if (error instanceof SQLiteError) {
 			return { refused: error.message };
@@ -132,13 +155,26 @@ const answer = (request: typeof Request.Type): typeof Answer.Type => {
 	}
 };
 
-/** `mx query-worker`: reads a request on stdin, and writes its answer on stdout, SQLite's error verbatim when it refused. */
+/**
+ * `mx query-worker`: reads a request on stdin, and writes its answer on stdout, SQLite's error verbatim when it refused.
+ * The aliases come from config.json as it is now, so the views show an alias changed after mx mcp started.
+ */
 export const answerQuery = Effect.gen(function* () {
 	const request = yield* Effect.promise(() => Bun.stdin.text()).pipe(
 		Effect.flatMap(Schema.decodeEffect(Request)),
 		Effect.orDie
 	);
-	const answered = yield* Effect.sync(() => answer(request));
+	const answered = yield* (yield* AccountsFile).read.pipe(
+		Effect.map((accounts) =>
+			answer(
+				request,
+				Arr.isReadonlyArrayNonEmpty(accounts) ? accounts : unnamed
+			)
+		),
+		Effect.catchTag("CredentialFailed", ({ message }) =>
+			Effect.succeed({ refused: message })
+		)
+	);
 	const text = yield* Schema.encodeEffect(Answer)(answered).pipe(Effect.orDie);
 	yield* Effect.promise(() => Bun.write(Bun.stdout, text));
 });
@@ -147,8 +183,14 @@ export const answerQuery = Effect.gen(function* () {
 export class Query extends Context.Service<
 	Query,
 	{
-		/** The table the SQL selects; SQL that SQLite or mx refuses, or that runs past `queryTimeout`, is refused with why. */
-		readonly run: (sql: string) => Effect.Effect<string, Refused>;
+		/**
+		 * The table the SQL selects, over the mail of the account with that id alone when there is one; SQL that SQLite or
+		 * mx refuses, or that runs past `queryTimeout`, is refused with why.
+		 */
+		readonly run: (
+			sql: string,
+			account: Option.Option<number>
+		) => Effect.Effect<string, Refused>;
 	}
 >()("mx/query") {
 	static readonly layer = Layer.effect(
@@ -162,8 +204,15 @@ export class Query extends Context.Service<
 				? [queryWorker]
 				: [path.join(import.meta.dir, "main.ts"), queryWorker];
 
-			const run = Effect.fnUntraced(function* (sql: string) {
+			const run = Effect.fnUntraced(function* (
+				sql: string,
+				account: Option.Option<number>
+			) {
 				const request = yield* Schema.encodeEffect(Request)({
+					...Option.match(account, {
+						onNone: () => ({}),
+						onSome: (id) => ({ account: id }),
+					}),
 					database,
 					sql,
 				}).pipe(Effect.orDie);

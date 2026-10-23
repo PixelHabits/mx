@@ -91,12 +91,12 @@ This installs the package `mx-mail`. To update it, pull and run `makepkg -si` ag
 ### What `mx install` does
 
 1. Asks which agents to set up: Claude Desktop, Claude Code or Codex. You can also name them with `--agent`.
-2. Signs you in to Microsoft. It asks once for a client id and a tenant, or takes `--client-id` and `--tenant`. It copies the sign-in code, and opens your browser when you press Enter.
-3. Copies your mailbox the first time, showing how many messages it has read and about how long is left. This can take a while for a large mailbox. You can stop it with Ctrl-C, and the next `mx install` continues where it stopped.
+2. Signs you in to Microsoft. It asks once for a client id and a tenant, or takes `--client-id` and `--tenant`, and for an alias, a short name for the account such as `work`. It copies the sign-in code, and opens your browser when you press Enter. Then it asks whether to add another account.
+3. Copies each mailbox the first time, all at once, showing how many messages each has read and about how long is left. This can take a while for a large mailbox. You can stop it with Ctrl-C, and the next `mx install` continues where it stopped.
 4. Starts mx in the background, and again each time you sign in to your computer.
 5. Tells you to restart the agents it set up. Do that, and mx is ready.
 
-mx asks Microsoft for these delegated permissions: `Mail.ReadWrite`, `Mail.Send` and `offline_access`.
+mx asks Microsoft for these delegated permissions: `Mail.ReadWrite`, `Mail.Send` and `offline_access`. When you sign in, it also asks for `openid`, `email` and `profile`, so it knows which mailbox each account is.
 
 Run `mx install` again at any time to reinstall or to add an agent. It keeps your settings.
 
@@ -112,19 +112,19 @@ Your agent uses these tools:
 
 | Tool | What it does |
 | --- | --- |
-| `search` | Finds conversations by words, sender, folder and date, best match first. Each conversation shows once. |
-| `query` | Counts, groups and filters mail with one read-only SQL query. |
+| `search` | Finds conversations by words, sender, folder, date and account, best match first. Each conversation shows once. |
+| `query` | Counts, groups and filters mail with one read-only SQL query, in every account or in one. |
 | `thread` | Shows a whole conversation, oldest first. |
 | `message` | Shows one message. |
 | `attachment` | Lists a message's attachments, or saves one. |
-| `draft` | Creates a new message, reply, reply-all or forward. |
+| `draft` | Creates a new message, reply, reply-all or forward, in the account it comes from. |
 | `update_draft` | Changes a draft. |
 | `delete_draft` | Moves a draft to Deleted Items. |
-| `send` | Sends a draft, or a new message. |
+| `send` | Sends a draft, or a new message, from the account that `from` names. |
 | `update` | Marks, flags, categorizes or moves messages. |
 | `delete` | Moves messages to Deleted Items. |
-| `folder` | Creates, renames or moves a folder. |
-| `delete_folder` | Moves a folder, with everything in it, to Deleted Items. |
+| `folder` | Creates, renames or moves a folder in one account. |
+| `delete_folder` | Moves a folder, with everything in it, to Deleted Items in its account. |
 
 ### Triage and interview
 
@@ -135,6 +135,27 @@ mx also offers two ready-made requests:
 
 In Claude Code, type `/mx:triage` or `/mx:interview`. You can give triage a start date, as in `/mcp__mx__triage 2026-10-01`. In Claude Desktop, choose **+**, then **Add from mx**. Codex has no ready-made requests, so ask it in plain words, such as "triage my mail".
 
+With several accounts, triage reports each account under its own heading, and interview asks what each account is for.
+
+## Several accounts
+
+mx can keep several mailboxes, such as your work and personal mail. Each one is an account with an alias, a short name such as `work`.
+
+- **Add an account:** run `mx login --account personal`. mx asks for a client id and a tenant, where Enter keeps the first account's client id. It signs you in and restarts mx in the background, which then copies that mailbox. Run `mx status` to see how far it has got. You can also add accounts as you install: after each sign-in, `mx install` asks whether to add another one. Each account keeps its own sign-in, client id and tenant.
+- **Aliases:** an alias is up to 20 lowercase letters, digits and hyphens, and starts with a letter. Your first account's alias is the first part of its tenant's domain, such as `contoso` for contoso.com, or `main`. To change one, run `mx rename contoso work`.
+- **Remove an account:** run `mx logout --account personal`. mx lists what it removes and asks first; `--yes` skips the question. It removes that account's sign-in, its entry in mx's settings and the copy of its mail on your machine. If it stops partway, run it again to finish. Your other accounts stay as they are, and the mailbox in Microsoft 365 is not touched. mx keeps your last account; to remove it, run `mx uninstall`.
+- **Restart your agents** after you add or remove an account, so they see the change.
+
+How your agent sees your accounts:
+
+- mx tells your agent each account's alias and address.
+- Every message has its own `#id`, and a tool that takes an id acts in that message's account. `thread` shows a conversation within one account.
+- `search` and `query` cover every account. Each line shows the account, as in `#12 [work] 2026-10-19 09:14 Inbox | …`, and `account` limits them to one.
+- Mail never moves between accounts. `update` moves a message only to a folder of its own account, and `folder` and `delete_folder` take `account`.
+- **The sender is never guessed.** A reply, reply-all or forward always comes from the account of the message it answers. A new message needs `account`, and your agent asks you which one if you have not said. `send` needs `from`, the account the draft is in, and sends nothing when `from` names another account.
+
+With one account, mx works as before: no tool needs `account` or `from`, and lines show no alias.
+
 ## Approvals
 
 `mx install` sets these defaults in Claude Code and Codex:
@@ -142,7 +163,7 @@ In Claude Code, type `/mx:triage` or `/mx:interview`. You can give triage a star
 - **Asks you first:** `send`, `delete` and `delete_folder`.
 - **Runs without asking:** everything else.
 
-When your agent sends a draft, the approval prompt shows every recipient and the subject.
+When your agent sends a draft, the approval prompt shows every recipient and the subject. With several accounts, it also shows `from`, the account that sends. Approvals are per tool, so the same rule covers every account.
 
 Change the defaults in your agent's own settings. A reinstall keeps your changes.
 
@@ -160,7 +181,7 @@ mx status
 
 `mx status` says whether mx is running in the background, when your mail last synced, and any error. Once a day, mx also checks its copy against your mailbox and repairs anything that drifted.
 
-When your mail may be out of date, your agent sees a warning line before its answer, such as `⚠ Mail last synced 3 h ago and mx sync is not running. Run mx status.` If the warning says `Sign-in expired. Run mx login.`, run `mx login`. mx restarts its background sync, and your agents use the new sign-in from their next request.
+When your mail may be out of date, your agent sees a warning line before its answer, such as `⚠ Mail last synced 3 h ago and mx sync is not running. Run mx status.` If the warning says `Sign-in expired. Run mx login.`, run `mx login`. mx restarts its background sync, and your agents use the new sign-in from their next request. With several accounts, each warning names its account, such as `⚠ personal: Sign-in expired. Run mx login --account personal.`
 
 To see what your agents asked mx and what mx answered, run `mx log`. It prints the last 20 tool calls, oldest first: when, which agent, what it sent, the whole answer, and how long it took. `--tool send` shows one tool, `--since 2026-10-19` starts at a date, `--sync` adds the background sync's own lines, and `--follow` keeps printing new calls as they arrive.
 
@@ -184,7 +205,7 @@ To report a security problem, see [SECURITY.md](SECURITY.md).
 mx uninstall
 ```
 
-mx lists what it will remove and asks first. It removes everything: the program, its entries in your agents' settings, your saved sign-in, your local copy of your mail and the log of tool calls. On Windows it also takes mx off your PATH. Your mailbox in Microsoft 365 is not touched.
+mx lists what it will remove and asks first. It removes everything: the program, its entries in your agents' settings, every account's saved sign-in, your local copy of your mail and the log of tool calls. On Windows it also takes mx off your PATH. Your mailbox in Microsoft 365 is not touched.
 
 Quit your agents first. If one is still running mx, uninstall tells you which files to delete after you quit it.
 
