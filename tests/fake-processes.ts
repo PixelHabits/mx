@@ -10,7 +10,7 @@ import {
 	String as Str,
 	Stream,
 } from "effect";
-import { type ChildProcess, ChildProcessSpawner } from "effect/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { queryWorker } from "../src/query.ts";
 import { readUserPath, stopSync, writeUserPath } from "../src/windows.ts";
 import type { FakeTunnels } from "./fake-push.ts";
@@ -109,18 +109,29 @@ export class FakeProcesses {
 		this.tunnels = tunnels;
 	}
 
-	/** The programs mx starts, faked, except mx's own query worker, which runs for real and goes unrecorded. */
-	readonly layer = Layer.effect(
-		ChildProcessSpawner.ChildProcessSpawner,
-		Effect.map(ChildProcessSpawner.ChildProcessSpawner, (system) =>
-			ChildProcessSpawner.make((command) =>
-				command._tag === "StandardCommand" &&
-				command.args.at(-1) === queryWorker
-					? system.spawn(command)
-					: Effect.suspend(() => this.spawn(command))
+	/**
+	 * The programs mx starts on a machine whose environment is `env`, faked, except mx's own query worker, which runs
+	 * for real with `env` over the test's own environment, as a child inherits its parent's, and goes unrecorded.
+	 */
+	layer(env: Record<string, string>) {
+		return Layer.effect(
+			ChildProcessSpawner.ChildProcessSpawner,
+			Effect.map(ChildProcessSpawner.ChildProcessSpawner, (system) =>
+				ChildProcessSpawner.make((command) =>
+					command._tag === "StandardCommand" &&
+					command.args.at(-1) === queryWorker
+						? system.spawn(
+								ChildProcess.make(command.command, command.args, {
+									...command.options,
+									env,
+									extendEnv: true,
+								})
+							)
+						: Effect.suspend(() => this.spawn(command))
+				)
 			)
-		)
-	).pipe(Layer.provide(BunServices.layer));
+		).pipe(Layer.provide(BunServices.layer));
+	}
 
 	/** Ends the quick tunnel at `host` as if cloudflared exited with code 1. */
 	exit(host: string) {

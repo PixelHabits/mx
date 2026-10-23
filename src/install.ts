@@ -15,18 +15,12 @@ import {
 	Schedule,
 	String as Str,
 	Stream,
-	Terminal,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { type Agent, type AgentId, agents, type ConfigFile } from "./agents.ts";
-import { Auth, signIn } from "./auth/auth.ts";
-import type { SignInConfig } from "./auth/config.ts";
+import { AccountsFile, listed } from "./auth/config.ts";
 import { Credentials } from "./auth/credentials.ts";
-import {
-	InstallFailed,
-	type MicrosoftUnavailable,
-	type SignInFailed,
-} from "./errors.ts";
+import { InstallFailed } from "./errors.ts";
 import type { GraphError } from "./graph/graph.ts";
 import { Paths } from "./paths.ts";
 import { onSystem } from "./system.ts";
@@ -152,9 +146,6 @@ const trailingBackslashes = /\\+$/u;
 
 const whitespace = /\s+/u;
 
-/** Names agents as a sentence does: `Claude Code and Codex`. */
-const listed = new Intl.ListFormat("en", { type: "conjunction" });
-
 /** One thing `mx uninstall` removes: `what` names it as the prompt lists it, and `remove` removes it and says so. */
 export interface Removal {
 	readonly remove: Effect.Effect<void, InstallFailed>;
@@ -183,18 +174,16 @@ export class Installer extends Context.Service<
 	Installer,
 	{
 		/**
-		 * Sets up `agents`, signs in with `login` when there is no sign-in saved for it, runs `firstSync` and then starts
-		 * the background `mx sync`, which it starts as well when a step after its registration fails.
+		 * Sets up `agents`, runs `login` and `firstSync` and then starts the background `mx sync`, which it starts as well
+		 * when a step after its registration fails.
 		 */
-		readonly install: (options: {
+		readonly install: <E, R, S>(options: {
 			readonly agents: readonly AgentId[];
 			/** The sync to run in the foreground once signed in, before mx sync starts in the background. */
-			readonly firstSync: Effect.Effect<void, GraphError>;
-			readonly login: SignInConfig;
-		}) => Effect.Effect<
-			void,
-			InstallFailed | SignInFailed | MicrosoftUnavailable | GraphError
-		>;
+			readonly firstSync: Effect.Effect<void, GraphError, S>;
+			/** Signs the first account in when it needs a sign-in. */
+			readonly login: Effect.Effect<void, E, R>;
+		}) => Effect.Effect<void, InstallFailed | GraphError | E, R | S>;
 		/** What `mx uninstall` removes on this machine, in the order it removes them. */
 		readonly removals: Effect.Effect<readonly Removal[], InstallFailed>;
 		/** Puts `bytes` in place as the installed binary, also while it runs. */
@@ -205,9 +194,9 @@ export class Installer extends Context.Service<
 		readonly restartSync: Effect.Effect<void, InstallFailed>;
 		/**
 		 * Restarts the background `mx sync` when `mx install` registered it to start at sign-in, as after `mx login`, so
-		 * it runs with the new sign-in; does nothing elsewhere, as for mx run from source.
+		 * it runs with the new sign-in; does nothing elsewhere, as for mx run from source. Answers whether it restarted it.
 		 */
-		readonly resumeSync: Effect.Effect<void, InstallFailed>;
+		readonly resumeSync: Effect.Effect<boolean, InstallFailed>;
 		/**
 		 * Deletes the copies of mx.exe and mxw.exe that a reinstall or an update on Windows moved aside. A copy that still
 		 * runs, as the mx mcp an agent started, stays; the next install, update or start of mx sync tries again.
@@ -221,10 +210,9 @@ export class Installer extends Context.Service<
 			const fs = yield* FileSystem.FileSystem;
 			const path = yield* Path.Path;
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-			const terminal = yield* Terminal.Terminal;
 			const { randomUUIDv4 } = yield* Crypto.Crypto;
 			const credentials = yield* Credentials;
-			const auth = yield* Auth;
+			const accountsFile = yield* AccountsFile;
 			const { bin, cache, config, configFile, data, home, packaged, state } =
 				yield* Paths;
 			const offered = yield* agents;
@@ -622,10 +610,11 @@ export class Installer extends Context.Service<
 
 			const resumeSync = Effect.gen(function* () {
 				if (!(yield* syncAtSignIn.registered)) {
-					return;
+					return false;
 				}
 				yield* syncAtSignIn.restart;
 				yield* Console.log("Restarted mx sync.");
+				return true;
 			});
 
 			/** The user's own PATH on Windows, as stored. A PATH mx could not read fails, so mx never writes over one. */
@@ -763,89 +752,71 @@ export class Installer extends Context.Service<
 					})
 				);
 
-			/** Whether a sign-in is saved. */
-			const signedIn = credentials.read.pipe(
-				Effect.as(true),
-				Effect.catchTag("LoginRequired", () => Effect.succeed(false))
-			);
-
-			const install = Effect.fn("Installer.install")(
-				function* ({
-					agents: chosen,
-					firstSync,
-					login,
-				}: {
-					readonly agents: readonly AgentId[];
-					readonly firstSync: Effect.Effect<void, GraphError>;
-					readonly login: SignInConfig;
-				}) {
-					// Every config is read and edited before anything changes, so a missing or unreadable one changes nothing.
-					const set = yield* Effect.forEach(Arr.dedupe(chosen), (id) =>
-						Effect.gen(function* () {
-							const agent = Arr.findFirst(offered, (each) => each.id === id);
-							if (Option.isNone(agent)) {
-								return yield* InstallFailed.make({
-									message:
-										"mx sets up Claude Desktop on Windows and macOS only.",
-								});
+			const install = Effect.fn("Installer.install")(function* <E, R, S>({
+				agents: chosen,
+				firstSync,
+				login,
+			}: {
+				readonly agents: readonly AgentId[];
+				readonly firstSync: Effect.Effect<void, GraphError, S>;
+				readonly login: Effect.Effect<void, E, R>;
+			}) {
+				// Every config is read and edited before anything changes, so a missing or unreadable one changes nothing.
+				const set = yield* Effect.forEach(Arr.dedupe(chosen), (id) =>
+					Effect.gen(function* () {
+						const agent = Arr.findFirst(offered, (each) => each.id === id);
+						if (Option.isNone(agent)) {
+							return yield* InstallFailed.make({
+								message: "mx sets up Claude Desktop on Windows and macOS only.",
+							});
+						}
+						yield* Effect.forEach(
+							agent.value.files,
+							(file) => setUp(agent.value, file),
+							{ discard: true }
+						);
+						return agent.value;
+					})
+				);
+				if (path.resolve(process.execPath) !== path.resolve(bin)) {
+					const bytes = yield* fs
+						.readFile(process.execPath)
+						.pipe(
+							Effect.mapError(failed(`Could not read ${process.execPath}`))
+						);
+					yield* replaceBinary(bytes);
+					yield* Console.log(`Installed ${bin}.`);
+				}
+				if (windows) {
+					yield* addToPath;
+				} else if (!packaged) {
+					yield* pathHint;
+				}
+				yield* syncAtSignIn.register;
+				yield* Console.log("Registered mx sync to start at sign-in.");
+				// Whatever fails or stops mx install from here, as a refused sign-in in the first sync, mx sync starts as registered.
+				yield* Effect.onExit(
+					Effect.gen(function* () {
+						// Each config is read again as it is written, so what an agent saved to it in the meantime stays.
+						for (const agent of set) {
+							for (const file of agent.files) {
+								yield* change(
+									file,
+									setUp(agent, file),
+									`Registered mx with ${agent.app} in ${file.path}.`
+								);
 							}
-							yield* Effect.forEach(
-								agent.value.files,
-								(file) => setUp(agent.value, file),
-								{ discard: true }
-							);
-							return agent.value;
-						})
-					);
-					if (path.resolve(process.execPath) !== path.resolve(bin)) {
-						const bytes = yield* fs
-							.readFile(process.execPath)
-							.pipe(
-								Effect.mapError(failed(`Could not read ${process.execPath}`))
-							);
-						yield* replaceBinary(bytes);
-						yield* Console.log(`Installed ${bin}.`);
-					}
-					if (windows) {
-						yield* addToPath;
-					} else if (!packaged) {
-						yield* pathHint;
-					}
-					yield* syncAtSignIn.register;
-					yield* Console.log("Registered mx sync to start at sign-in.");
-					// Whatever fails or stops mx install from here, as a refused sign-in in the first sync, mx sync starts as registered.
-					yield* Effect.onExit(
-						Effect.gen(function* () {
-							// Each config is read again as it is written, so what an agent saved to it in the meantime stays.
-							for (const agent of set) {
-								for (const file of agent.files) {
-									yield* change(
-										file,
-										setUp(agent, file),
-										`Registered mx with ${agent.app} in ${file.path}.`
-									);
-								}
-							}
-							yield* credentials.use(login);
-							if (!(yield* signedIn)) {
-								yield* signIn({ auth, spawner, terminal }, login);
-							}
-							yield* firstSync;
-						}),
-						() =>
-							Effect.andThen(
-								syncAtSignIn.reload,
-								Console.log("Started mx sync.")
-							)
-					);
-					yield* Console.log(
-						`Quit and reopen ${listed.format(Arr.map(set, ({ app }) => app))} now. An agent left open can write its old settings back and drop mx.`
-					);
-				},
-				Effect.catchTag("CredentialFailed", (error) =>
-					Effect.fail(failed("Could not read the saved sign-in")(error))
-				)
-			);
+						}
+						yield* login;
+						yield* firstSync;
+					}),
+					() =>
+						Effect.andThen(syncAtSignIn.reload, Console.log("Started mx sync."))
+				);
+				yield* Console.log(
+					`Quit and reopen ${listed.format(Arr.map(set, ({ app }) => app))} now. An agent left open can write its old settings back and drop mx.`
+				);
+			});
 
 			/** Whether `file` is the exe this process runs; Windows compares paths without case. */
 			const isThisExe = (file: string) =>
@@ -966,21 +937,40 @@ export class Installer extends Context.Service<
 			/**
 			 * Sync stops first, so nothing writes to the store as it goes. On Linux and macOS it deletes its Graph
 			 * subscriptions as it stops, while its sign-in is still saved; on Windows nothing can ask it to stop, so they stay
-			 * until they expire, on a tunnel that is gone.
+			 * until they expire, on a tunnel that is gone. config.json goes last: it names the accounts, so an uninstall run
+			 * again after one that stopped partway still finds each sign-in.
 			 */
 			const removals = Effect.gen(function* () {
 				const registration = yield* syncAtSignIn.removals;
-				const signInRemoval: readonly Removal[] = (yield* signedIn)
-					? [
-							{
-								remove: credentials.remove.pipe(
-									Effect.mapError(failed("Could not delete the saved sign-in")),
-									Effect.andThen(Console.log("Removed the saved sign-in."))
-								),
-								what: "the saved sign-in",
-							},
-						]
-					: [];
+				const accounts = yield* accountsFile.read;
+				// Account 1's sign-in is refresh-token also without a config.json, as after the user deletes one an earlier mx cannot read.
+				const withFirst = Arr.some(accounts, ({ id }) => id === 1)
+					? accounts
+					: [{ alias: "account 1", id: 1 }, ...accounts];
+				const signInRemovals = Arr.getSomes(
+					yield* Effect.forEach(withFirst, ({ alias, id }) =>
+						credentials.read(id).pipe(
+							Effect.as(
+								Option.some<Removal>({
+									remove: credentials
+										.remove(id)
+										.pipe(
+											Effect.mapError(
+												failed(`Could not delete the saved sign-in of ${alias}`)
+											),
+											Effect.andThen(
+												Console.log(`Removed the saved sign-in of ${alias}.`)
+											)
+										),
+									what: `the saved sign-in of ${alias}`,
+								})
+							),
+							Effect.catchTag("LoginRequired", () =>
+								Effect.succeed(Option.none<Removal>())
+							)
+						)
+					)
+				);
 				const agentRemovals = Arr.getSomes(
 					yield* Effect.forEach(
 						Arr.flatMap(offered, (agent) => agent.files),
@@ -1004,11 +994,14 @@ export class Installer extends Context.Service<
 					registration,
 					agentRemovals,
 					yield* programRemovals,
-					yield* removeFile("the client id and the tenant", configFile),
 					yield* removeStore,
-					signInRemoval,
+					signInRemovals,
 					yield* removeFile("the attachment cache", cache),
 					yield* removeFile("the state folder with the tool call log", state),
+					yield* removeFile(
+						"the accounts with their client ids and tenants",
+						configFile
+					),
 				]);
 			}).pipe(
 				Effect.catchTags({
@@ -1032,6 +1025,6 @@ export class Installer extends Context.Service<
 	);
 
 	static readonly layer = Installer.layerNoDeps.pipe(
-		Layer.provide(Layer.mergeAll(Auth.layer, Credentials.layer))
+		Layer.provide(Layer.mergeAll(AccountsFile.layer, Credentials.layer))
 	);
 }

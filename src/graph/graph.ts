@@ -675,6 +675,4 @@ export class Graph extends Context.Service<
 			});
 		})
 	);
-
-	static readonly layer = Graph.layerNoDeps.pipe(Layer.provide(Auth.layer));
 }
