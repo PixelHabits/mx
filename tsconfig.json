@@ -65,6 +65,8 @@
 					"effect/Logger#toFile",
 					// XDG paths and file names.
 					"effect/Path",
+					// mx's config, data, cache and state folders.
+					"effect/persistence/UserDirectories",
 					// systemd-creds for the saved sign-in.
 					"effect/process",
 					// The mail store in SQLite, and its transactions.

@@ -555,30 +555,11 @@ const graphRequests = (suffix: string) =>
 		pipe(request.url.pathname, Str.endsWith(suffix))
 	);
 
-/** Where mx keeps its files: below `%LOCALAPPDATA%\\mx` on Windows, below `~/Library` on macOS, in the XDG folders on Linux. */
-const local = join(home, "AppData", "Local", "mx");
-const library = join(home, "Library");
-const support = join(library, "Application Support", "mx");
-const { cacheFolder, configFile, dataFolder, stateFolder } = onThisSystem({
-	darwin: {
-		cacheFolder: join(library, "Caches", "mx"),
-		configFile: join(support, "config.json"),
-		dataFolder: join(support, "data"),
-		stateFolder: join(library, "Logs", "mx"),
-	},
-	linux: {
-		cacheFolder: join(home, "cache", "mx"),
-		configFile: join(home, "config", "mx", "config.json"),
-		dataFolder: join(home, "data", "mx"),
-		stateFolder: join(home, "state", "mx"),
-	},
-	win32: {
-		cacheFolder: join(local, "cache"),
-		configFile: join(local, "config.json"),
-		dataFolder: join(local, "data"),
-		stateFolder: join(local, "state"),
-	},
-});
+/** Where mx keeps its files: the XDG folders `environment` names, which mx follows on every system. */
+const cacheFolder = join(home, "cache", "mx");
+const configFile = join(home, "config", "mx", "config.json");
+const dataFolder = join(home, "data", "mx");
+const stateFolder = join(home, "state", "mx");
 const tokenFile = join(stateFolder, "refresh-token");
 /** The sign-in's entry in the system's secret store. */
 const credential = { name: "refresh-token", service: "mx" };
@@ -939,8 +920,8 @@ const writeJson = (file: string, value: unknown) =>
 	);
 
 /**
- * `platform` on a machine where mx never synced: a store of its own, and Claude Code's config in a folder of its own,
- * since on Windows the store sits below the same folder as the installed program, and on macOS below the home folder.
+ * `platform` on a machine where mx never synced: a store, a home and a program folder of its own, and Claude Code's
+ * config in a folder of its own.
  */
 const neverSynced = (name: string) =>
 	Effect.gen(function* () {
@@ -963,24 +944,8 @@ const neverSynced = (name: string) =>
 const ownStore = (name: string) => {
 	const root = join(home, name);
 	return {
-		database: onThisSystem({
-			darwin: join(
-				root,
-				"Library",
-				"Application Support",
-				"mx",
-				"data",
-				"mx.sqlite"
-			),
-			linux: join(root, "data", "mx", "mx.sqlite"),
-			win32: join(root, "Local", "mx", "data", "mx.sqlite"),
-		}),
-		system: platformWith({
-			...environment,
-			HOME: root,
-			LOCALAPPDATA: join(root, "Local"),
-			XDG_DATA_HOME: join(root, "data"),
-		}),
+		database: join(root, "data", "mx", "mx.sqlite"),
+		system: platformWith({ ...environment, XDG_DATA_HOME: join(root, "data") }),
 	};
 };
 
@@ -2296,7 +2261,7 @@ describe("mx", () => {
 						(row) => (row as { kind: string }).kind === "sync"
 					)
 				).toEqual([]);
-				expect(yield* fs.exists(join(local, "state", "sync.log"))).toBe(false);
+				expect(yield* fs.exists(join(stateFolder, "sync.log"))).toBe(false);
 			})
 		));
 
@@ -4363,7 +4328,7 @@ describe("mx", () => {
 	);
 
 	test(
-		"mx install writes a LaunchAgent that runs the installed binary at sign-in, starts it again at most every 5 minutes after it fails, and logs to ~/Library/Logs/mx, and makes the binary executable",
+		"mx install writes a LaunchAgent that runs the installed binary at sign-in, starts it again at most every 5 minutes after it fails, and logs to its state folder, and makes the binary executable",
 		() =>
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
@@ -5212,20 +5177,21 @@ describe("mx", () => {
 		));
 
 	test(
-		"on macOS, mx install loads the LaunchAgent with launchctl bootstrap once it unloads the one loaded before, mx login restarts it with kickstart, and mx uninstall unloads it and deletes it with the log folder",
+		"on macOS, mx install loads the LaunchAgent with launchctl bootstrap once it unloads the one loaded before, mx login restarts it with kickstart, and mx uninstall unloads it and deletes it with the state folder",
 		() =>
 			onMac(
 				Effect.gen(function* () {
 					const fs = yield* FileSystem.FileSystem;
-					const logs = join(library, "Logs", "mx");
 					const bin = join(home, ".local", "bin", "mx");
 					const before = processes.commands.length;
 					yield* cli("install", "--agent", "codex");
 					yield* cli("install", "--agent", "codex");
 					const plist = yield* fs.readFileString(agentFile);
 					expect(plist).toContain(`<string>${bin}</string>`);
-					expect(plist).toContain(`<string>${join(logs, "sync.log")}</string>`);
-					expect(yield* fs.exists(logs)).toBe(true);
+					expect(plist).toContain(
+						`<string>${join(stateFolder, "sync.log")}</string>`
+					);
+					expect(yield* fs.exists(stateFolder)).toBe(true);
 					yield* cliOn(unconfigured)("login");
 					yield* cli("uninstall", "--yes");
 					const bootout = `launchctl bootout ${agentTarget}`;
@@ -5248,10 +5214,10 @@ describe("mx", () => {
 					]);
 					for (const path of [
 						agentFile,
-						logs,
+						stateFolder,
 						bin,
-						join(support, "config.json"),
-						join(support, "data"),
+						configFile,
+						dataFolder,
 					]) {
 						expect(yield* fs.exists(path)).toBe(false);
 					}
@@ -5259,8 +5225,8 @@ describe("mx", () => {
 			),
 		{
 			because:
-				"on macOS the install, login and uninstall tests above run these steps",
-			systems: ["linux", "win32"],
+				"on macOS the install, login and uninstall tests above run these steps, and on Windows the fake home starts with a drive letter, which UserDirectories does not take as an absolute macOS path",
+			systems: ["linux"],
 		}
 	);
 });
