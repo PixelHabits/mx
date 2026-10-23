@@ -54,7 +54,7 @@ xattr -d com.apple.quarantine mx-darwin-arm64
 ./mx-darwin-arm64 install
 ```
 
-mx installs itself to `~/.local/bin/mx`. If that folder is not on your PATH, `mx install` prints the line to add to `~/.zprofile`. Open a new terminal to run `mx`.
+mx installs itself to `~/.local/bin/mx` and finishes the install from there, so your sign-in in the Keychain belongs to that program. If that folder is not on your PATH, `mx install` prints the line to add to `~/.zprofile`. Open a new terminal to run `mx`.
 
 ### Linux
 

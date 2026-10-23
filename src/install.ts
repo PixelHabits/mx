@@ -20,7 +20,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { type Agent, type AgentId, agents, type ConfigFile } from "./agents.ts";
 import { AccountsFile, listed } from "./auth/config.ts";
 import { Credentials } from "./auth/credentials.ts";
-import { InstallFailed } from "./errors.ts";
+import { InstallFailed, InstallStopped } from "./errors.ts";
 import type { GraphError } from "./graph/graph.ts";
 import { Paths } from "./paths.ts";
 import { onSystem } from "./system.ts";
@@ -179,11 +179,17 @@ export class Installer extends Context.Service<
 		 */
 		readonly install: <E, R, S>(options: {
 			readonly agents: readonly AgentId[];
+			/** The arguments of `mx install` with each answer given so far, for the installed mx that finishes the install on macOS. */
+			readonly args: readonly string[];
 			/** The sync to run in the foreground once signed in, before mx sync starts in the background. */
 			readonly firstSync: Effect.Effect<void, GraphError, S>;
 			/** Signs the first account in when it needs a sign-in. */
 			readonly login: Effect.Effect<void, E, R>;
-		}) => Effect.Effect<void, InstallFailed | GraphError | E, R | S>;
+		}) => Effect.Effect<
+			void,
+			InstallFailed | InstallStopped | GraphError | E,
+			R | S
+		>;
 		/** What `mx uninstall` removes on this machine, in the order it removes them. */
 		readonly removals: Effect.Effect<readonly Removal[], InstallFailed>;
 		/** Puts `bytes` in place as the installed binary, also while it runs. */
@@ -754,10 +760,12 @@ export class Installer extends Context.Service<
 
 			const install = Effect.fn("Installer.install")(function* <E, R, S>({
 				agents: chosen,
+				args,
 				firstSync,
 				login,
 			}: {
 				readonly agents: readonly AgentId[];
+				readonly args: readonly string[];
 				readonly firstSync: Effect.Effect<void, GraphError, S>;
 				readonly login: Effect.Effect<void, E, R>;
 			}) {
@@ -778,7 +786,23 @@ export class Installer extends Context.Service<
 						return agent.value;
 					})
 				);
-				if (path.resolve(process.execPath) !== path.resolve(bin)) {
+				// The package's mx is bin. Elsewhere Bun resolves the symlinks in process.execPath and bin may hold some, as
+				// macOS's /var to /private/var, so they compare as real paths; an installed mx that missed itself here would
+				// hand off to itself.
+				const runsBin =
+					packaged ||
+					(yield* Effect.all([
+						fs.realPath(process.execPath),
+						fs.realPath(bin),
+					]).pipe(
+						Effect.map(([running, installed]) => running === installed),
+						Effect.catchIf(
+							(error) => error.reason._tag === "NotFound",
+							() => Effect.succeed(false)
+						),
+						Effect.mapError(failed(`Could not look for ${bin}`))
+					));
+				if (!runsBin) {
 					const bytes = yield* fs
 						.readFile(process.execPath)
 						.pipe(
@@ -786,6 +810,25 @@ export class Installer extends Context.Service<
 						);
 					yield* replaceBinary(bytes);
 					yield* Console.log(`Installed ${bin}.`);
+					// The macOS Keychain lets a program delete only the sign-ins that a program of its file name saved, so the
+					// installed mx finishes the install and saves them. In the terminal's process group it reads the terminal,
+					// and Ctrl+C reaches it. From source, the installed copy is Bun, which runs no mx command.
+					if (process.platform === "darwin" && Bun.isStandaloneExecutable) {
+						const code = yield* spawner
+							.exitCode(
+								ChildProcess.make(bin, ["install", ...args], {
+									detached: false,
+									stderr: "inherit",
+									stdin: "inherit",
+									stdout: "inherit",
+								})
+							)
+							.pipe(Effect.mapError(failed(`${bin} install`)));
+						if (code !== 0) {
+							return yield* InstallStopped.make({ code });
+						}
+						return;
+					}
 				}
 				if (windows) {
 					yield* addToPath;
