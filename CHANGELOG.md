@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.0](https://github.com/PixelHabits/mx/compare/v0.3.0...v0.4.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* On Windows and macOS, mx now looks for its sign-in settings, its mail store and its logs in new folders. On Windows, the client id and tenant and the mail store are in %APPDATA%\mx, the logs in %LOCALAPPDATA%\mx, and saved attachments in %LOCALAPPDATA%\mx\Cache. On macOS, the client id and tenant, the mail store and the logs are in ~/Library/Application Support/mx. To move to this version, first run mx uninstall with the version you have now. Then install this version, and run mx install and mx login again. Run mx uninstall first, because this version does not know the old folders.
+
+### Features
+
+* adopt Effect 4.0.6, with folders from UserDirectories and terminal checks from TerminalCapabilities ([#11](https://github.com/PixelHabits/mx/issues/11)) ([67dbc4f](https://github.com/PixelHabits/mx/commit/67dbc4fe74d87c181502bed0d1407ede037dcdbb))
+* **mcp:** give each message a link that opens it in Outlook on the web ([ce41978](https://github.com/PixelHabits/mx/commit/ce41978ea52fddfed926f5a739420e6ca5e9c2e7))
+* **mcp:** write mail bodies as HTML rendered from Markdown, with an html format for raw HTML ([#8](https://github.com/PixelHabits/mx/issues/8)) ([6ac51d5](https://github.com/PixelHabits/mx/commit/6ac51d584032694ab5f1bee50a553b9154142955))
+* several Microsoft 365 accounts in one mx ([#7](https://github.com/PixelHabits/mx/issues/7)) ([6dc7af0](https://github.com/PixelHabits/mx/commit/6dc7af0e9f88f90d4ecf8a08fb3669cbee0df061))
+
+
+### Bug Fixes
+
+* **install:** find Claude Desktop's config in Claude-Data on Windows ([#13](https://github.com/PixelHabits/mx/issues/13)) ([ceb3056](https://github.com/PixelHabits/mx/commit/ceb3056eb587260b5896c2f1e921953188d8aac1))
+* **push:** run only cloudflared 2026.10.2 or newer, and pin 2026.10.3 ([#10](https://github.com/PixelHabits/mx/issues/10)) ([5ca160d](https://github.com/PixelHabits/mx/commit/5ca160dfe7a8fd6a84e558438c43cc4bf8443cb9))
+
 ## [0.3.0](https://github.com/PixelHabits/mx/compare/v0.2.0...v0.3.0) (2026-10-19)
 
 
