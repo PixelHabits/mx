@@ -5438,6 +5438,30 @@ describe("mx", () => {
 			)
 		));
 
+	test("mx uninstall that the macOS Keychain refuses to delete a sign-in, as one a program of another file name saved, stops with the security command that deletes it and keeps the program, and runs to its end once the user ran that command", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const asInstalled = runningAs(installed);
+			yield* cli("install", "--agent", "codex");
+			secrets.machine = "keychain";
+			const failure = yield* Effect.flip(
+				asInstalled(cli("uninstall", "--yes"))
+			);
+			expect(failure.message).toBe(
+				"Could not delete the saved sign-in of contoso: The Keychain lets only the program that saved this sign-in delete it. Delete it with security delete-generic-password -s mx -a refresh-token, then run the mx command again."
+			);
+			expect(yield* fs.exists(installed)).toBe(true);
+			secrets.entries.delete("mx/refresh-token");
+			yield* asInstalled(cli("uninstall", "--yes"));
+			expect(yield* fs.exists(installed)).toBe(windows);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					secrets.machine = "store";
+				})
+			)
+		));
+
 	test(
 		"mx install from the Arch package copies no binary and writes no unit, enables the package's unit and registers /usr/bin/mx",
 		() =>

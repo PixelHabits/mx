@@ -209,6 +209,8 @@ mx lists what it will remove and asks first. It removes everything: the program,
 
 Quit your agents first. If one is still running mx, uninstall tells you which files to delete after you quit it.
 
+On macOS, the Keychain lets only the program that saved a sign-in delete it. If it refuses, `mx uninstall` stops and prints the command that deletes that sign-in, such as `security delete-generic-password -s mx -a refresh-token`. Run it, then run `mx uninstall` again.
+
 ## Build from source
 
 You need [Bun](https://bun.com).
