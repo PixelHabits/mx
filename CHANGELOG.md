@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/PixelHabits/mx/compare/v0.4.0...v0.4.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* save and delete macOS Keychain sign-ins from the installed mx, and delete them before the binary ([#14](https://github.com/PixelHabits/mx/issues/14)) ([243c692](https://github.com/PixelHabits/mx/commit/243c692cd7700c91f9b88a73a0c35893c19151ca))
+
 ## [0.4.0](https://github.com/PixelHabits/mx/compare/v0.3.0...v0.4.0) (2026-10-23)
 
 
