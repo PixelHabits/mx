@@ -54,7 +54,7 @@ xattr -d com.apple.quarantine mx-darwin-arm64
 ./mx-darwin-arm64 install
 ```
 
-mx installs itself to `~/.local/bin/mx`. If that folder is not on your PATH, `mx install` prints the line to add to `~/.zprofile`. Open a new terminal to run `mx`.
+mx installs itself to `~/.local/bin/mx` and finishes the install from there, so your sign-in in the Keychain belongs to that program. If that folder is not on your PATH, `mx install` prints the line to add to `~/.zprofile`. Open a new terminal to run `mx`.
 
 ### Linux
 
@@ -208,6 +208,8 @@ mx uninstall
 mx lists what it will remove and asks first. It removes everything: the program, its entries in your agents' settings, every account's saved sign-in, your local copy of your mail and the log of tool calls. On Windows it also takes mx off your PATH. Your mailbox in Microsoft 365 is not touched.
 
 Quit your agents first. If one is still running mx, uninstall tells you which files to delete after you quit it.
+
+On macOS, the Keychain lets only the program that saved a sign-in delete it. If it refuses, `mx uninstall` stops and prints the command that deletes that sign-in, such as `security delete-generic-password -s mx -a refresh-token`. Run it, then run `mx uninstall` again.
 
 ## Build from source
 

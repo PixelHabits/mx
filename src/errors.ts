@@ -1,4 +1,4 @@
-import { Schema } from "effect";
+import { Runtime, Schema } from "effect";
 
 /**
  * No saved sign-in, or Microsoft refused it; only a new device-code sign-in helps. `account` names the account to sign in
@@ -118,6 +118,19 @@ export class InstallFailed extends Schema.TaggedError<
 >("mx/errors/InstallFailed")("InstallFailed", {
 	message: Schema.String,
 }) {}
+
+/**
+ * The installed mx that finishes `mx install` on macOS exited with `code`, and printed why itself. The mx that started it
+ * exits with the same code.
+ */
+export class InstallStopped extends Schema.TaggedError<
+	InstallStopped,
+	{ readonly brand: unique symbol }
+>("mx/errors/InstallStopped")("InstallStopped", {
+	code: Schema.Int,
+}) {
+	override readonly [Runtime.errorExitCode] = this.code;
+}
 
 /** `mx update` refused a release, or could not fetch or install it; `message` says which. */
 export class UpdateFailed extends Schema.TaggedError<

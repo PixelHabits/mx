@@ -53,6 +53,7 @@ import {
 	CredentialFailed,
 	GraphRefused,
 	InstallFailed,
+	InstallStopped,
 	LoginRequired,
 	MicrosoftUnavailable,
 	NewerStore,
@@ -537,18 +538,36 @@ const install = Command.make(
 			// A new first account's client id and tenant are settled before anything changes, and its alias as it signs in.
 			const first = yield* Option.match(Arr.head(saved), {
 				onNone: () =>
-					Effect.map(newSettings(saved, given), (settings) =>
-						newAccount(saved, settings, Option.none())
-					),
+					Effect.map(newSettings(saved, given), (settings) => ({
+						settled: {
+							clientId: Option.some(settings.clientId),
+							tenant: Option.some(settings.tenant),
+						},
+						target: newAccount(saved, settings, Option.none()),
+					})),
 				onSome: (account) =>
-					Effect.succeed(Effect.succeed(existing(account, given))),
+					Effect.succeed({
+						settled: given,
+						target: Effect.succeed(existing(account, given)),
+					}),
 			});
 			yield* (yield* Installer).install({
 				agents: agent,
+				args: [
+					...Arr.flatMap(agent, (id) => ["--agent", id]),
+					...Arr.flatMap(Option.toArray(first.settled.clientId), (id) => [
+						"--client-id",
+						id,
+					]),
+					...Arr.flatMap(Option.toArray(first.settled.tenant), (tenant) => [
+						"--tenant",
+						tenant,
+					]),
+				],
 				// Every account whose first sync is unfinished gets it here, as one just signed in or one a stopped mx install left.
 				firstSync: Effect.flatMap(file.read, firstSyncs),
 				login: Effect.gen(function* () {
-					const target = yield* first;
+					const target = yield* first.target;
 					if (
 						target.added ||
 						target.changed ||
@@ -618,7 +637,7 @@ const uninstall = Command.make(
 ).pipe(
 	Command.provide(Installer.layer.pipe(Layer.provide(Paths.layer))),
 	Command.withDescription(
-		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, the installed binary, the mail store, each account's saved sign-in, the attachment cache, the state folder with the tool call log, and the accounts with their client ids and tenants. It lists them and asks first; --yes removes them without asking."
+		"Stop mx sync, and remove its registration, mx from each agent's config with every Claude Code rule that names mx, each account's saved sign-in, the mail store, the attachment cache, the state folder with the tool call log, the accounts with their client ids and tenants, and last the installed binary. It lists them and asks first; --yes removes them without asking."
 	)
 );
 
@@ -844,7 +863,10 @@ const isExplained = Schema.is(
 	])
 );
 
-/** The command line renders its own usage errors; anything unexplained prints its whole cause. */
+/**
+ * The command line renders its own usage errors, and the installed mx that finishes mx install says why it stopped;
+ * anything unexplained prints its whole cause.
+ */
 const report = (cause: Cause.Cause<unknown>) => {
 	if (Cause.hasInterruptsOnly(cause)) {
 		return Effect.void;
@@ -853,7 +875,9 @@ const report = (cause: Cause.Cause<unknown>) => {
 	if (isExplained(error)) {
 		return Console.error(`mx: ${error.message}`);
 	}
-	return CliError.isCliError(error) ? Effect.void : Effect.logError(cause);
+	return CliError.isCliError(error) || Schema.is(InstallStopped)(error)
+		? Effect.void
+		: Effect.logError(cause);
 };
 
 /** Asks for Enter, and waits for it or for the input to end, as Esc and Ctrl+C end it. */

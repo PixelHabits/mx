@@ -25,11 +25,13 @@ import {
 	Record as Rec,
 	Scheduler,
 	Schema,
+	Stdio,
 	String as Str,
+	Stream,
 	Terminal,
 } from "effect";
 import { Command, TerminalCapabilities } from "effect/cli";
-import type { ChildProcess } from "effect/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { SqlClient } from "effect/sql";
 import { TestClock, TestConsole } from "effect/testing";
 import packageJson from "../package.json" with { type: "json" };
@@ -118,7 +120,14 @@ const machine = ManagedRuntime.make(
 	).pipe(Layer.provideMerge(BunServices.layer))
 );
 const home = await machine.runPromise(Home);
-const { dirname, join } = await machine.runPromise(Path.Path);
+const { basename, dirname, join } = await machine.runPromise(Path.Path);
+/** Bun's own process spawner and stdio: the platform the tests run mx on fakes the programs mx starts. */
+const bun = await machine.runPromise(
+	Effect.all({
+		spawner: ChildProcessSpawner.ChildProcessSpawner,
+		stdio: Stdio.Stdio,
+	})
+);
 
 /** The client id the tests sign in with, and another one, and the tenant. */
 const clientId = "11111111-2222-4333-8444-555555555555";
@@ -509,6 +518,53 @@ const refusal = (name: string, args: Record<string, unknown>) =>
 	);
 
 const lines = (text: string): string[] => pipe(text, Str.split("\n"));
+
+/**
+ * Runs `command` with `args` as a real process with `env` alone: its exit code, and what it printed to stdout and
+ * stderr. The scope stops it, and when the test fails or times out, what it printed goes to the test's stderr.
+ */
+const runProcess = Effect.fnUntraced(function* (
+	command: string,
+	args: readonly string[],
+	env: Record<string, string> = {}
+) {
+	const said = { errors: "", output: "" };
+	yield* Effect.addFinalizer((exit) =>
+		Exit.isFailure(exit)
+			? Stream.run(
+					Stream.make(
+						`${Arr.join([command, ...args], " ")}\n--- stdout\n${said.output}\n--- stderr\n${said.errors}\n`
+					),
+					bun.stdio.stderr()
+				).pipe(Effect.orDie)
+			: Effect.void
+	);
+	const started = yield* bun.spawner.spawn(
+		ChildProcess.make(command, args, {
+			env,
+			forceKillAfter: Duration.seconds(1),
+			stdin: "ignore",
+		})
+	);
+	const read = (stream: typeof started.stdout, into: keyof typeof said) =>
+		stream.pipe(
+			Stream.decodeText,
+			Stream.runForEach((text) =>
+				Effect.sync(() => {
+					said[into] += text;
+				})
+			)
+		);
+	const [code] = yield* Effect.all(
+		[
+			started.exitCode,
+			read(started.stdout, "output"),
+			read(started.stderr, "errors"),
+		],
+		{ concurrency: "unbounded" }
+	);
+	return { code, ...said };
+});
 
 /** The sha256 of `bytes` in hex. Tests compare binaries by it, so a mismatch prints one line instead of every byte. */
 const sha256 = (bytes: Uint8Array) =>
@@ -1805,6 +1861,123 @@ describe("mx", () => {
 		{
 			because: "CI builds the binaries of macOS and Windows to run there",
 			systems: ["darwin", "win32"],
+		}
+	);
+
+	test(
+		"on macOS, mx install run from the downloaded binary saves the sign-in in the Keychain from the installed mx, so mx uninstall --yes deletes it",
+		() =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				if (!(yield* fs.exists(built.file))) {
+					return yield* Effect.die(
+						`${built.file} is missing. Build it with bun run build ${built.platform}, as CI does on Linux.`
+					);
+				}
+				const own = join(home, "keychain");
+				// Keychain Services finds the default keychain through HOME's Library/Preferences, and without one it waits on
+				// a dialog no one answers, so this HOME gets a keychain of its own.
+				const keychain = join(
+					own,
+					"Library",
+					"Keychains",
+					"mx-test.keychain-db"
+				);
+				yield* fs.makeDirectory(join(own, "Library", "Preferences"), {
+					recursive: true,
+				});
+				yield* fs.makeDirectory(dirname(keychain), { recursive: true });
+				const security = (...args: string[]) =>
+					runProcess("/usr/bin/security", args, { HOME: own });
+				for (const args of [
+					["create-keychain", "-p", "mx-test", keychain],
+					["list-keychains", "-d", "user", "-s", keychain],
+					["default-keychain", "-d", "user", "-s", keychain],
+				]) {
+					expect(yield* security(...args)).toMatchObject({ code: 0 });
+				}
+				yield* Effect.addFinalizer(() =>
+					Effect.scoped(security("delete-keychain", keychain)).pipe(
+						Effect.orDie,
+						Effect.asVoid
+					)
+				);
+				// security lists the item without reading its secret, which only the program that saved it may read unasked.
+				const inKeychain = Effect.map(
+					security(
+						"find-generic-password",
+						"-s",
+						credential.service,
+						"-a",
+						credential.name
+					),
+					({ code }) => code === 0
+				);
+				const downloaded = join(own, "Downloads", basename(built.file));
+				yield* fs.makeDirectory(dirname(downloaded), { recursive: true });
+				yield* fs.copyFile(built.file, downloaded);
+				yield* fs.chmod(downloaded, 0o755);
+				yield* fs.writeFileString(join(own, ".claude.json"), "{}");
+				// launchd holds no LaunchAgent of this test: launchctl print finds none, and every other command succeeds.
+				const launchctl = join(own, "path", "launchctl");
+				yield* fs.makeDirectory(dirname(launchctl), { recursive: true });
+				yield* fs.writeFileString(
+					launchctl,
+					'#!/bin/sh\n[ "$1" = print ] && exit 113\nexit 0\n'
+				);
+				yield* fs.chmod(launchctl, 0o755);
+				const cert = join(own, "cert.pem");
+				const key = join(own, "key.pem");
+				expect(
+					yield* runProcess("/usr/bin/openssl", [
+						"req",
+						"-x509",
+						"-newkey",
+						"rsa:2048",
+						"-nodes",
+						"-keyout",
+						key,
+						"-out",
+						cert,
+						"-days",
+						"1",
+						"-subj",
+						"/CN=mx-test",
+					])
+				).toMatchObject({ code: 0 });
+				const env = {
+					HOME: own,
+					// A Microsoft of its own: other tests count the requests the shared one received.
+					HTTPS_PROXY: yield* new FakeMicrosoft(releases).serve({
+						cert: yield* fs.readFileString(cert),
+						key: yield* fs.readFileString(key),
+					}),
+					MX_CLIENT_ID: clientId,
+					MX_TENANT: tenant,
+					NODE_TLS_REJECT_UNAUTHORIZED: "0",
+					PATH: dirname(launchctl),
+				};
+				expect(
+					yield* runProcess(
+						downloaded,
+						["install", "--agent", "claude-code"],
+						env
+					)
+				).toMatchObject({ code: 0 });
+				expect(yield* inKeychain).toBe(true);
+				expect(
+					yield* runProcess(
+						join(own, ".local", "bin", "mx"),
+						["uninstall", "--yes"],
+						env
+					)
+				).toMatchObject({ code: 0 });
+				expect(yield* inKeychain).toBe(false);
+			}).pipe(Effect.scoped),
+		{
+			because:
+				"only the macOS Keychain lets a program delete just the items that a program of its file name saved",
+			systems: ["darwin"],
 		}
 	);
 
@@ -5197,6 +5370,97 @@ describe("mx", () => {
 			).toBe(windows);
 			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
 		}));
+
+	test("mx uninstall that the Keychain stops at one account's sign-in, where config.json shares its folder with the mail store as on macOS, finds every other account's sign-in when the user runs it again", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const asInstalled = runningAs(installed);
+			const shared = join(home, "Library", "Application Support");
+			const oneFolder = cliOn(
+				platformWith({
+					...environment,
+					XDG_CONFIG_HOME: shared,
+					XDG_DATA_HOME: shared,
+					XDG_STATE_HOME: shared,
+				})
+			);
+			yield* oneFolder("install", "--agent", "codex");
+			secrets.machine = "keychain";
+			microsoft.signingIn = microsoft.addMailbox("pat", {
+				address: "pat@example.org",
+				name: "Pat Example",
+			});
+			yield* asInstalled(
+				oneFolder(
+					"login",
+					"--account",
+					"personal",
+					"--client-id",
+					otherClientId,
+					"--tenant",
+					"example.org"
+				)
+			);
+			yield* Effect.flip(asInstalled(oneFolder("uninstall", "--yes")));
+			secrets.entries.delete("mx/refresh-token");
+			const { output } = yield* asInstalled(oneFolder("uninstall", "--yes"));
+			expect(lines(output)).toContain("Removed the saved sign-in of personal.");
+			expect(
+				Arr.filter([...secrets.entries.keys()], Str.startsWith("mx/"))
+			).toEqual([]);
+			expect(yield* fs.exists(installed)).toBe(windows);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					secrets.machine = "store";
+					microsoft.signingIn = microsoft.mailbox;
+				})
+			)
+		));
+
+	test("mx uninstall run from the installed mx deletes the sign-in that mx saved while the program is still on disk, as the macOS Keychain requires, and removes the program last", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const asInstalled = runningAs(installed);
+			yield* cli("install", "--agent", "codex");
+			secrets.entries.delete("mx/refresh-token");
+			secrets.machine = "keychain";
+			yield* asInstalled(cli("login"));
+			yield* asInstalled(cli("uninstall", "--yes"));
+			expect(secrets.entries.has("mx/refresh-token")).toBe(false);
+			// On Windows the installed mx.exe goes once the mx that runs it exits.
+			expect(yield* fs.exists(installed)).toBe(windows);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					secrets.machine = "store";
+				})
+			)
+		));
+
+	test("mx uninstall that the macOS Keychain refuses to delete a sign-in, as one a program of another file name saved, stops with the security command that deletes it and keeps the program, and runs to its end once the user ran that command", () =>
+		Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const asInstalled = runningAs(installed);
+			yield* cli("install", "--agent", "codex");
+			secrets.machine = "keychain";
+			const failure = yield* Effect.flip(
+				asInstalled(cli("uninstall", "--yes"))
+			);
+			expect(failure.message).toBe(
+				"Could not delete the saved sign-in of contoso: The Keychain lets only the program that saved this sign-in delete it. Delete it with security delete-generic-password -s mx -a refresh-token, then run the mx command again."
+			);
+			expect(yield* fs.exists(installed)).toBe(true);
+			secrets.entries.delete("mx/refresh-token");
+			yield* asInstalled(cli("uninstall", "--yes"));
+			expect(yield* fs.exists(installed)).toBe(windows);
+		}).pipe(
+			Effect.ensuring(
+				Effect.sync(() => {
+					secrets.machine = "store";
+				})
+			)
+		));
 
 	test(
 		"mx install from the Arch package copies no binary and writes no unit, enables the package's unit and registers /usr/bin/mx",
