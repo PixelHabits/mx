@@ -1,3 +1,5 @@
+import { once } from "node:events";
+import { type AddressInfo, connect, createServer } from "node:net";
 import {
 	Array as Arr,
 	Duration,
@@ -424,6 +426,53 @@ export class FakeMicrosoft {
 			)
 		)
 	);
+
+	/**
+	 * Microsoft on the network, for an mx that runs as a process of its own, as the compiled binary does: the URL of an
+	 * HTTPS proxy that tunnels every connection to a server that answers as `layer` does, over TLS with `certificate`.
+	 * The process reaches it through `HTTPS_PROXY` and accepts the certificate with `NODE_TLS_REJECT_UNAUTHORIZED=0`. It
+	 * serves until the scope closes.
+	 */
+	serve(certificate: { readonly cert: string; readonly key: string }) {
+		return Effect.acquireRelease(
+			Effect.promise(async () => {
+				const server = Bun.serve({
+					fetch: async (request) =>
+						await this.answer(
+							request,
+							new Uint8Array(await request.arrayBuffer())
+						),
+					hostname: "127.0.0.1",
+					port: 0,
+					tls: certificate,
+				});
+				// Each connection opens with CONNECT <host>:443, and then carries TLS for the server.
+				const proxy = createServer((client) => {
+					client.once("data", () => {
+						const upstream = connect(server.port ?? 0, "127.0.0.1", () => {
+							client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+							client.pipe(upstream);
+							upstream.pipe(client);
+						});
+						upstream.on("error", () => client.destroy());
+					});
+					client.on("error", () => client.destroy());
+				});
+				await once(proxy.listen(0, "127.0.0.1"), "listening");
+				return { proxy, server };
+			}),
+			({ proxy, server }) =>
+				Effect.promise(async () => {
+					proxy.close();
+					await server.stop(true);
+				})
+		).pipe(
+			Effect.map(
+				({ proxy }) =>
+					`http://127.0.0.1:${(proxy.address() as AddressInfo).port}`
+			)
+		);
+	}
 
 	/**
 	 * Adds the mailbox of another user, with the folders every mailbox starts with and no mail. Its folder, message and

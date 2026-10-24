@@ -56,15 +56,30 @@ const isNoSecretStore = (error: unknown) =>
 	error.code === "ERR_SECRETS_PLATFORM_ERROR" &&
 	noSecretService.test(error.message);
 
-/** Runs a `Bun.secrets` call; none says the machine has no secret store, and any other failure fails loudly. */
-const inSecretStore = <A>(run: () => Promise<A>) =>
+/**
+ * Bun ends its message with the OSStatus. -25244, errSecInvalidOwnerEdit, is the macOS Keychain refusing a delete by a
+ * program other than the one that saved the item; the `security` command can delete it.
+ */
+const notOwner = /\(code: -25244\)$/u;
+
+/** An entry in the secret store: the service and the name of one account's sign-in. */
+interface Entry {
+	readonly name: string;
+	readonly service: string;
+}
+
+/** Runs a `Bun.secrets` call on `entry`; none says the machine has no secret store, and any other failure fails loudly. */
+const inSecretStore = <A>(entry: Entry, run: (entry: Entry) => Promise<A>) =>
 	Effect.tryPromise({
 		catch: (error) =>
 			CredentialFailed.make({
-				message: `The secret store failed: ${error instanceof Error ? error.message : String(error)}`,
+				message:
+					Schema.is(SecretsError)(error) && notOwner.test(error.message)
+						? `The Keychain lets only the program that saved this sign-in delete it. Delete it with security delete-generic-password -s ${entry.service} -a ${entry.name}, then run the mx command again.`
+						: `The secret store failed: ${error instanceof Error ? error.message : String(error)}`,
 			}),
 		try: () =>
-			run().then(Option.some, (error: unknown) =>
+			run(entry).then(Option.some, (error: unknown) =>
 				isNoSecretStore(error) ? Option.none<A>() : Promise.reject(error)
 			),
 	});
@@ -108,8 +123,8 @@ export class Credentials extends Context.Service<
 
 			const read = Effect.fn("Credentials.read")(
 				function* (account: number) {
-					const stored = yield* inSecretStore(() =>
-						Bun.secrets.get(entryOf(account))
+					const stored = yield* inSecretStore(entryOf(account), (entry) =>
+						Bun.secrets.get(entry)
 					);
 					const saved = Option.isSome(stored)
 						? Option.fromNullishOr(stored.value)
@@ -133,8 +148,8 @@ export class Credentials extends Context.Service<
 			const write = Effect.fn("Credentials.write")(
 				function* (account: number, signIn: SignIn) {
 					const value = yield* encodeSignIn(signIn).pipe(Effect.orDie);
-					const stored = yield* inSecretStore(() =>
-						Bun.secrets.set({ ...entryOf(account), value })
+					const stored = yield* inSecretStore(entryOf(account), (entry) =>
+						Bun.secrets.set({ ...entry, value })
 					);
 					if (Option.isSome(stored)) {
 						return;
@@ -151,7 +166,9 @@ export class Credentials extends Context.Service<
 
 			const remove = Effect.fn("Credentials.remove")(
 				function* (account: number) {
-					yield* inSecretStore(() => Bun.secrets.delete(entryOf(account)));
+					yield* inSecretStore(entryOf(account), (entry) =>
+						Bun.secrets.delete(entry)
+					);
 					yield* fs.remove(fileOf(account), { force: true });
 				},
 				Effect.catchTag("PlatformError", (error) => Effect.fail(failed(error)))
