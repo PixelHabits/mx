@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.4.2](https://github.com/PixelHabits/mx/compare/v0.4.1...v0.4.2) (2026-11-01)
+## [0.4.2](https://github.com/PixelHabits/mx/compare/3f40eeb79fdc2c1fd04b4c44ddd56a2069e9d3a9...v0.4.2) (2026-11-01)
 
 
 ### Miscellaneous Chores
