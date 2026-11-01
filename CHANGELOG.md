@@ -1,13 +1,13 @@
 # Changelog
 
-## [0.4.1](https://github.com/PixelHabits/mx/compare/v0.4.0...v0.4.1) (2026-10-24)
+## [0.4.1](https://github.com/PixelHabits/mx/compare/2cd0062dd7c20bfebaa1173b69ede46aab742caf...3f40eeb79fdc2c1fd04b4c44ddd56a2069e9d3a9) (2026-10-24)
 
 
 ### Bug Fixes
 
-* save and delete macOS Keychain sign-ins from the installed mx, and delete them before the binary ([#14](https://github.com/PixelHabits/mx/issues/14)) ([243c692](https://github.com/PixelHabits/mx/commit/243c692cd7700c91f9b88a73a0c35893c19151ca))
+* save and delete macOS Keychain sign-ins from the installed mx, and delete them before the binary ([#14](https://github.com/PixelHabits/mx/issues/14)) ([ecd8cb3](https://github.com/PixelHabits/mx/commit/ecd8cb3d3bf55a7d580aeaf46aa8ae79ec0b232e))
 
-## [0.4.0](https://github.com/PixelHabits/mx/compare/v0.3.0...v0.4.0) (2026-10-23)
+## [0.4.0](https://github.com/PixelHabits/mx/compare/v0.3.0...2cd0062dd7c20bfebaa1173b69ede46aab742caf) (2026-10-23)
 
 
 ### ⚠ BREAKING CHANGES
@@ -16,16 +16,16 @@
 
 ### Features
 
-* adopt Effect 4.0.6, with folders from UserDirectories and terminal checks from TerminalCapabilities ([#11](https://github.com/PixelHabits/mx/issues/11)) ([67dbc4f](https://github.com/PixelHabits/mx/commit/67dbc4fe74d87c181502bed0d1407ede037dcdbb))
+* adopt Effect 4.0.6, with folders from UserDirectories and terminal checks from TerminalCapabilities ([#11](https://github.com/PixelHabits/mx/issues/11)) ([6c3277f](https://github.com/PixelHabits/mx/commit/6c3277f1694464adb1a08862780690072d7cf732))
 * **mcp:** give each message a link that opens it in Outlook on the web ([ce41978](https://github.com/PixelHabits/mx/commit/ce41978ea52fddfed926f5a739420e6ca5e9c2e7))
-* **mcp:** write mail bodies as HTML rendered from Markdown, with an html format for raw HTML ([#8](https://github.com/PixelHabits/mx/issues/8)) ([6ac51d5](https://github.com/PixelHabits/mx/commit/6ac51d584032694ab5f1bee50a553b9154142955))
-* several Microsoft 365 accounts in one mx ([#7](https://github.com/PixelHabits/mx/issues/7)) ([6dc7af0](https://github.com/PixelHabits/mx/commit/6dc7af0e9f88f90d4ecf8a08fb3669cbee0df061))
+* **mcp:** write mail bodies as HTML rendered from Markdown, with an html format for raw HTML ([#8](https://github.com/PixelHabits/mx/issues/8)) ([845839c](https://github.com/PixelHabits/mx/commit/845839c79685621e5e9d587a788c8de417705861))
+* several Microsoft 365 accounts in one mx ([#7](https://github.com/PixelHabits/mx/issues/7)) ([f53095f](https://github.com/PixelHabits/mx/commit/f53095f67ba68a065d1eb638f7def088f9174fc0))
 
 
 ### Bug Fixes
 
-* **install:** find Claude Desktop's config in Claude-Data on Windows ([#13](https://github.com/PixelHabits/mx/issues/13)) ([ceb3056](https://github.com/PixelHabits/mx/commit/ceb3056eb587260b5896c2f1e921953188d8aac1))
-* **push:** run only cloudflared 2026.10.2 or newer, and pin 2026.10.3 ([#10](https://github.com/PixelHabits/mx/issues/10)) ([5ca160d](https://github.com/PixelHabits/mx/commit/5ca160dfe7a8fd6a84e558438c43cc4bf8443cb9))
+* **install:** find Claude Desktop's config in Claude-Data on Windows ([#13](https://github.com/PixelHabits/mx/issues/13)) ([261a40e](https://github.com/PixelHabits/mx/commit/261a40e4cd088999befd77e731c7ca1327195d93))
+* **push:** run only cloudflared 2026.10.2 or newer, and pin 2026.10.3 ([#10](https://github.com/PixelHabits/mx/issues/10)) ([2ff96d0](https://github.com/PixelHabits/mx/commit/2ff96d0b72e080ee364b40930254fd2382ed937e))
 
 ## [0.3.0](https://github.com/PixelHabits/mx/compare/v0.2.0...v0.3.0) (2026-10-19)
 
